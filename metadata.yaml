@@ -1,6 +1,6 @@
 name: zssm_explain
-desc: 解释被回复的消息或图片含义，并调用 LLM 给出说明。
-version: v0.1.0
+desc: 回复消息后触发对文本/图片的含义解释；支持关键词“zssm”（忽略前缀）、Napcat get_msg 回溯、按 Provider ID 选择文本/图片模型并带回退。
+version: v0.2.0
 author: codex
 repo: https://example.com/astrbot-plugins/zssm_explain
 

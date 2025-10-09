@@ -13,8 +13,8 @@ import re
 @register(
     "zssm_explain",
     "codex",
-    "回复消息后发送 /zssm，调用 LLM 解释被回复的文本或图片含义",
-    "0.1.2",
+    "回复消息或关键词触发，解释被回复文本/图片含义；支持 Napcat get_msg 回溯与 Provider ID 选择文本/图片模型及回退",
+    "0.2.0",
     "https://example.com/astrbot-plugins/zssm_explain",
 )
 class ZssmExplain(Star):
