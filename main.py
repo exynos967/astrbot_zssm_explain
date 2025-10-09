@@ -9,13 +9,26 @@ from astrbot.api import logger
 import astrbot.api.message_components as Comp
 import re
 
+# === 可编辑的默认提示词（用户可直接在此处修改） ===
+DEFAULT_SYSTEM_PROMPT = "你是一个中文助理，擅长从被引用的消息中提炼含义、意图和注意事项。"
+
+DEFAULT_TEXT_USER_PROMPT = (
+    "请解释这条被回复的消息的含义，输出简洁不超过100字。\n"
+    "原始文本：\n{text}"
+)
+
+DEFAULT_IMAGE_USER_PROMPT = (
+    "请解释这条被回复的消息/图片的含义，输出简洁不超过100字。\n"
+    "{text_block}\n包含图片：若无法直接读取图片，请结合上下文或文件名描述。"
+)
+
 
 @register(
     "zssm_explain",
-    "codex",
-    "回复消息或关键词触发，解释被回复文本/图片含义；支持 Napcat get_msg 回溯与 Provider ID 选择文本/图片模型及回退",
-    "0.2.0",
-    "https://example.com/astrbot-plugins/zssm_explain",
+    "薄暝",
+    "zssm，回复消息或关键词触发；支持“zssm + 内容”直接解释；引用+@ 场景；Napcat get_msg 回溯图片；按 Provider ID 选择文本/图片模型并带回退；未回复仅发 zssm 时提示；默认提示词可在 main.py 顶部修改",
+    "0.2.1",
+    "https://github.com/xiaoxi68/astrbot_zssm_explain",
 )
 class ZssmExplain(Star):
     def __init__(self, context: Context, config: Optional[Dict[str, Any]] = None):
@@ -232,19 +245,18 @@ class ZssmExplain(Star):
         logger.info("zssm_explain: reply component found but no embedded origin; consider platform API to fetch by id")
         return (None, [])
 
-    @staticmethod
-    def _build_user_prompt(text: Optional[str], images: List[str]) -> str:
-        parts: List[str] = [
-            "请解释这条被回复的消息/图片的含义，输出简洁不超过100字"
-        ]
-        if text:
-            parts.append("原始文本：\n" + text)
+    def _build_user_prompt(self, text: Optional[str], images: List[str]) -> str:
+        """仅使用文件顶部的默认常量构建用户提示词，不再读取配置。"""
+        text_block = ("原始文本:\n" + text) if text else ""
         if images:
-            parts.append("包含图片：若无法直接读取图片，请结合上下文或文件名描述。")
-        return "\n\n".join(parts)
+            tmpl = DEFAULT_IMAGE_USER_PROMPT
+        else:
+            tmpl = DEFAULT_TEXT_USER_PROMPT
+        return tmpl.format(text=text or "", text_block=text_block)
 
     def _build_system_prompt(self) -> str:
-        return "你是一个中文助理，擅长从被引用的消息中提炼含义、意图和注意事项。"
+        """仅使用文件顶部的默认系统提示词，不再读取配置。"""
+        return DEFAULT_SYSTEM_PROMPT
 
     @staticmethod
     def _is_zssm_trigger(text: str) -> bool:
@@ -270,6 +282,35 @@ class ZssmExplain(Star):
             except Exception:
                 continue
         return ""
+
+    @staticmethod
+    def _strip_trigger_and_get_content(text: str) -> str:
+        """剥离前缀与 zssm 触发词，返回其后的内容；无内容则返回空串。"""
+        if not isinstance(text, str):
+            return ""
+        t = text.strip()
+        m = re.match(r"^[\s/!！。\.、，\-]*zssm(?:\s+(.+))?$", t, re.I)
+        if not m:
+            return ""
+        content = m.group(1) or ""
+        return content.strip()
+
+    def _get_inline_content(self, event: AstrMessageEvent) -> str:
+        """从消息首个 Plain 文本或整体纯文本中提取 'zssm xxx' 的 xxx 内容。"""
+        try:
+            chain = event.get_messages()
+        except Exception:
+            chain = getattr(event.message_obj, "message", []) if hasattr(event, "message_obj") else []
+        head = self._first_plain_head_text(chain)
+        if head:
+            c = self._strip_trigger_and_get_content(head)
+            if c:
+                return c
+        try:
+            s = event.get_message_str()
+        except Exception:
+            s = getattr(event, "message_str", "") or ""
+        return self._strip_trigger_and_get_content(s)
 
     def _pick_llm_text(self, llm_resp: object) -> str:
         # 1) 优先解析 AstrBot 的结果链（MessageChain）
@@ -359,11 +400,16 @@ class ZssmExplain(Star):
 
     @filter.command("zssm", alias={"知识说明", "解释"})
     async def zssm(self, event: AstrMessageEvent):
-        """解释被回复消息：/zssm（需使用消息回复功能）"""
-        text, images = await self._extract_quoted_payload(event)
-        if not text and not images:
-            yield event.plain_result("请先回复一条消息或图片后再发送 zssm。")
-            return
+        """解释被回复消息：/zssm 或关键词触发；若携带内容则直接解释该内容，否则按回复消息逻辑。"""
+        inline = self._get_inline_content(event)
+        if inline:
+            text, images = inline, []
+        else:
+            text, images = await self._extract_quoted_payload(event)
+            if not text and not images:
+                # 未携带被回复内容时的提示
+                yield event.plain_result("请输入要解释的内容。")
+                return
 
         try:
             provider = self.context.get_using_provider(umo=event.unified_msg_origin)
