@@ -1,0 +1,6 @@
+name: zssm_explain
+desc: 解释被回复的消息或图片含义，并调用 LLM 给出说明。
+version: v0.1.0
+author: codex
+repo: https://example.com/astrbot-plugins/zssm_explain
+

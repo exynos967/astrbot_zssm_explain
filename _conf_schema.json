@@ -1,0 +1,15 @@
+{
+  "text_provider_id": {
+    "description": "文本解释优先使用的 Provider ID",
+    "type": "string",
+    "_special": "select_provider",
+    "hint": "可选；留空则使用当前会话 Provider"
+  },
+  "image_provider_id": {
+    "description": "图片转述优先使用的 Provider ID",
+    "type": "string",
+    "_special": "select_provider",
+    "hint": "可选；留空则自动选择具备图片能力的 Provider"
+  }
+}
+
