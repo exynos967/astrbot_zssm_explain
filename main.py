@@ -256,6 +256,21 @@ class ZssmExplain(Star):
             return True
         return False
 
+    @staticmethod
+    def _first_plain_head_text(chain: List[object]) -> str:
+        """返回消息链中最靠前且非空的 Plain 文本。忽略 Reply、At 等非文本段。"""
+        if not isinstance(chain, list):
+            return ""
+        for seg in chain:
+            try:
+                if isinstance(seg, Comp.Plain):
+                    txt = getattr(seg, "text", None)
+                    if isinstance(txt, str) and txt.strip():
+                        return txt
+            except Exception:
+                continue
+        return ""
+
     def _pick_llm_text(self, llm_resp: object) -> str:
         # 1) 优先解析 AstrBot 的结果链（MessageChain）
         try:
@@ -456,20 +471,32 @@ class ZssmExplain(Star):
 
     @filter.event_message_type(filter.EventMessageType.ALL)
     async def keyword_zssm(self, event: AstrMessageEvent):
-        """关键词触发：忽略常见前缀，检测消息起始处的 zssm。
+        """关键词触发：忽略常见前缀/Reply/At 等，检测首个 Plain 段的 zssm。
         避免与 /zssm 指令重复：若以 /zssm 开头则交由指令处理。
         """
+        # 优先使用消息链首个 Plain 段判断
+        try:
+            chain = event.get_messages()
+        except Exception:
+            chain = getattr(event.message_obj, "message", []) if hasattr(event, "message_obj") else []
+        head = self._first_plain_head_text(chain)
+        # 指令冲突：首个 Plain 段是 /zssm 则交由指令处理
+        if isinstance(head, str) and head.strip():
+            if re.match(r"^\s*/\s*zssm(\s|$)", head.strip(), re.I):
+                return
+            if self._is_zssm_trigger(head):
+                async for r in self.zssm(event):
+                    yield r
+                return
+        # 回退到纯文本串
         try:
             text = event.get_message_str()
         except Exception:
             text = getattr(event, "message_str", "") or ""
-        if not isinstance(text, str) or not text.strip():
-            return
-        t = text.strip()
-        # 避免与指令重复：以 /zssm 开头时不在此处理
-        if re.match(r"^\s*/\s*zssm(\s|$)", t, re.I):
-            return
-        if self._is_zssm_trigger(t):
-            # 复用已实现的 zssm 处理逻辑
-            async for r in self.zssm(event):
-                yield r
+        if isinstance(text, str) and text.strip():
+            t = text.strip()
+            if re.match(r"^\s*/\s*zssm(\s|$)", t, re.I):
+                return
+            if self._is_zssm_trigger(t):
+                async for r in self.zssm(event):
+                    yield r
