@@ -55,7 +55,7 @@ class ZssmExplain(Star):
                         images.append(f)
                     elif isinstance(u, str) and u:
                         images.append(u)
-            except Exception as e:
+            except (AttributeError, TypeError, ValueError) as e:
                 logger.warning(f"zssm_explain: parse chain segment failed: {e}")
         return ("\n".join([t for t in texts if t]).strip(), images)
 
@@ -63,33 +63,24 @@ class ZssmExplain(Star):
     def _try_extract_from_reply_component(reply_comp: object) -> Tuple[Optional[str], List[str]]:
         """尽量从 Reply 组件中得到被引用消息的文本与图片。"""
         for attr in ("message", "origin", "content"):
-            try:
-                payload = getattr(reply_comp, attr, None)
-                if isinstance(payload, list):
-                    return ZssmExplain._extract_text_and_images_from_chain(payload)
-            except Exception:
-                pass
+            payload = getattr(reply_comp, attr, None)
+            if isinstance(payload, list):
+                return ZssmExplain._extract_text_and_images_from_chain(payload)
         return (None, [])
 
     @staticmethod
     def _get_reply_message_id(reply_comp: object) -> Optional[str]:
         """从 Reply 组件中尽力获取原消息的 message_id（OneBot/Napcat 常见为 id）。"""
         for key in ("id", "message_id", "reply_id", "messageId", "message_seq"):
-            try:
-                val = getattr(reply_comp, key, None)
+            val = getattr(reply_comp, key, None)
+            if isinstance(val, (str, int)) and str(val):
+                return str(val)
+        data = getattr(reply_comp, "data", None)
+        if isinstance(data, dict):
+            for key in ("id", "message_id", "reply", "messageId", "message_seq"):
+                val = data.get(key)
                 if isinstance(val, (str, int)) and str(val):
                     return str(val)
-            except Exception:
-                pass
-        try:
-            data = getattr(reply_comp, "data", None)
-            if isinstance(data, dict):
-                for key in ("id", "message_id", "reply", "messageId", "message_seq"):
-                    val = data.get(key)
-                    if isinstance(val, (str, int)) and str(val):
-                        return str(val)
-        except Exception:
-            pass
         return None
 
     @staticmethod
@@ -124,10 +115,9 @@ class ZssmExplain(Star):
             if isinstance(raw, str) and raw:
                 texts.append(raw)
                 return ("\n".join(texts).strip(), images)
-        try:
-            return (str(payload), images)
-        except Exception:
-            return ("", images)
+        # 无法解析出有意义的文本，返回空字符串而非对象字符串，避免误导 LLM
+        logger.warning("zssm_explain: failed to extract text from OneBot payload; fallback to empty text")
+        return ("", images)
 
     @staticmethod
     def _filter_supported_images(images: List[str]) -> List[str]:
@@ -153,52 +143,103 @@ class ZssmExplain(Star):
                 ml = [str(m).lower() for m in mods]
                 if any(k in ml for k in ["image", "vision", "multimodal", "vl", "picture"]):
                     return True
-        except Exception:
+        except (AttributeError, TypeError):
             pass
         # 一些 Provider 将信息挂在 config/model_config
         for attr in ("config", "model_config", "model"):
             try:
                 val = getattr(provider, attr, None)
-                if isinstance(val, dict):
-                    text = str(val)
-                else:
-                    text = str(val)
+                text = str(val)
                 lt = text.lower()
                 if any(k in lt for k in ["image", "vision", "multimodal", "vl", "gpt-4o", "gemini", "minicpm-v"]):
                     return True
-            except Exception:
+            except (AttributeError, TypeError, ValueError):
                 pass
         return False
 
-    def _select_caption_provider(self, event: AstrMessageEvent, prefer: Any) -> Any:
-        """选择可用于图片转述的 Provider：
-        1) 优先使用插件配置的 image_provider_id；
-        2) 其次使用当前会话 Provider（若具备图片能力）；
-        3) 再次在全部 Provider 中查找具备图片能力的第一个。
+    def _select_primary_provider(self, session_provider: Any, image_urls: List[str]) -> Any:
+        """根据是否包含图片选择首选 Provider。
+        - 图片：优先配置 image_provider_id；否则首选会话 Provider（需具备图片能力）；否则从全部 Provider 中挑首个具备图片能力的；否则回退会话 Provider。
+        - 文本：优先配置 text_provider_id；否则采用会话 Provider。
         """
-        # 1) 配置优先
-        try:
+        images_present = bool(image_urls)
+        if images_present:
             cfg_img = self._get_config_provider("image_provider_id")
             if cfg_img is not None:
                 return cfg_img
-        except Exception:
-            pass
-        # 2) 当前会话 Provider
-        try:
-            if self._provider_supports_image(prefer):
-                return prefer
-        except Exception:
-            pass
-        # 3) 全部 Provider 中查找
-        try:
+            if session_provider and self._provider_supports_image(session_provider):
+                return session_provider
             for p in self.context.get_all_providers():
-                if p is prefer:
+                if p is session_provider:
                     continue
                 if self._provider_supports_image(p):
                     return p
-        except Exception:
-            pass
-        return prefer
+            return session_provider
+        else:
+            cfg_txt = self._get_config_provider("text_provider_id")
+            if cfg_txt is not None:
+                return cfg_txt
+            return session_provider
+
+    async def _call_llm_with_fallback(
+        self,
+        primary: Any,
+        session_provider: Any,
+        user_prompt: str,
+        system_prompt: str,
+        image_urls: List[str],
+    ) -> Any:
+        """执行 LLM 调用与统一回退：
+        - 先 primary，再 session_provider（若不同），然后遍历全部 Provider。
+        - 图片场景仅尝试具备图片能力的 Provider；文本场景尝试所有 Provider。
+        """
+        tried = set()
+        images_present = bool(image_urls)
+
+        async def _try_call(p: Any) -> Optional[Any]:
+            return await p.text_chat(
+                prompt=user_prompt,
+                context=[],
+                system_prompt=system_prompt,
+                image_urls=image_urls,
+            )
+
+        # 1) primary
+        if primary is not None:
+            tried.add(id(primary))
+            try:
+                return await _try_call(primary)
+            except Exception:
+                pass
+
+        # 2) session provider
+        if session_provider is not None and id(session_provider) not in tried:
+            tried.add(id(session_provider))
+            try:
+                # 图片时校验能力
+                if not images_present or self._provider_supports_image(session_provider):
+                    return await _try_call(session_provider)
+            except Exception:
+                pass
+
+        # 3) enumerate others
+        for p in self.context.get_all_providers():
+            if id(p) in tried:
+                continue
+            if images_present and not self._provider_supports_image(p):
+                continue
+            tried.add(id(p))
+            try:
+                resp = await _try_call(p)
+                logger.info(
+                    "zssm_explain: fallback %s provider succeeded",
+                    "vision" if images_present else "text",
+                )
+                return resp
+            except Exception:
+                continue
+
+        raise RuntimeError("all providers failed for current request")
 
     async def _extract_quoted_payload(self, event: AstrMessageEvent) -> Tuple[Optional[str], List[str]]:
         """从当前事件中获取被回复消息的文本与图片。
@@ -279,9 +320,38 @@ class ZssmExplain(Star):
                     txt = getattr(seg, "text", None)
                     if isinstance(txt, str) and txt.strip():
                         return txt
-            except Exception:
+            except (AttributeError, TypeError):
                 continue
         return ""
+
+    @staticmethod
+    def _chain_has_at_me(chain: List[object], self_id: str) -> bool:
+        """检测消息链是否 @ 了当前 Bot。"""
+        if not isinstance(chain, list):
+            return False
+        for seg in chain:
+            try:
+                if isinstance(seg, Comp.At):
+                    qq = getattr(seg, "qq", None)
+                    if qq is not None and str(qq) == str(self_id):
+                        return True
+            except (AttributeError, TypeError):
+                continue
+        return False
+
+    def _already_handled(self, event: AstrMessageEvent) -> bool:
+        """同一事件只处理一次，避免指令与关键词双触发产生重复回复。"""
+        try:
+            extras = event.get_extra()
+            if isinstance(extras, dict) and extras.get("zssm_handled"):
+                return True
+        except Exception:
+            pass
+        try:
+            event.set_extra("zssm_handled", True)
+        except Exception:
+            pass
+        return False
 
     @staticmethod
     def _strip_trigger_and_get_content(text: str) -> str:
@@ -401,6 +471,8 @@ class ZssmExplain(Star):
     @filter.command("zssm", alias={"知识说明", "解释"})
     async def zssm(self, event: AstrMessageEvent):
         """解释被回复消息：/zssm 或关键词触发；若携带内容则直接解释该内容，否则按回复消息逻辑。"""
+        if self._already_handled(event):
+            return
         inline = self._get_inline_content(event)
         if inline:
             text, images = inline, []
@@ -409,6 +481,7 @@ class ZssmExplain(Star):
             if not text and not images:
                 # 未携带被回复内容时的提示
                 yield event.plain_result("请输入要解释的内容。")
+                event.stop_event()
                 return
 
         try:
@@ -426,91 +499,29 @@ class ZssmExplain(Star):
         image_urls = self._filter_supported_images(images)
 
         try:
-            # 决定首选 Provider：配置优先
-            call_provider = provider
-            if image_urls:
-                cfg_img = self._get_config_provider("image_provider_id")
-                if cfg_img is not None:
-                    call_provider = cfg_img
-                else:
-                    # 若未配置，优先使用具备 vision 能力的 Provider
-                    call_provider = provider if self._provider_supports_image(provider) else self._select_caption_provider(event, provider)
-            else:
-                cfg_txt = self._get_config_provider("text_provider_id")
-                if cfg_txt is not None:
-                    call_provider = cfg_txt
-
-            # 首次尝试
-            try:
-                llm_resp = await call_provider.text_chat(
-                    prompt=user_prompt,
-                    context=[],
-                    system_prompt=system_prompt,
-                    image_urls=image_urls,
-                )
-            except Exception as e1:
-                llm_resp = None
-                # 回退路径：
-                tried = {id(call_provider)}
-                # 1) 若为图片场景，尝试其他 vision Provider
-                if image_urls:
-                    try:
-                        # 优先尝试当前会话 Provider（若未作为首选）
-                        if provider and id(provider) not in tried and self._provider_supports_image(provider):
-                            tried.add(id(provider))
-                            try:
-                                llm_resp = await provider.text_chat(
-                                    prompt=user_prompt,
-                                    context=[],
-                                    system_prompt=system_prompt,
-                                    image_urls=image_urls,
-                                )
-                            except Exception:
-                                pass
-                        # 再尝试其余 vision Provider
-                        if llm_resp is None:
-                            for p in self.context.get_all_providers():
-                                if id(p) in tried:
-                                    continue
-                                tried.add(id(p))
-                                if not self._provider_supports_image(p):
-                                    continue
-                                try:
-                                    llm_resp = await p.text_chat(
-                                        prompt=user_prompt,
-                                        context=[],
-                                        system_prompt=system_prompt,
-                                        image_urls=image_urls,
-                                    )
-                                    logger.info("zssm_explain: fallback vision provider succeeded")
-                                    break
-                                except Exception:
-                                    continue
-                    except Exception:
-                        pass
-                else:
-                    # 文本场景：尝试当前会话 Provider（若非首选）
-                    if provider and id(provider) not in tried:
-                        tried.add(id(provider))
-                        try:
-                            llm_resp = await provider.text_chat(
-                                prompt=user_prompt,
-                                context=[],
-                                system_prompt=system_prompt,
-                                image_urls=[],
-                            )
-                        except Exception:
-                            pass
-
-                if llm_resp is None:
-                    raise e1
-
+            # 统一选择与回退
+            call_provider = self._select_primary_provider(provider, image_urls)
+            llm_resp = await self._call_llm_with_fallback(
+                primary=call_provider,
+                session_provider=provider,
+                user_prompt=user_prompt,
+                system_prompt=system_prompt,
+                image_urls=image_urls,
+            )
             reply_text = self._pick_llm_text(llm_resp)
             yield event.plain_result(reply_text)
+            # 防止后续流程重复处理当前事件
+            try:
+                event.stop_event()
+            except Exception:
+                pass
         except Exception as e:
             logger.error(f"zssm_explain: LLM 调用失败: {e}")
-            # 文字场景或所有回退均失败
             yield event.plain_result("解释失败：LLM 或图片转述模型调用异常，请稍后再试或联系管理员。")
+            try:
+                event.stop_event()
+            except Exception:
+                pass
 
     async def terminate(self):
         return
@@ -526,11 +537,20 @@ class ZssmExplain(Star):
         except Exception:
             chain = getattr(event.message_obj, "message", []) if hasattr(event, "message_obj") else []
         head = self._first_plain_head_text(chain)
-        # 指令冲突：首个 Plain 段是 /zssm 则交由指令处理
+        # 如果 @ 了 Bot 并且首个 Plain 文本是 zssm，则交由指令处理以避免重复
+        at_me = False
+        try:
+            self_id = event.get_self_id()
+            at_me = self._chain_has_at_me(chain, self_id)
+        except Exception:
+            at_me = False
         if isinstance(head, str) and head.strip():
-            if re.match(r"^\s*/\s*zssm(\s|$)", head.strip(), re.I):
+            hs = head.strip()
+            if re.match(r"^\s*/\s*zssm(\s|$)", hs, re.I):
                 return
-            if self._is_zssm_trigger(head):
+            if at_me and re.match(r"^zssm(\s|$)", hs, re.I):
+                return
+            if self._is_zssm_trigger(hs):
                 async for r in self.zssm(event):
                     yield r
                 return
@@ -542,6 +562,8 @@ class ZssmExplain(Star):
         if isinstance(text, str) and text.strip():
             t = text.strip()
             if re.match(r"^\s*/\s*zssm(\s|$)", t, re.I):
+                return
+            if at_me and re.match(r"^zssm(\s|$)", t, re.I):
                 return
             if self._is_zssm_trigger(t):
                 async for r in self.zssm(event):
