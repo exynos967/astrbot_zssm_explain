@@ -26,8 +26,8 @@ DEFAULT_IMAGE_USER_PROMPT = (
 @register(
     "zssm_explain",
     "薄暝",
-    "zssm，回复消息或关键词触发；支持“zssm + 内容”直接解释；引用+@ 场景；Napcat get_msg 回溯图片；按 Provider ID 选择文本/图片模型并带回退；未回复仅发 zssm 时提示；默认提示词可在 main.py 顶部修改",
-    "0.2.1",
+    "zssm，回复消息或关键词触发；支持“zssm + 内容”直接解释；引用+@ 场景；支持 QQ 合并转发（forward/nodes）解析并合并解释；Napcat get_msg/get_forward_msg 回溯；按 Provider ID 选择文本/图片模型并带回退；未回复仅发 zssm 时提示；默认提示词可在 main.py 顶部修改",
+    "0.2.2",
     "https://github.com/xiaoxi68/astrbot_zssm_explain",
 )
 class ZssmExplain(Star):
@@ -40,7 +40,7 @@ class ZssmExplain(Star):
 
     @staticmethod
     def _extract_text_and_images_from_chain(chain: List[object]) -> Tuple[str, List[str]]:
-        """从一段消息链中提取纯文本与图片地址/路径。"""
+        """从一段消息链中提取纯文本与图片地址/路径；支持合并转发节点的递归提取。"""
         texts: List[str] = []
         images: List[str] = []
         for seg in chain:
@@ -55,6 +55,33 @@ class ZssmExplain(Star):
                         images.append(f)
                     elif isinstance(u, str) and u:
                         images.append(u)
+                elif hasattr(Comp, "Node") and isinstance(seg, getattr(Comp, "Node")):
+                    content = getattr(seg, "content", None)
+                    if isinstance(content, list):
+                        t2, i2 = ZssmExplain._extract_text_and_images_from_chain(content)
+                        if t2:
+                            texts.append(t2)
+                        images.extend(i2)
+                elif hasattr(Comp, "Nodes") and isinstance(seg, getattr(Comp, "Nodes")):
+                    nodes = getattr(seg, "nodes", None) or getattr(seg, "content", None)
+                    if isinstance(nodes, list):
+                        for node in nodes:
+                            c = getattr(node, "content", None)
+                            if isinstance(c, list):
+                                t2, i2 = ZssmExplain._extract_text_and_images_from_chain(c)
+                                if t2:
+                                    texts.append(t2)
+                                images.extend(i2)
+                elif hasattr(Comp, "Forward") and isinstance(seg, getattr(Comp, "Forward")):
+                    nodes = getattr(seg, "nodes", None) or getattr(seg, "content", None)
+                    if isinstance(nodes, list):
+                        for node in nodes:
+                            c = getattr(node, "content", None)
+                            if isinstance(c, list):
+                                t2, i2 = ZssmExplain._extract_text_and_images_from_chain(c)
+                                if t2:
+                                    texts.append(t2)
+                                images.extend(i2)
             except (AttributeError, TypeError, ValueError) as e:
                 logger.warning(f"zssm_explain: parse chain segment failed: {e}")
         return ("\n".join([t for t in texts if t]).strip(), images)
@@ -84,12 +111,23 @@ class ZssmExplain(Star):
         return None
 
     @staticmethod
+    def _ob_data(obj: Any) -> Dict[str, Any]:
+        """OneBot 风格响应可能包裹在 data 字段中，展开后返回字典。"""
+        if isinstance(obj, dict):
+            data = obj.get("data")
+            if isinstance(data, dict):
+                return data
+            return obj
+        return {}
+
+    @staticmethod
     def _extract_from_onebot_message_payload(payload: Any) -> Tuple[str, List[str]]:
-        """从 OneBot/Napcat get_msg 返回的 payload 中提取文本与图片。"""
+        """从 OneBot/Napcat get_msg 返回的 payload 中提取文本与图片；识别 forward/nodes 由上层处理。"""
         texts: List[str] = []
         images: List[str] = []
-        if isinstance(payload, dict):
-            msg = payload.get("message")
+        data = ZssmExplain._ob_data(payload) if isinstance(payload, dict) else {}
+        if isinstance(data, dict):
+            msg = data.get("message") or data.get("messages")
             if isinstance(msg, list):
                 for seg in msg:
                     try:
@@ -105,13 +143,14 @@ class ZssmExplain(Star):
                             url = d.get("url") or d.get("file")
                             if isinstance(url, str) and url:
                                 images.append(url)
+                        # 对于 forward/nodes，不在此层解析，由上层触发 get_forward_msg 获取节点
                     except Exception as e:
                         logger.warning(f"zssm_explain: parse onebot segment failed: {e}")
                 return ("\n".join([t for t in texts if t]).strip(), images)
             elif isinstance(msg, str) and msg:
                 texts.append(msg)
                 return ("\n".join(texts).strip(), images)
-            raw = payload.get("raw_message")
+            raw = data.get("raw_message")
             if isinstance(raw, str) and raw:
                 texts.append(raw)
                 return ("\n".join(texts).strip(), images)
@@ -276,15 +315,69 @@ class ZssmExplain(Star):
         if reply_id and platform_name == "aiocqhttp" and hasattr(event, "bot"):
             try:
                 ret: Dict[str, Any] = await event.bot.api.call_action("get_msg", message_id=reply_id)
-                t2, imgs2 = self._extract_from_onebot_message_payload(ret)
-                if t2 or imgs2:
+                data = ZssmExplain._ob_data(ret)
+                # 先解析普通文本/图片
+                t2, imgs2 = self._extract_from_onebot_message_payload(data)
+                agg_texts: List[str] = [t2] if t2 else []
+                agg_imgs: List[str] = list(imgs2)
+                # 检测是否包含合并转发段，尝试调用 get_forward_msg 拉取节点
+                try:
+                    msg_list = data.get("message") if isinstance(data, dict) else None
+                    if isinstance(msg_list, list):
+                        for seg in msg_list:
+                            if not isinstance(seg, dict):
+                                continue
+                            if seg.get("type") in ("forward", "forward_msg", "nodes"):
+                                d = seg.get("data", {}) if isinstance(seg.get("data"), dict) else {}
+                                fid = d.get("id")
+                                if isinstance(fid, str) and fid:
+                                    try:
+                                        fwd = await event.bot.api.call_action("get_forward_msg", id=fid)
+                                        ft, fi = self._extract_from_onebot_forward_payload(fwd)
+                                        if ft:
+                                            agg_texts.append(ft)
+                                        if fi:
+                                            agg_imgs.extend(fi)
+                                    except Exception as fe:
+                                        logger.warning(f"zssm_explain: get_forward_msg failed: {fe}")
+                except Exception:
+                    pass
+                if agg_texts or agg_imgs:
                     logger.info("zssm_explain: fetched origin via get_msg")
-                    return (t2, imgs2)
+                    return ("\n".join([x for x in agg_texts if x]).strip(), agg_imgs)
             except Exception as e:
                 logger.warning(f"zssm_explain: get_msg failed: {e}")
 
         logger.info("zssm_explain: reply component found but no embedded origin; consider platform API to fetch by id")
         return (None, [])
+
+    @staticmethod
+    def _extract_from_onebot_forward_payload(payload: Any) -> Tuple[str, List[str]]:
+        """解析 OneBot get_forward_msg 返回的 messages/nodes 列表，汇总文本与图片。"""
+        texts: List[str] = []
+        images: List[str] = []
+        data = ZssmExplain._ob_data(payload) if isinstance(payload, dict) else {}
+        if isinstance(data, dict):
+            msgs = (
+                data.get("messages")
+                or data.get("message")
+                or data.get("nodes")
+                or data.get("nodeList")
+            )
+            if isinstance(msgs, list):
+                for node in msgs:
+                    try:
+                        content = None
+                        if isinstance(node, dict):
+                            content = node.get("content") or node.get("message")
+                        if isinstance(content, list):
+                            t, i = ZssmExplain._extract_from_onebot_message_payload({"message": content})
+                            if t:
+                                texts.append(t)
+                            images.extend(i)
+                    except Exception:
+                        continue
+        return ("\n".join([x for x in texts if x]).strip(), images)
 
     def _build_user_prompt(self, text: Optional[str], images: List[str]) -> str:
         """仅使用文件顶部的默认常量构建用户提示词，不再读取配置。"""
