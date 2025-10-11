@@ -26,7 +26,7 @@ DEFAULT_IMAGE_USER_PROMPT = (
 @register(
     "zssm_explain",
     "薄暝",
-    "zssm，回复消息或关键词触发；支持“zssm + 内容”直接解释；引用+@ 场景；支持 QQ 合并转发（forward/nodes）解析并合并解释；Napcat get_msg/get_forward_msg 回溯；按 Provider ID 选择文本/图片模型并带回退；未回复仅发 zssm 时提示；默认提示词可在 main.py 顶部修改",
+    "zssm，支持关键词“zssm”（忽略前缀）与“zssm + 内容”直接解释；引用消息（含@）正常处理；支持 QQ 合并转发；未回复仅发 zssm 时提示；默认提示词可在 main.py 顶部修改。",
     "0.2.2",
     "https://github.com/xiaoxi68/astrbot_zssm_explain",
 )
