@@ -1,5 +1,5 @@
 name: astrbot_zssm_explain
-desc: zssm，支持关键词“zssm”（忽略前缀）与“zssm + 内容”直接解释；支持网；支持 QQ 合并转发；默认提示词可在 main.py 顶部修改
+desc: zssm，支持关键词“zssm”（忽略前缀）与“zssm + 内容”直接解释；支持抓取url内容；支持 QQ 合并转发；默认提示词可在 main.py 顶部修改
 version: v0.3.0
 author: 薄暝
 repo: https://github.com/xiaoxi68/astrbot_zssm_explain
