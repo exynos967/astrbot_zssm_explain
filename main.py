@@ -2,12 +2,19 @@ from __future__ import annotations
 
 from typing import List, Tuple, Optional, Any, Dict
 import os
+import asyncio
+import re
+from html import unescape
+
+try:
+    import aiohttp  # 优先使用异步 HTTP 客户端
+except Exception:  # pragma: no cover
+    aiohttp = None  # 运行环境若无 aiohttp，将回退到线程内 urllib
 
 from astrbot.api.event import filter, AstrMessageEvent
 from astrbot.api.star import Context, Star, register
 from astrbot.api import logger
 import astrbot.api.message_components as Comp
-import re
 
 # === 可编辑的默认提示词（用户可直接在此处修改） ===
 DEFAULT_SYSTEM_PROMPT = "你是一个中文助理，擅长从被引用的消息中提炼含义、意图和注意事项。"
@@ -21,6 +28,24 @@ DEFAULT_IMAGE_USER_PROMPT = (
     "请解释这条被回复的消息/图片的含义，输出简洁不超过100字。\n"
     "{text_block}\n包含图片：若无法直接读取图片，请结合上下文或文件名描述。"
 )
+
+DEFAULT_URL_USER_PROMPT = (
+    "你将看到一个网页的关键信息，请输出简版摘要（2-8句，中文）。"
+    "避免口水话，保留事实与结论，适当含链接上下文。\n"
+    "网址: {url}\n"
+    "标题: {title}\n"
+    "描述: {desc}\n"
+    "正文片段: \n{snippet}"
+)
+
+# URL 识别/抓取的默认参数（可通过插件配置覆盖）
+URL_DETECT_ENABLE_KEY = "enable_url_detect"
+URL_FETCH_TIMEOUT_KEY = "url_timeout_sec"
+URL_MAX_CHARS_KEY = "url_max_chars"
+
+DEFAULT_URL_DETECT_ENABLE = True
+DEFAULT_URL_FETCH_TIMEOUT = 8
+DEFAULT_URL_MAX_CHARS = 6000
 
 
 @register(
@@ -475,6 +500,135 @@ class ZssmExplain(Star):
             s = getattr(event, "message_str", "") or ""
         return self._strip_trigger_and_get_content(s)
 
+    # ===== URL 相关：检测、抓取、提取与组装提示词 =====
+    def _get_conf_bool(self, key: str, default: bool) -> bool:
+        try:
+            v = self.config.get(key) if isinstance(self.config, dict) else None
+            if isinstance(v, bool):
+                return v
+            if isinstance(v, str):
+                lv = v.strip().lower()
+                if lv in ("1", "true", "yes", "on"):  # 兼容字符串布尔
+                    return True
+                if lv in ("0", "false", "no", "off"):
+                    return False
+        except Exception:
+            pass
+        return default
+
+    def _get_conf_int(self, key: str, default: int, min_v: int = 1, max_v: int = 120000) -> int:
+        try:
+            v = self.config.get(key) if isinstance(self.config, dict) else None
+            if isinstance(v, int):
+                return max(min(v, max_v), min_v)
+            if isinstance(v, str) and v.strip().isdigit():
+                return max(min(int(v.strip()), max_v), min_v)
+        except Exception:
+            pass
+        return default
+
+    @staticmethod
+    def _extract_urls_from_text(text: Optional[str]) -> List[str]:
+        if not isinstance(text, str) or not text:
+            return []
+        # 基本 URL 正则：匹配 http/https 及常见顶级域名
+        url_pattern = re.compile(r"(https?://[\w\-._~:/?#\[\]@!$&'()*+,;=%]+)", re.IGNORECASE)
+        urls = [m.group(1) for m in url_pattern.finditer(text)]
+        # 去重并保持顺序
+        seen = set()
+        uniq = []
+        for u in urls:
+            if u not in seen:
+                uniq.append(u)
+                seen.add(u)
+        return uniq
+
+    async def _fetch_html(self, url: str, timeout_sec: int) -> Optional[str]:
+        """获取网页 HTML 文本：优先 aiohttp；回退 urllib 在线程池中执行，避免阻塞事件循环。"""
+        async def _aiohttp_fetch() -> Optional[str]:
+            if aiohttp is None:
+                return None
+            try:
+                async with aiohttp.ClientSession(headers={
+                    "User-Agent": "AstrBot-zssm/1.0 (+https://github.com/xiaoxi68/astrbot_zssm_explain)"
+                }) as session:
+                    async with session.get(url, timeout=timeout_sec, allow_redirects=True) as resp:
+                        if resp.status >= 200 and resp.status < 400:
+                            # 推测编码
+                            text = await resp.text()
+                            return text
+                        return None
+            except Exception as e:
+                logger.warning(f"zssm_explain: aiohttp fetch failed: {e}")
+                return None
+
+        async def _urllib_fetch() -> Optional[str]:
+            import urllib.request
+            import urllib.error
+            def _do() -> Optional[str]:
+                try:
+                    req = urllib.request.Request(url, headers={
+                        "User-Agent": "AstrBot-zssm/1.0 (+https://github.com/xiaoxi68/astrbot_zssm_explain)"
+                    })
+                    with urllib.request.urlopen(req, timeout=timeout_sec) as resp:
+                        data = resp.read()
+                        # 尝试从头部/内容推断编码；回退 utf-8
+                        enc = resp.headers.get_content_charset() or "utf-8"
+                        try:
+                            return data.decode(enc, errors="replace")
+                        except Exception:
+                            return data.decode("utf-8", errors="replace")
+                except Exception as e:
+                    logger.warning(f"zssm_explain: urllib fetch failed: {e}")
+                    return None
+            loop = asyncio.get_running_loop()
+            return await loop.run_in_executor(None, _do)
+
+        html = await _aiohttp_fetch()
+        if html is not None:
+            return html
+        return await _urllib_fetch()
+
+    @staticmethod
+    def _strip_html(html: str) -> str:
+        # 去掉 script/style
+        html = re.sub(r"<script[\s\S]*?</script>", " ", html, flags=re.IGNORECASE)
+        html = re.sub(r"<style[\s\S]*?</style>", " ", html, flags=re.IGNORECASE)
+        # 基础去标签
+        text = re.sub(r"<[^>]+>", " ", html)
+        text = unescape(text)
+        text = re.sub(r"\s+", " ", text)
+        return text.strip()
+
+    @staticmethod
+    def _extract_title(html: str) -> str:
+        m = re.search(r"<title[^>]*>(.*?)</title>", html, flags=re.IGNORECASE | re.DOTALL)
+        if m:
+            return unescape(re.sub(r"\s+", " ", m.group(1)).strip())
+        return ""
+
+    @staticmethod
+    def _extract_meta_desc(html: str) -> str:
+        # 常见 meta 描述字段
+        for name in [
+            r"name=\"description\"",
+            r"property=\"og:description\"",
+            r"name=\"twitter:description\"",
+        ]:
+            m = re.search(rf"<meta[^>]+{name}[^>]+content=\"(.*?)\"[^>]*>", html, flags=re.IGNORECASE | re.DOTALL)
+            if m:
+                return unescape(re.sub(r"\s+", " ", m.group(1)).strip())
+        return ""
+
+    def _build_url_user_prompt(self, url: str, html: str) -> Tuple[str, str]:
+        title = self._extract_title(html)
+        desc = self._extract_meta_desc(html)
+        plain = self._strip_html(html)
+        max_chars = self._get_conf_int(URL_MAX_CHARS_KEY, DEFAULT_URL_MAX_CHARS, min_v=1000, max_v=50000)
+        snippet = plain[:max_chars]
+        user_prompt = DEFAULT_URL_USER_PROMPT.format(url=url, title=title or "(无)", desc=desc or "(无)", snippet=snippet)
+        return user_prompt, title or ""
+
     def _pick_llm_text(self, llm_resp: object) -> str:
         # 1) 优先解析 AstrBot 的结果链（MessageChain）
         try:
@@ -567,15 +721,45 @@ class ZssmExplain(Star):
         if self._already_handled(event):
             return
         inline = self._get_inline_content(event)
+        enable_url = self._get_conf_bool(URL_DETECT_ENABLE_KEY, DEFAULT_URL_DETECT_ENABLE)
+
+        # 1) 先解析内联内容
         if inline:
-            text, images = inline, []
+            # 若内联包含 URL，优先走“网页摘要”流程
+            urls = self._extract_urls_from_text(inline) if enable_url else []
+            if urls:
+                target_url = urls[0]
+                timeout_sec = self._get_conf_int(URL_FETCH_TIMEOUT_KEY, DEFAULT_URL_FETCH_TIMEOUT, 2, 60)
+                html = await self._fetch_html(target_url, timeout_sec)
+                if not html:
+                    yield event.plain_result("网页获取失败或不支持，请稍后再试或检查链接可访问性。")
+                    event.stop_event()
+                    return
+                user_prompt, _page_title = self._build_url_user_prompt(target_url, html)
+                text, images = None, []  # 网页模式不直接传原文文本
+            else:
+                text, images = inline, []
+                user_prompt = self._build_user_prompt(text, images)
         else:
+            # 2) 无内联时，尝试被回复消息内容
             text, images = await self._extract_quoted_payload(event)
             if not text and not images:
-                # 未携带被回复内容时的提示
                 yield event.plain_result("请输入要解释的内容。")
                 event.stop_event()
                 return
+            urls = self._extract_urls_from_text(text) if (enable_url and text) else []
+            if urls:
+                target_url = urls[0]
+                timeout_sec = self._get_conf_int(URL_FETCH_TIMEOUT_KEY, DEFAULT_URL_FETCH_TIMEOUT, 2, 60)
+                html = await self._fetch_html(target_url, timeout_sec)
+                if not html:
+                    yield event.plain_result("网页获取失败或不支持，请稍后再试或检查链接可访问性。")
+                    event.stop_event()
+                    return
+                user_prompt, _page_title = self._build_url_user_prompt(target_url, html)
+                text, images = None, []
+            else:
+                user_prompt = self._build_user_prompt(text, images)
 
         try:
             provider = self.context.get_using_provider(umo=event.unified_msg_origin)
@@ -587,7 +771,6 @@ class ZssmExplain(Star):
             yield event.plain_result("未检测到可用的大语言模型提供商，请先在 AstrBot 配置中启用。")
             return
 
-        user_prompt = self._build_user_prompt(text, images)
         system_prompt = self._build_system_prompt()
         image_urls = self._filter_supported_images(images)
 
