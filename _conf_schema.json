@@ -20,13 +20,13 @@
   "url_timeout_sec": {
     "description": "抓取网页超时时间（秒）",
     "type": "int",
-    "default": 8,
+    "default": 20,
     "hint": "范围建议 2-60"
   },
   "url_max_chars": {
     "description": "参与摘要的正文片段最大长度（字符）",
     "type": "int",
-    "default": 6000,
+    "default": 4000,
     "hint": "限制输入规模，避免过长上下文"
   }
 }
