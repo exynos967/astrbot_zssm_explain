@@ -59,6 +59,7 @@ class ZssmExplain(Star):
     def __init__(self, context: Context, config: Optional[Dict[str, Any]] = None):
         super().__init__(context)
         self.config: Dict[str, Any] = config or {}
+        self._last_fetch_info: Dict[str, Any] = {}
 
     async def initialize(self):
         """可选：插件初始化。"""
@@ -545,6 +546,25 @@ class ZssmExplain(Star):
 
     async def _fetch_html(self, url: str, timeout_sec: int) -> Optional[str]:
         """获取网页 HTML 文本：优先 aiohttp；回退 urllib 在线程池中执行，避免阻塞事件循环。"""
+        def _mark(status: Optional[int] = None, headers: Optional[Dict[str, str]] = None, text_hint: Optional[str] = None, via: str = "", error: Optional[str] = None):
+            headers = headers or {}
+            # 简易 Cloudflare 识别：server=cloudflare 或存在 cf-* 响应头；或文本提示
+            server = str(headers.get("server", "")).lower()
+            cf_header = any(h.lower().startswith("cf-") for h in headers.keys()) if headers else False
+            text_has_cf = False
+            if isinstance(text_hint, str):
+                tl = text_hint.lower()
+                if "cloudflare" in tl or "attention required" in tl or "enable javascript and cookies" in tl:
+                    text_has_cf = True
+            is_cf = ("cloudflare" in server) or cf_header or text_has_cf
+            self._last_fetch_info = {
+                "url": url,
+                "status": status,
+                "cloudflare": is_cf,
+                "via": via,
+                "error": error,
+            }
+
         async def _aiohttp_fetch() -> Optional[str]:
             if aiohttp is None:
                 return None
@@ -553,13 +573,18 @@ class ZssmExplain(Star):
                     "User-Agent": "AstrBot-zssm/1.0 (+https://github.com/xiaoxi68/astrbot_zssm_explain)"
                 }) as session:
                     async with session.get(url, timeout=timeout_sec, allow_redirects=True) as resp:
-                        if resp.status >= 200 and resp.status < 400:
-                            # 推测编码
+                        status = int(resp.status)
+                        hdrs = {k: v for k, v in resp.headers.items()}
+                        if 200 <= status < 400:
                             text = await resp.text()
+                            _mark(status=status, headers=hdrs, text_hint=text[:512], via="aiohttp")
                             return text
+                        # 非 2xx/3xx，记录并返回 None
+                        _mark(status=status, headers=hdrs, text_hint=None, via="aiohttp")
                         return None
             except Exception as e:
                 logger.warning(f"zssm_explain: aiohttp fetch failed: {e}")
+                _mark(status=None, headers=None, text_hint=None, via="aiohttp", error=str(e))
                 return None
 
         async def _urllib_fetch() -> Optional[str]:
@@ -575,10 +600,25 @@ class ZssmExplain(Star):
                         # 尝试从头部/内容推断编码；回退 utf-8
                         enc = resp.headers.get_content_charset() or "utf-8"
                         try:
-                            return data.decode(enc, errors="replace")
+                            text = data.decode(enc, errors="replace")
+                            _mark(status=getattr(resp, "status", 200), headers=dict(resp.headers), text_hint=text[:512], via="urllib")
+                            return text
                         except Exception:
-                            return data.decode("utf-8", errors="replace")
+                            text = data.decode("utf-8", errors="replace")
+                            _mark(status=getattr(resp, "status", 200), headers=dict(resp.headers), text_hint=text[:512], via="urllib")
+                            return text
+                except urllib.error.HTTPError as e:  # 带状态码与响应头
+                    try:
+                        body = e.read() or b""
+                        hint = body.decode("utf-8", errors="ignore")[:512]
+                    except Exception:
+                        hint = None
+                    hdrs = dict(getattr(e, "headers", {}) or {})
+                    _mark(status=getattr(e, "code", None), headers=hdrs, text_hint=hint, via="urllib", error=str(e))
+                    logger.warning(f"zssm_explain: urllib fetch failed: {e}")
+                    return None
                 except Exception as e:
+                    _mark(status=None, headers=None, text_hint=None, via="urllib", error=str(e))
                     logger.warning(f"zssm_explain: urllib fetch failed: {e}")
                     return None
             loop = asyncio.get_running_loop()
@@ -732,7 +772,15 @@ class ZssmExplain(Star):
                 timeout_sec = self._get_conf_int(URL_FETCH_TIMEOUT_KEY, DEFAULT_URL_FETCH_TIMEOUT, 2, 60)
                 html = await self._fetch_html(target_url, timeout_sec)
                 if not html:
-                    yield event.plain_result("网页获取失败或不支持，请稍后再试或检查链接可访问性。")
+                    info = getattr(self, "_last_fetch_info", {}) or {}
+                    if info.get("cloudflare"):
+                        logger.warning(
+                            "zssm_explain: Cloudflare protection detected for URL: %s (status=%s, via=%s)",
+                            target_url, info.get("status"), info.get("via")
+                        )
+                        yield event.plain_result("目标站点启用 Cloudflare 防护，暂无法抓取网页内容。请稍后重试，或发送页面截图/复制关键段落。")
+                    else:
+                        yield event.plain_result("网页获取失败或不支持，请稍后再试或检查链接可访问性。")
                     event.stop_event()
                     return
                 user_prompt, _page_title = self._build_url_user_prompt(target_url, html)
@@ -753,7 +801,15 @@ class ZssmExplain(Star):
                 timeout_sec = self._get_conf_int(URL_FETCH_TIMEOUT_KEY, DEFAULT_URL_FETCH_TIMEOUT, 2, 60)
                 html = await self._fetch_html(target_url, timeout_sec)
                 if not html:
-                    yield event.plain_result("网页获取失败或不支持，请稍后再试或检查链接可访问性。")
+                    info = getattr(self, "_last_fetch_info", {}) or {}
+                    if info.get("cloudflare"):
+                        logger.warning(
+                            "zssm_explain: Cloudflare protection detected for URL: %s (status=%s, via=%s)",
+                            target_url, info.get("status"), info.get("via")
+                        )
+                        yield event.plain_result("目标站点启用 Cloudflare 防护，暂无法抓取网页内容。请稍后重试，或发送页面截图/复制关键段落。")
+                    else:
+                        yield event.plain_result("网页获取失败或不支持，请稍后再试或检查链接可访问性。")
                     event.stop_event()
                     return
                 user_prompt, _page_title = self._build_url_user_prompt(target_url, html)
