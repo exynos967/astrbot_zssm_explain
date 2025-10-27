@@ -15,9 +15,13 @@ from astrbot.api.event import filter, AstrMessageEvent
 from astrbot.api.star import Context, Star, register
 from astrbot.api import logger
 import astrbot.api.message_components as Comp
+from astrbot.core.star.star_handler import EventType
+from astrbot.core.pipeline.context_utils import call_event_hook
 
 # === 可编辑的默认提示词（用户可直接在此处修改） ===
-DEFAULT_SYSTEM_PROMPT = "你是一个中文助理，擅长从被引用的消息中提炼含义、意图和注意事项。"
+DEFAULT_SYSTEM_PROMPT = (
+    "你是一个中文助理，擅长从被引用的消息中提炼含义、意图和注意事项。"
+)
 
 DEFAULT_TEXT_USER_PROMPT = (
     "请解释这条被回复的消息的含义，输出简洁不超过100字。\n"
@@ -31,7 +35,7 @@ DEFAULT_IMAGE_USER_PROMPT = (
 
 DEFAULT_URL_USER_PROMPT = (
     "你将看到一个网页的关键信息，请输出简版摘要（2-8句，中文）。"
-    "避免口水话，保留事实与结论，适当含链接上下文。\n"
+    "避免口水话，保留事实与结论，适当含链接上下文。"
     "网址: {url}\n"
     "标题: {title}\n"
     "描述: {desc}\n"
@@ -740,6 +744,37 @@ class ZssmExplain(Star):
         # 最终兜底：避免打印对象 repr
         return "（未解析到可读内容）"
 
+    # ===== 输出清洗：去除思考/推理内容，仅保留结论性文本 =====
+    @staticmethod
+    def _sanitize_model_output(text: str) -> str:
+        if not isinstance(text, str):
+            return ""
+        s = text.strip()
+        if not s:
+            return s
+        # 1) 去除常见 CoT 包裹：<think>…</think>、```think``` 块
+        s = re.sub(r"(?is)<\s*think\s*>[\s\S]*?<\s*/\s*think\s*>", "", s)
+        s = re.sub(r"(?is)```\s*(think|thinking|reasoning|cot|chain[-_ ]?of[-_ ]?thought)[\s\S]*?```", "", s)
+        # 2) 若存在“答案/结论/回答/总结/Result/Final Answer”等标记，优先保留其后的内容
+        markers = [
+            r"答案[:：]", r"结论[:：]", r"回答[:：]", r"总结[:：]",
+            r"最终答案[:：]?", r"Final Answer[:：]?", r"Result[:：]?",
+        ]
+        for mk in markers:
+            m = re.search(rf"(?is){mk}\s*(.+)$", s)
+            if m:
+                s = m.group(1).strip()
+                break
+        # 3) 去除常见前缀段落：以“思考/推理/分析/计划/步骤/原因/链式推理/思维/思路/推导/内心独白/Reasoning/Thinking/Analysis/Plan/Steps/Rationale/Chain of Thought”开头
+        s = re.sub(r"(?im)^(思考|推理|分析|计划|步骤|原因|链式推理|思维|思路|推导|内心独白)[:：].*(\n\s*\n|$)", "", s)
+        s = re.sub(r"(?im)^(Reasoning|Thinking|Analysis|Plan|Steps|Rationale|Chain[-_ ]?of[-_ ]?Thought)[:：].*(\n\s*\n|$)", "", s)
+        # 同时移除中文括注头如【思考】/【分析】等
+        s = re.sub(r"(?im)^【(思考|分析|推理|思维|计划|步骤)】.*(\n\s*\n|$)", "", s)
+        # 4) 去除开头冗余标记符与多余空白
+        s = re.sub(r"^[#>*\-\s]+", "", s).strip()
+        # 5) 若清洗后为空，则回退原文（避免误删全部内容）
+        return s or text.strip()
+
     def _get_config_provider(self, key: str) -> Optional[Any]:
         """根据插件配置项（text_provider_id / image_provider_id）返回 Provider 实例。"""
         try:
@@ -840,7 +875,33 @@ class ZssmExplain(Star):
                 system_prompt=system_prompt,
                 image_urls=image_urls,
             )
-            reply_text = self._pick_llm_text(llm_resp)
+            # 走标准事件钩子：触发 OnLLMResponseEvent，让 thinking_filter 根据配置统一过滤/展示思考
+            try:
+                await call_event_hook(event, EventType.OnLLMResponseEvent, llm_resp)
+            except Exception:
+                pass
+
+            # 优先使用经钩子可能更新过的 completion_text；否则回退原解析
+            reply_text = None
+            try:
+                ct = getattr(llm_resp, "completion_text", None)
+                if isinstance(ct, str) and ct.strip():
+                    reply_text = ct.strip()
+            except Exception:
+                reply_text = None
+            if not reply_text:
+                reply_text = self._pick_llm_text(llm_resp)
+
+            # 根据 AstrBot 配置是否展示思考，决定是否再做插件侧清洗
+            show_reasoning = False
+            try:
+                cfg = self.context.get_config(umo=event.unified_msg_origin) or {}
+                ps = cfg.get("provider_settings", {})
+                show_reasoning = bool(ps.get("display_reasoning_text", False))
+            except Exception:
+                show_reasoning = False
+            if not show_reasoning:
+                reply_text = self._sanitize_model_output(reply_text)
             yield event.plain_result(reply_text)
             # 防止后续流程重复处理当前事件
             try:

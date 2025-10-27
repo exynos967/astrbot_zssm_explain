@@ -11,7 +11,15 @@
 - 文本支持：可在配置中指定“文本模型”（Provider ID）；失败回退到当前会话 Provider。
 - 提示词：默认提示词位于 `main.py` 顶部 `DEFAULT_*` 常量，直接修改即可（已取消在配置中编辑提示词）。
 - 注意：未回复且未携带内容时，会提示“请输入要解释的内容。”
- - Cloudflare：若目标站点启用 Cloudflare 导致抓取失败，将在日志中标注 `Cloudflare protection detected`，并向用户发送专门提示“目标站点启用 Cloudflare 防护，暂无法抓取网页内容...”。
+- Cloudflare：若目标站点启用 Cloudflare 导致抓取失败，将在日志中标注 `Cloudflare protection detected`，并向用户发送专门提示“目标站点启用 Cloudflare 防护，暂无法抓取网页内容...”。
+
+## 思考内容（Chain-of-Thought）屏蔽
+
+- 已在系统提示中明确禁止输出“思考/推理/中间分析/系统提示/工具调用日志”。
+- 插件会在返回前对模型文本进行清洗：去除 `<think>…</think>`、```think```/```reasoning``` 块；
+  若检测到“答案/结论/Final Answer”等标记，将优先保留其后的内容；
+  同时移除以“思考/推理/分析/计划/步骤/原因/链式推理”开头的段落。
+- 适配 Gemini 提供商：避免输出其思考内容（文本与图片场景）。
   
 ## 配置项
 
