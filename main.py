@@ -35,7 +35,7 @@ DEFAULT_IMAGE_USER_PROMPT = (
 
 DEFAULT_URL_USER_PROMPT = (
     "你将看到一个网页的关键信息，请输出简版摘要（2-8句，中文）。"
-    "避免口水话，保留事实与结论，适当含链接上下文。"
+    "避免口水话，保留事实与结论，适当含链接上下文。\n"
     "网址: {url}\n"
     "标题: {title}\n"
     "描述: {desc}\n"
@@ -56,7 +56,7 @@ DEFAULT_URL_MAX_CHARS = 6000
     "zssm_explain",
     "薄暝",
     "zssm，支持关键词“zssm”（忽略前缀）与“zssm + 内容”直接解释；引用消息（含@）正常处理；支持 QQ 合并转发；未回复仅发 zssm 时提示；默认提示词可在 main.py 顶部修改。",
-    "0.2.2",
+    "0.4.0",
     "https://github.com/xiaoxi68/astrbot_zssm_explain",
 )
 class ZssmExplain(Star):
