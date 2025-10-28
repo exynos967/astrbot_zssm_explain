@@ -56,7 +56,7 @@ DEFAULT_URL_MAX_CHARS = 6000
     "zssm_explain",
     "薄暝",
     "zssm，支持关键词“zssm”（忽略前缀）与“zssm + 内容”直接解释；引用消息（含@）正常处理；支持 QQ 合并转发；未回复仅发 zssm 时提示；默认提示词可在 main.py 顶部修改。",
-    "0.4.0",
+    "0.5.0",
     "https://github.com/xiaoxi68/astrbot_zssm_explain",
 )
 class ZssmExplain(Star):
@@ -67,6 +67,32 @@ class ZssmExplain(Star):
 
     async def initialize(self):
         """可选：插件初始化。"""
+
+    def _reply_text_result(self, event: AstrMessageEvent, text: str):
+        """构造一个显式“回复调用者”的文本消息结果。
+
+        优先使用 Reply 组件引用当前事件的 message_id，无法获取或平台不支持时
+        回退为普通纯文本结果，确保跨平台健壮性。
+        """
+        try:
+            msg_id = None
+            try:
+                msg_id = getattr(event.message_obj, "message_id", None)
+            except Exception:
+                msg_id = None
+            if msg_id:
+                try:
+                    chain = [
+                        Comp.Reply(id=str(msg_id)),
+                        Comp.Plain(str(text) if text is not None else ""),
+                    ]
+                    return event.chain_result(chain)
+                except Exception:
+                    # 某些平台或适配器不支持 Reply 组件
+                    pass
+            return event.plain_result(str(text) if text is not None else "")
+        except Exception:
+            return event.plain_result(str(text) if text is not None else "")
 
     @staticmethod
     def _extract_text_and_images_from_chain(chain: List[object]) -> Tuple[str, List[str]]:
@@ -813,9 +839,9 @@ class ZssmExplain(Star):
                             "zssm_explain: Cloudflare protection detected for URL: %s (status=%s, via=%s)",
                             target_url, info.get("status"), info.get("via")
                         )
-                        yield event.plain_result("目标站点启用 Cloudflare 防护，暂无法抓取网页内容。请稍后重试，或发送页面截图/复制关键段落。")
+                        yield self._reply_text_result(event, "目标站点启用 Cloudflare 防护，暂无法抓取网页内容。请稍后重试，或发送页面截图/复制关键段落。")
                     else:
-                        yield event.plain_result("网页获取失败或不支持，请稍后再试或检查链接可访问性。")
+                        yield self._reply_text_result(event, "网页获取失败或不支持，请稍后再试或检查链接可访问性。")
                     event.stop_event()
                     return
                 user_prompt, _page_title = self._build_url_user_prompt(target_url, html)
@@ -827,7 +853,7 @@ class ZssmExplain(Star):
             # 2) 无内联时，尝试被回复消息内容
             text, images = await self._extract_quoted_payload(event)
             if not text and not images:
-                yield event.plain_result("请输入要解释的内容。")
+                yield self._reply_text_result(event, "请输入要解释的内容。")
                 event.stop_event()
                 return
             urls = self._extract_urls_from_text(text) if (enable_url and text) else []
@@ -842,9 +868,9 @@ class ZssmExplain(Star):
                             "zssm_explain: Cloudflare protection detected for URL: %s (status=%s, via=%s)",
                             target_url, info.get("status"), info.get("via")
                         )
-                        yield event.plain_result("目标站点启用 Cloudflare 防护，暂无法抓取网页内容。请稍后重试，或发送页面截图/复制关键段落。")
+                        yield self._reply_text_result(event, "目标站点启用 Cloudflare 防护，暂无法抓取网页内容。请稍后重试，或发送页面截图/复制关键段落。")
                     else:
-                        yield event.plain_result("网页获取失败或不支持，请稍后再试或检查链接可访问性。")
+                        yield self._reply_text_result(event, "网页获取失败或不支持，请稍后再试或检查链接可访问性。")
                     event.stop_event()
                     return
                 user_prompt, _page_title = self._build_url_user_prompt(target_url, html)
@@ -859,7 +885,7 @@ class ZssmExplain(Star):
             provider = None
 
         if not provider:
-            yield event.plain_result("未检测到可用的大语言模型提供商，请先在 AstrBot 配置中启用。")
+            yield self._reply_text_result(event, "未检测到可用的大语言模型提供商，请先在 AstrBot 配置中启用。")
             return
 
         system_prompt = self._build_system_prompt()
@@ -902,7 +928,7 @@ class ZssmExplain(Star):
                 show_reasoning = False
             if not show_reasoning:
                 reply_text = self._sanitize_model_output(reply_text)
-            yield event.plain_result(reply_text)
+            yield self._reply_text_result(event, reply_text)
             # 防止后续流程重复处理当前事件
             try:
                 event.stop_event()
@@ -910,7 +936,7 @@ class ZssmExplain(Star):
                 pass
         except Exception as e:
             logger.error(f"zssm_explain: LLM 调用失败: {e}")
-            yield event.plain_result("解释失败：LLM 或图片转述模型调用异常，请稍后再试或联系管理员。")
+            yield self._reply_text_result(event, "解释失败：LLM 或图片转述模型调用异常，请稍后再试或联系管理员。")
             try:
                 event.stop_event()
             except Exception:
