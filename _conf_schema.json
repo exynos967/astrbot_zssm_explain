@@ -1,13 +1,13 @@
 {
   "group_list_mode": {
-    "description": "群聊权限模式（whitelist/blacklist/none）",
+    "description": "群聊权限模式",
     "type": "string",
     "options": ["whitelist", "blacklist", "none"],
     "default": "none",
     "hint": "whitelist: 仅允许列表内群；blacklist: 拒绝列表内群；none: 不限制"
   },
   "group_list": {
-    "description": "群号列表（字符串或数字，建议填 QQ 群号）",
+    "description": "群号列表（填 QQ 群号）",
     "type": "list",
     "items": { "type": "string" },
     "default": [],
