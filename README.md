@@ -9,7 +9,7 @@
 - 合并转发支持：QQ 合并转发（forward/nodes）可自动拉取节点并合并解释。
 - 图片支持：Napcat/OneBot 回复仅含 message_id 时自动回溯 `get_msg`；图片将优先使用配置的“图片转述模型”（Provider ID），失败回退到其它具备图片能力的 Provider。
 - 文本支持：可在配置中指定“文本模型”（Provider ID）；失败回退到当前会话 Provider。
-- 提示词：默认提示词位于 `main.py` 顶部 `DEFAULT_*` 常量，直接修改即可（已取消在配置中编辑提示词）。
+- 提示词：默认提示词位于 `main.py` 顶部 `DEFAULT_*` 常量，直接修改即可。
 - 注意：未回复且未携带内容时，会提示“请输入要解释的内容。”
 - Cloudflare：若目标站点启用 Cloudflare 导致抓取失败，将在日志中标注 `Cloudflare protection detected`，并向用户发送专门提示“目标站点启用 Cloudflare 防护，暂无法抓取网页内容...”。
 
@@ -26,6 +26,10 @@
 - `enable_url_detect`：是否启用 URL 识别与网页摘要（默认开启）。
 - `url_timeout_sec`：抓取网页超时（默认 8 秒）。
 - `url_max_chars`：参与摘要的正文片段最大长度（默认 6000 字符）。
+
+## TODO List
+
+- 支持视频
 
 > 如关闭 `enable_url_detect`，`zssm <url>` 将按普通文本解释，不抓取网页。
 
