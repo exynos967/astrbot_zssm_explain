@@ -1,4 +1,18 @@
 {
+  "group_list_mode": {
+    "description": "群聊权限模式（whitelist/blacklist/none）",
+    "type": "string",
+    "options": ["whitelist", "blacklist", "none"],
+    "default": "none",
+    "hint": "whitelist: 仅允许列表内群；blacklist: 拒绝列表内群；none: 不限制"
+  },
+  "group_list": {
+    "description": "群号列表（字符串或数字，建议填 QQ 群号）",
+    "type": "list",
+    "items": { "type": "string" },
+    "default": [],
+    "hint": "仅在 whitelist/blacklist 下生效；留空等效于无限制"
+  },
   "text_provider_id": {
     "description": "文本解释优先使用的 Provider ID",
     "type": "string",

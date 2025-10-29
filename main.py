@@ -46,6 +46,8 @@ DEFAULT_URL_USER_PROMPT = (
 URL_DETECT_ENABLE_KEY = "enable_url_detect"
 URL_FETCH_TIMEOUT_KEY = "url_timeout_sec"
 URL_MAX_CHARS_KEY = "url_max_chars"
+GROUP_LIST_MODE_KEY = "group_list_mode"
+GROUP_LIST_KEY = "group_list"
 
 DEFAULT_URL_DETECT_ENABLE = True
 DEFAULT_URL_FETCH_TIMEOUT = 8
@@ -56,7 +58,7 @@ DEFAULT_URL_MAX_CHARS = 6000
     "zssm_explain",
     "薄暝",
     "zssm，支持关键词“zssm”（忽略前缀）与“zssm + 内容”直接解释；引用消息（含@）正常处理；支持 QQ 合并转发；未回复仅发 zssm 时提示；默认提示词可在 main.py 顶部修改。",
-    "0.5.0",
+    "0.8.0",
     "https://github.com/xiaoxi68/astrbot_zssm_explain",
 )
 class ZssmExplain(Star):
@@ -93,6 +95,61 @@ class ZssmExplain(Star):
             return event.plain_result(str(text) if text is not None else "")
         except Exception:
             return event.plain_result(str(text) if text is not None else "")
+
+    # ===== 群聊权限控制 =====
+    def _get_conf_str(self, key: str, default: str) -> str:
+        try:
+            v = self.config.get(key) if isinstance(self.config, dict) else None
+            if isinstance(v, str):
+                return v.strip()
+        except Exception:
+            pass
+        return default
+
+    def _get_conf_list_str(self, key: str) -> List[str]:
+        try:
+            v = self.config.get(key) if isinstance(self.config, dict) else None
+            if isinstance(v, list):
+                out: List[str] = []
+                for it in v:
+                    if isinstance(it, (str, int)):
+                        s = str(it).strip()
+                        if s:
+                            out.append(s)
+                return out
+            if isinstance(v, str) and v.strip():
+                # 兼容以逗号/空白分隔的字符串
+                raw = [x.strip() for x in re.split(r"[\s,]+", v) if x.strip()]
+                return raw
+        except Exception:
+            pass
+        return []
+
+    def _is_group_allowed(self, event: AstrMessageEvent) -> bool:
+        """根据配置的白/黑名单判断是否允许在该群聊中使用插件。
+        模式：
+        - whitelist：仅允许在列表内群使用
+        - blacklist：拒绝列表内群使用
+        - none：不限制
+        当无法获取 group_id 时（如私聊），默认放行。
+        """
+        try:
+            gid = event.get_group_id()
+        except Exception:
+            gid = None
+        if not gid:
+            return True  # 非群聊或无法识别，放行
+
+        mode = self._get_conf_str(GROUP_LIST_MODE_KEY, "none").lower()
+        if mode not in ("whitelist", "blacklist", "none"):
+            mode = "none"
+        glist = self._get_conf_list_str(GROUP_LIST_KEY)
+
+        if mode == "whitelist":
+            return str(gid) in glist if glist else False
+        if mode == "blacklist":
+            return str(gid) not in glist if glist else True
+        return True
 
     @staticmethod
     def _extract_text_and_images_from_chain(chain: List[object]) -> Tuple[str, List[str]]:
@@ -819,6 +876,12 @@ class ZssmExplain(Star):
     @filter.command("zssm", alias={"知识说明", "解释"})
     async def zssm(self, event: AstrMessageEvent):
         """解释被回复消息：/zssm 或关键词触发；若携带内容则直接解释该内容，否则按回复消息逻辑。"""
+        # 群聊权限控制：不满足条件则直接忽略
+        try:
+            if not self._is_group_allowed(event):
+                return
+        except Exception:
+            pass
         if self._already_handled(event):
             return
         inline = self._get_inline_content(event)
@@ -950,6 +1013,12 @@ class ZssmExplain(Star):
         """关键词触发：忽略常见前缀/Reply/At 等，检测首个 Plain 段的 zssm。
         避免与 /zssm 指令重复：若以 /zssm 开头则交由指令处理。
         """
+        # 群聊权限控制：不满足条件则直接忽略
+        try:
+            if not self._is_group_allowed(event):
+                return
+        except Exception:
+            pass
         # 优先使用消息链首个 Plain 段判断
         try:
             chain = event.get_messages()
