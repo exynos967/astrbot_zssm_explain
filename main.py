@@ -4,6 +4,11 @@ from typing import List, Tuple, Optional, Any, Dict
 import os
 import asyncio
 import re
+import json
+import shutil
+import tempfile
+import subprocess
+from urllib.parse import urlparse, unquote
 from html import unescape
 
 try:
@@ -48,10 +53,32 @@ URL_FETCH_TIMEOUT_KEY = "url_timeout_sec"
 URL_MAX_CHARS_KEY = "url_max_chars"
 GROUP_LIST_MODE_KEY = "group_list_mode"
 GROUP_LIST_KEY = "group_list"
+VIDEO_PROVIDER_ID_KEY = "video_provider_id"
+ENABLE_VIDEO_EXPLAIN_KEY = "enable_video_explain"
+VIDEO_FRAME_INTERVAL_SEC_KEY = "video_frame_interval_sec"
+VIDEO_FRAME_COUNT_LIMIT_KEY = "video_frame_count_limit"
+VIDEO_ASR_ENABLE_KEY = "video_asr_enable"
+VIDEO_MAX_DURATION_SEC_KEY = "video_max_duration_sec"
+VIDEO_MAX_SIZE_MB_KEY = "video_max_size_mb"
+FFMPEG_PATH_KEY = "ffmpeg_path"
+ASR_PROVIDER_ID_KEY = "asr_provider_id"
 
 DEFAULT_URL_DETECT_ENABLE = True
 DEFAULT_URL_FETCH_TIMEOUT = 8
 DEFAULT_URL_MAX_CHARS = 6000
+DEFAULT_ENABLE_VIDEO_EXPLAIN = True
+DEFAULT_VIDEO_FRAME_INTERVAL_SEC = 6
+DEFAULT_VIDEO_FRAME_COUNT_LIMIT = 6
+DEFAULT_VIDEO_ASR_ENABLE = False
+DEFAULT_VIDEO_MAX_DURATION_SEC = 120
+DEFAULT_VIDEO_MAX_SIZE_MB = 50
+DEFAULT_FFMPEG_PATH = "ffmpeg"
+
+# 视频提示词模板（可被 _conf_schema.json 覆盖）
+DEFAULT_VIDEO_USER_PROMPT = (
+    "请解释这段视频的主要内容，输出简洁不超过100字。已提供关键帧与可用音频摘要（如有）。\n"
+    "{meta_block}\n{asr_block}"
+)
 
 
 @register(
@@ -150,6 +177,532 @@ class ZssmExplain(Star):
         if mode == "blacklist":
             return str(gid) not in glist if glist else True
         return True
+
+    # ===== 视频相关工具 =====
+    @staticmethod
+    def _extract_videos_from_chain(chain: List[object]) -> List[str]:
+        videos: List[str] = []
+        if not isinstance(chain, list):
+            return videos
+        for seg in chain:
+            try:
+                if hasattr(Comp, "Video") and isinstance(seg, getattr(Comp, "Video")):
+                    f = getattr(seg, "file", None)
+                    u = getattr(seg, "url", None)
+                    if isinstance(f, str) and f:
+                        videos.append(f)
+                    elif isinstance(u, str) and u:
+                        videos.append(u)
+                elif hasattr(Comp, "Node") and isinstance(seg, getattr(Comp, "Node")):
+                    content = getattr(seg, "content", None)
+                    if isinstance(content, list):
+                        videos.extend(ZssmExplain._extract_videos_from_chain(content))
+                elif hasattr(Comp, "Nodes") and isinstance(seg, getattr(Comp, "Nodes")):
+                    nodes = getattr(seg, "nodes", None) or getattr(seg, "content", None)
+                    if isinstance(nodes, list):
+                        for node in nodes:
+                            c = getattr(node, "content", None)
+                            if isinstance(c, list):
+                                videos.extend(ZssmExplain._extract_videos_from_chain(c))
+                elif hasattr(Comp, "Forward") and isinstance(seg, getattr(Comp, "Forward")):
+                    nodes = getattr(seg, "nodes", None) or getattr(seg, "content", None)
+                    if isinstance(nodes, list):
+                        for node in nodes:
+                            c = getattr(node, "content", None)
+                            if isinstance(c, list):
+                                videos.extend(ZssmExplain._extract_videos_from_chain(c))
+            except Exception:
+                continue
+        return videos
+
+    async def _extract_videos_from_event(self, event: AstrMessageEvent) -> List[str]:
+        # 先找被回复消息中的视频
+        try:
+            chain = event.get_messages()
+        except Exception:
+            chain = getattr(event.message_obj, "message", []) or []
+        reply_comp = None
+        for seg in chain:
+            try:
+                if isinstance(seg, Comp.Reply):
+                    reply_comp = seg
+                    break
+            except Exception:
+                pass
+        if reply_comp:
+            for attr in ("message", "origin", "content"):
+                payload = getattr(reply_comp, attr, None)
+                if isinstance(payload, list):
+                    vids = self._extract_videos_from_chain(payload)
+                    if vids:
+                        return vids
+            # 无内嵌内容时，尝试通过平台能力（OneBot/Napcat）用 message_id 拉取原消息
+            reply_id = self._get_reply_message_id(reply_comp)
+            platform_name = None
+            try:
+                platform_name = event.get_platform_name()
+            except Exception:
+                platform_name = None
+            if reply_id and platform_name == "aiocqhttp" and hasattr(event, "bot"):
+                try:
+                    data = await event.bot.get_msg(message_id=int(reply_id))
+                    vids = self._extract_videos_from_onebot_message_payload(data)
+                    if vids:
+                        return vids
+                except Exception:
+                    pass
+        # 没有 Reply 或 Reply 无视频，则直接从当前消息链找视频
+        return self._extract_videos_from_chain(chain)
+
+    @staticmethod
+    def _extract_videos_from_onebot_message_payload(payload: Any) -> List[str]:
+        """从 OneBot/Napcat get_msg/get_forward_msg 返回的 payload 中提取视频 URL/路径。"""
+        videos: List[str] = []
+        data = ZssmExplain._ob_data(payload) if isinstance(payload, dict) else {}
+        if isinstance(data, dict):
+            # 常见字段 message/messages/nodes
+            candidates = data.get("message") or data.get("messages") or data.get("nodes") or data.get("nodeList")
+            if isinstance(candidates, list):
+                for seg in candidates:
+                    try:
+                        if isinstance(seg, dict):
+                            # 可能是消息段，或转发节点
+                            if "type" in seg and "data" in seg:
+                                t = seg.get("type")
+                                d = seg.get("data") or {}
+                                if t == "video" and isinstance(d, dict):
+                                    url = d.get("url") or d.get("file")
+                                    if isinstance(url, str) and url:
+                                        videos.append(url)
+                            else:
+                                # 转发节点内的 message/content 列表
+                                content = seg.get("content") or seg.get("message")
+                                if isinstance(content, list):
+                                    inner = ZssmExplain._extract_videos_from_onebot_message_payload({"message": content})
+                                    videos.extend(inner)
+                    except Exception:
+                        continue
+        return videos
+
+    def _resolve_ffmpeg(self) -> Optional[str]:
+        # 配置优先
+        path = self._get_conf_str(FFMPEG_PATH_KEY, DEFAULT_FFMPEG_PATH)
+        if path and shutil.which(path):
+            return shutil.which(path)
+        # 尝试系统 ffmpeg
+        sys_ffmpeg = shutil.which("ffmpeg")
+        if sys_ffmpeg:
+            return sys_ffmpeg
+        # 尝试 imageio-ffmpeg
+        try:
+            import imageio_ffmpeg
+            p = imageio_ffmpeg.get_ffmpeg_exe()
+            if p and os.path.exists(p):
+                return p
+        except Exception:
+            pass
+        return None
+
+    def _resolve_ffprobe(self) -> Optional[str]:
+        # 同目录的 ffprobe（若 imageio-ffmpeg 提供）或系统 ffprobe
+        sys_ffprobe = shutil.which("ffprobe")
+        if sys_ffprobe:
+            return sys_ffprobe
+        # 粗略尝试：若 ffmpeg 同目录存在 ffprobe
+        ff = self._resolve_ffmpeg()
+        if ff:
+            cand = os.path.join(os.path.dirname(ff), "ffprobe")
+            if os.path.exists(cand):
+                return cand
+        return None
+
+    async def _download_to_temp(self, url: str, size_mb_limit: int) -> Optional[str]:
+        # 为 URL 提取安全的短扩展名，避免把查询串当后缀导致路径过长
+        def _safe_ext_from_url(u: str) -> str:
+            try:
+                path = urlparse(u).path
+                base = os.path.basename(unquote(path))
+                ext = os.path.splitext(base)[1]
+                # 限制扩展名长度并校验字符
+                if isinstance(ext, str):
+                    ext = ext[:8]
+                if not ext or not re.match(r"^\.[A-Za-z0-9]{1,6}$", ext):
+                    # 尝试常见视频后缀匹配
+                    lower = base.lower()
+                    for cand in (".mp4", ".mov", ".m4v", ".avi", ".webm", ".mkv", ".flv", ".wmv"):
+                        if lower.endswith(cand):
+                            return cand
+                    return ".bin"
+                return ext
+            except Exception:
+                return ".bin"
+
+        ext = _safe_ext_from_url(url)
+        tmp = tempfile.NamedTemporaryFile(prefix="zssm_video_", suffix=ext, delete=False)
+        tmp_path = tmp.name
+        tmp.close()
+        max_bytes = size_mb_limit * 1024 * 1024
+        if aiohttp is not None:
+            try:
+                async with aiohttp.ClientSession() as sess:
+                    async with sess.get(url, timeout=20) as resp:
+                        if resp.status != 200:
+                            try:
+                                os.remove(tmp_path)
+                            except Exception:
+                                pass
+                            return None
+                        # 内容长度预判
+                        cl = resp.headers.get("Content-Length")
+                        if cl and cl.isdigit() and int(cl) > max_bytes:
+                            try:
+                                os.remove(tmp_path)
+                            except Exception:
+                                pass
+                            return None
+                        total = 0
+                        with open(tmp_path, "wb") as f:
+                            async for chunk in resp.content.iter_chunked(8192):
+                                if not chunk:
+                                    break
+                                total += len(chunk)
+                                if total > max_bytes:
+                                    try:
+                                        f.close()
+                                    except Exception:
+                                        pass
+                                    try:
+                                        os.remove(tmp_path)
+                                    except Exception:
+                                        pass
+                                    return None
+                                f.write(chunk)
+                return tmp_path if os.path.exists(tmp_path) else None
+            except Exception:
+                try:
+                    os.remove(tmp_path)
+                except Exception:
+                    pass
+                return None
+        # urllib 回退
+        try:
+            import urllib.request
+            with urllib.request.urlopen(url, timeout=20) as r, open(tmp_path, "wb") as f:
+                total = 0
+                while True:
+                    chunk = r.read(8192)
+                    if not chunk:
+                        break
+                    total += len(chunk)
+                    if total > max_bytes:
+                        try:
+                            f.close()
+                        except Exception:
+                            pass
+                        try:
+                            os.remove(tmp_path)
+                        except Exception:
+                            pass
+                        return None
+                    f.write(chunk)
+            return tmp_path if os.path.exists(tmp_path) else None
+        except Exception:
+            try:
+                os.remove(tmp_path)
+            except Exception:
+                pass
+            return None
+
+    def _probe_duration_sec(self, ffprobe_path: Optional[str], video_path: str) -> Optional[float]:
+        if not ffprobe_path:
+            return None
+        try:
+            res = subprocess.run(
+                [ffprobe_path, "-v", "error", "-show_entries", "format=duration", "-of", "json", video_path],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+            )
+            if res.returncode != 0:
+                return None
+            data = json.loads(res.stdout.decode("utf-8", errors="ignore") or "{}")
+            dur = None
+            if isinstance(data, dict):
+                fmt = data.get("format")
+                if isinstance(fmt, dict):
+                    d = fmt.get("duration")
+                    try:
+                        dur = float(d)
+                    except Exception:
+                        dur = None
+            return dur
+        except Exception:
+            return None
+
+    async def _sample_frames_with_ffmpeg(self, ffmpeg_path: str, video_path: str, interval_sec: int, count_limit: int) -> List[str]:
+        out_dir = tempfile.mkdtemp(prefix="zssm_frames_")
+        out_tpl = os.path.join(out_dir, "frame_%03d.jpg")
+        cmd = [
+            ffmpeg_path, "-y", "-i", video_path,
+            "-vf", f"fps=1/{max(1, interval_sec)}",
+            "-frames:v", str(max(1, count_limit)),
+            "-qscale:v", "2",
+            out_tpl,
+        ]
+        loop = asyncio.get_running_loop()
+        def _run():
+            return subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
+        res = await loop.run_in_executor(None, _run)
+        if res.returncode != 0:
+            # 失败时删除目录
+            try:
+                shutil.rmtree(out_dir, ignore_errors=True)
+            except Exception:
+                pass
+            raise RuntimeError("ffmpeg sample frames failed")
+        frames = []
+        try:
+            for name in sorted(os.listdir(out_dir)):
+                if name.lower().endswith('.jpg'):
+                    frames.append(os.path.join(out_dir, name))
+        except Exception:
+            pass
+        if not frames:
+            try:
+                shutil.rmtree(out_dir, ignore_errors=True)
+            except Exception:
+                pass
+            raise RuntimeError("no frames generated")
+        return frames
+
+    async def _extract_audio_wav(self, ffmpeg_path: str, video_path: str) -> Optional[str]:
+        out_fd, out_path = tempfile.mkstemp(prefix="zssm_audio_", suffix=".wav")
+        os.close(out_fd)
+        cmd = [
+            ffmpeg_path, "-y", "-i", video_path,
+            "-vn", "-ac", "1", "-ar", "16000", "-f", "wav",
+            out_path,
+        ]
+        loop = asyncio.get_running_loop()
+        def _run():
+            return subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
+        res = await loop.run_in_executor(None, _run)
+        if res.returncode != 0:
+            try:
+                os.remove(out_path)
+            except Exception:
+                pass
+            return None
+        return out_path if os.path.exists(out_path) else None
+
+    def _build_video_user_prompt(self, meta: Dict[str, Any], asr_text: Optional[str]) -> str:
+        # 始终使用代码常量模板，不从配置读取
+        tmpl = DEFAULT_VIDEO_USER_PROMPT
+        meta_items = []
+        name = meta.get("name")
+        if name:
+            meta_items.append(f"视频: {name}")
+        dur = meta.get("duration")
+        if isinstance(dur, (int, float)):
+            meta_items.append(f"时长: {int(dur)}s")
+        fcnt = meta.get("frames")
+        if isinstance(fcnt, int):
+            meta_items.append(f"关键帧: {fcnt} 张")
+        meta_block = "\n".join(meta_items)
+        asr_block = f"音频转写要点: \n{asr_text.strip()}" if isinstance(asr_text, str) and asr_text.strip() else ""
+        return tmpl.format(meta_block=meta_block, asr_block=asr_block)
+
+    def _choose_stt_provider(self, event: AstrMessageEvent) -> Optional[Any]:
+        """根据配置选择 STT（ASR）提供商：优先 asr_provider_id；否则使用当前会话 STT。"""
+        pid = None
+        try:
+            pid = self.config.get(ASR_PROVIDER_ID_KEY) if isinstance(self.config, dict) else None
+            if isinstance(pid, str):
+                pid = pid.strip()
+        except Exception:
+            pid = None
+        # 优先根据 ID 在已注册 STT 中匹配
+        if pid:
+            try:
+                stts = self.context.get_all_stt_providers()
+            except Exception:
+                stts = []
+            pid_l = pid.lower()
+            for p in stts or []:
+                try:
+                    candidates = []
+                    for attr in ("id", "provider_id", "name"):
+                        val = getattr(p, attr, None)
+                        if isinstance(val, str) and val:
+                            candidates.append(val)
+                    cfg = getattr(p, "provider_config", None)
+                    if isinstance(cfg, dict):
+                        for k in ("id", "provider_id", "name"):
+                            v = cfg.get(k)
+                            if isinstance(v, str) and v:
+                                candidates.append(v)
+                    if any(str(c).lower() == pid_l for c in candidates):
+                        return p
+                except Exception:
+                    continue
+        # 回退为当前会话 STT
+        try:
+            return self.context.get_using_stt_provider(umo=event.unified_msg_origin)
+        except Exception:
+            return None
+
+    def _select_video_provider(self, session_provider: Any, image_urls: List[str]) -> Any:
+        """用于视频解释的 Provider 选择：
+        1) 优先使用配置的 video_provider_id；
+        2) 否则使用当前会话 Provider（需支持图片能力）；
+        3) 否则在所有 Provider 中选择首个支持图片的；
+        4) 否则回退为当前会话 Provider。
+        """
+        cfg_vid = self._get_config_provider(VIDEO_PROVIDER_ID_KEY)
+        if cfg_vid is not None:
+            return cfg_vid
+        if session_provider and self._provider_supports_image(session_provider):
+            return session_provider
+        for p in self.context.get_all_providers():
+            if p is session_provider:
+                continue
+            if self._provider_supports_image(p):
+                return p
+        return session_provider
+
+    async def _explain_video(self, event: AstrMessageEvent, video_src: str):
+        # 配置检查
+        if not self._get_conf_bool(ENABLE_VIDEO_EXPLAIN_KEY, DEFAULT_ENABLE_VIDEO_EXPLAIN):
+            yield self._reply_text_result(event, "视频解释功能未启用。")
+            return
+        ffmpeg_path = self._resolve_ffmpeg()
+        if not ffmpeg_path:
+            yield self._reply_text_result(event, "未检测到 ffmpeg，请安装系统 ffmpeg 或 Python 包 imageio-ffmpeg，并在插件配置中设置 ffmpeg_path。")
+            return
+
+        # 统一获取本地文件路径（支持 http/https 下载）
+        max_mb = self._get_conf_int(VIDEO_MAX_SIZE_MB_KEY, DEFAULT_VIDEO_MAX_SIZE_MB, 1, 512)
+        local_path = None
+        if isinstance(video_src, str) and video_src.lower().startswith(("http://", "https://")):
+            local_path = await self._download_to_temp(video_src, max_mb)
+            if not local_path:
+                yield self._reply_text_result(event, f"视频下载失败或超过大小限制（>{max_mb}MB）。")
+                return
+        else:
+            # 假定为本地路径
+            if not (isinstance(video_src, str) and os.path.isabs(video_src) and os.path.exists(video_src)):
+                yield self._reply_text_result(event, "无法读取该视频源，请确认路径或链接有效。")
+                return
+            # 大小检查
+            try:
+                sz = os.path.getsize(video_src)
+                if sz > max_mb * 1024 * 1024:
+                    yield self._reply_text_result(event, f"视频大小超过限制（>{max_mb}MB），请压缩或截取片段后重试。")
+                    return
+            except Exception:
+                pass
+            local_path = video_src
+
+        # 时长检查（可选，缺少 ffprobe 时跳过）
+        max_sec = self._get_conf_int(VIDEO_MAX_DURATION_SEC_KEY, DEFAULT_VIDEO_MAX_DURATION_SEC, 10, 3600)
+        dur = self._probe_duration_sec(self._resolve_ffprobe(), local_path)
+        if isinstance(dur, (int, float)) and dur > max_sec:
+            yield self._reply_text_result(event, f"视频时长超过限制（>{max_sec}s），请截取片段后重试。")
+            return
+
+        # 抽帧
+        interval = self._get_conf_int(VIDEO_FRAME_INTERVAL_SEC_KEY, DEFAULT_VIDEO_FRAME_INTERVAL_SEC, 1, 120)
+        limit = self._get_conf_int(VIDEO_FRAME_COUNT_LIMIT_KEY, DEFAULT_VIDEO_FRAME_COUNT_LIMIT, 1, 16)
+        try:
+            frames = await self._sample_frames_with_ffmpeg(ffmpeg_path, local_path, interval, limit)
+        except Exception as e:
+            yield self._reply_text_result(event, f"抽帧失败：{e}")
+            return
+        image_urls = self._filter_supported_images(frames)
+        if not image_urls:
+            yield self._reply_text_result(event, "未能生成可用关键帧，请检查 ffmpeg 或更换视频后重试。")
+            return
+
+        # 可选 ASR
+        asr_text = None
+        if self._get_conf_bool(VIDEO_ASR_ENABLE_KEY, DEFAULT_VIDEO_ASR_ENABLE):
+            try:
+                wav = await self._extract_audio_wav(ffmpeg_path, local_path)
+                if wav and os.path.exists(wav):
+                    stt = self._choose_stt_provider(event)
+                    if stt is not None:
+                        try:
+                            asr_text = await stt.get_text(wav)
+                        except Exception:
+                            asr_text = None
+                    try:
+                        os.remove(wav)
+                    except Exception:
+                        pass
+            except Exception:
+                asr_text = None
+
+        # 组装并调用 LLM
+        try:
+            provider = self.context.get_using_provider(umo=event.unified_msg_origin)
+        except Exception as e:
+            logger.error(f"zssm_explain: get provider failed: {e}")
+            provider = None
+        if not provider:
+            yield self._reply_text_result(event, "未检测到可用的大语言模型提供商，请先在 AstrBot 配置中启用。")
+            return
+        system_prompt = self._build_system_prompt()
+        meta = {
+            "name": os.path.basename(local_path),
+            "duration": dur if isinstance(dur, (int, float)) else None,
+            "frames": len(image_urls),
+        }
+        user_prompt = self._build_video_user_prompt(meta, asr_text)
+
+        try:
+            call_provider = self._select_video_provider(provider, image_urls)
+            llm_resp = await self._call_llm_with_fallback(
+                primary=call_provider,
+                session_provider=provider,
+                user_prompt=user_prompt,
+                system_prompt=system_prompt,
+                image_urls=image_urls,
+            )
+            try:
+                await call_event_hook(event, EventType.OnLLMResponseEvent, llm_resp)
+            except Exception:
+                pass
+            reply_text = None
+            try:
+                ct = getattr(llm_resp, "completion_text", None)
+                if isinstance(ct, str) and ct.strip():
+                    reply_text = ct.strip()
+            except Exception:
+                reply_text = None
+            if not reply_text:
+                reply_text = self._pick_llm_text(llm_resp)
+            show_reasoning = False
+            try:
+                cfg = self.context.get_config(umo=event.unified_msg_origin) or {}
+                ps = cfg.get("provider_settings", {})
+                show_reasoning = bool(ps.get("display_reasoning_text", False))
+            except Exception:
+                show_reasoning = False
+            if not show_reasoning:
+                reply_text = self._sanitize_model_output(reply_text)
+            yield self._reply_text_result(event, reply_text)
+            try:
+                event.stop_event()
+            except Exception:
+                pass
+        finally:
+            # 清理帧文件
+            try:
+                frame_dir = os.path.dirname(image_urls[0]) if image_urls else None
+                if frame_dir and os.path.isdir(frame_dir):
+                    shutil.rmtree(frame_dir, ignore_errors=True)
+            except Exception:
+                pass
 
     @staticmethod
     def _extract_text_and_images_from_chain(chain: List[object]) -> Tuple[str, List[str]]:
@@ -913,7 +1466,16 @@ class ZssmExplain(Star):
                 text, images = inline, []
                 user_prompt = self._build_user_prompt(text, images)
         else:
-            # 2) 无内联时，尝试被回复消息内容
+            # 2) 无内联时，优先检测是否存在视频
+            try:
+                vids = await self._extract_videos_from_event(event)
+            except Exception:
+                vids = []
+            if vids:
+                async for r in self._explain_video(event, vids[0]):
+                    yield r
+                return
+            # 其次，尝试被回复消息中的文本/图片
             text, images = await self._extract_quoted_payload(event)
             if not text and not images:
                 yield self._reply_text_result(event, "请输入要解释的内容。")

@@ -13,6 +13,54 @@
     "default": [],
     "hint": "仅在 whitelist/blacklist 下生效；留空等效于无限制"
   },
+  "enable_video_explain": {
+    "description": "是否启用视频解释（抽帧+可选 ASR）",
+    "type": "bool",
+    "default": true,
+    "hint": "启用后识别视频并进行解释，需 ffmpeg 支持"
+  },
+  "video_frame_interval_sec": {
+    "description": "抽帧间隔（秒）",
+    "type": "int",
+    "default": 6,
+    "hint": "每隔 N 秒取 1 帧"
+  },
+  "video_frame_count_limit": {
+    "description": "最大关键帧数",
+    "type": "int",
+    "default": 6,
+    "hint": "限制帧数以控制 LLM 输入规模"
+  },
+  "video_asr_enable": {
+    "description": "是否启用音频转写（ASR）",
+    "type": "bool",
+    "default": false,
+    "hint": "调用 AstrBot 已配置的语音识别提供商（STT）"
+  },
+  "asr_provider_id": {
+    "description": "ASR 提供商 ID（语音识别）",
+    "type": "string",
+    "_special": "select_provider_stt",
+    "hint": "可选；留空则使用当前会话 STT 提供商"
+  },
+  "video_max_duration_sec": {
+    "description": "最大允许视频时长（秒）",
+    "type": "int",
+    "default": 120,
+    "hint": "超过则拒绝并提示"
+  },
+  "video_max_size_mb": {
+    "description": "最大允许视频大小（MB）",
+    "type": "int",
+    "default": 50,
+    "hint": "超过则拒绝并提示"
+  },
+  "ffmpeg_path": {
+    "description": "ffmpeg 可执行文件路径",
+    "type": "string",
+    "default": "ffmpeg",
+    "hint": "可填写绝对路径；若为空将自动查找或尝试 imageio-ffmpeg"
+  },
   "text_provider_id": {
     "description": "文本解释优先使用的 Provider ID",
     "type": "string",
@@ -24,6 +72,12 @@
     "type": "string",
     "_special": "select_provider",
     "hint": "可选；留空则自动选择具备图片能力的 Provider"
+  },
+  "video_provider_id": {
+    "description": "视频解释优先使用的 Provider ID（建议支持图片输入）",
+    "type": "string",
+    "_special": "select_provider",
+    "hint": "可选；仅用于视频解释，不影响图片转述"
   },
   "enable_url_detect": {
     "description": "是否识别 URL 并输出网页简版摘要（2-8句）",
