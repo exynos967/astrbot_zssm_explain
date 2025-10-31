@@ -10,6 +10,7 @@ import tempfile
 import subprocess
 from urllib.parse import urlparse, unquote
 from html import unescape
+import math
 
 try:
     import aiohttp  # 优先使用异步 HTTP 客户端
@@ -52,6 +53,11 @@ DEFAULT_VIDEO_USER_PROMPT = (
     "{meta_block}\n{asr_block}"
 )
 
+# 单帧描述提示词（逐帧多次调用使用）
+DEFAULT_FRAME_CAPTION_PROMPT = (
+    "请根据这张关键帧图片，用一句中文描述画面要点；少于25字。若无法判断，请回答‘未识别’。"
+)
+
 # URL 识别/抓取的默认参数（可通过插件配置覆盖）
 URL_DETECT_ENABLE_KEY = "enable_url_detect"
 URL_FETCH_TIMEOUT_KEY = "url_timeout_sec"
@@ -61,7 +67,6 @@ GROUP_LIST_KEY = "group_list"
 VIDEO_PROVIDER_ID_KEY = "video_provider_id"
 ENABLE_VIDEO_EXPLAIN_KEY = "enable_video_explain"
 VIDEO_FRAME_INTERVAL_SEC_KEY = "video_frame_interval_sec"
-VIDEO_FRAME_COUNT_LIMIT_KEY = "video_frame_count_limit"
 VIDEO_ASR_ENABLE_KEY = "video_asr_enable"
 VIDEO_MAX_DURATION_SEC_KEY = "video_max_duration_sec"
 VIDEO_MAX_SIZE_MB_KEY = "video_max_size_mb"
@@ -73,7 +78,6 @@ DEFAULT_URL_FETCH_TIMEOUT = 8
 DEFAULT_URL_MAX_CHARS = 6000
 DEFAULT_ENABLE_VIDEO_EXPLAIN = True
 DEFAULT_VIDEO_FRAME_INTERVAL_SEC = 6
-DEFAULT_VIDEO_FRAME_COUNT_LIMIT = 6
 DEFAULT_VIDEO_ASR_ENABLE = False
 DEFAULT_VIDEO_MAX_DURATION_SEC = 120
 DEFAULT_VIDEO_MAX_SIZE_MB = 50
@@ -279,6 +283,52 @@ class ZssmExplain(Star):
         # 没有 Reply 或 Reply 无视频，则直接从当前消息链找视频
         return self._extract_videos_from_chain(chain)
 
+    # ===== Napcat (aiocqhttp) 文件直链解析 =====
+    @staticmethod
+    def _is_http_url(s: Optional[str]) -> bool:
+        return isinstance(s, str) and s.lower().startswith(("http://", "https://"))
+
+    @staticmethod
+    def _is_abs_file(s: Optional[str]) -> bool:
+        return isinstance(s, str) and os.path.isabs(s)
+
+    def _is_napcat(self, event: AstrMessageEvent) -> bool:
+        try:
+            return event.get_platform_name() == "aiocqhttp" and hasattr(event, "bot") and hasattr(event.bot, "api")
+        except Exception:
+            return False
+
+    async def _napcat_resolve_file_url(self, event: AstrMessageEvent, file_id: str) -> Optional[str]:
+        """使用 Napcat 接口将文件/视频的 file_id 解析为可下载 URL。
+        - 群聊: POST /get_group_file_url { group_id, file_id }
+        - 私聊: POST /get_private_file_url { file_id }
+        返回 url 或 None。
+        """
+        if not (isinstance(file_id, str) and file_id):
+            return None
+        if not self._is_napcat(event):
+            return None
+        params: Dict[str, Any] = {"file_id": file_id}
+        action = "get_private_file_url"
+        try:
+            gid = event.get_group_id()
+        except Exception:
+            gid = None
+        if gid:
+            params = {"group_id": gid, "file_id": file_id}
+            action = "get_group_file_url"
+        try:
+            ret = await event.bot.api.call_action(action, **params)
+            data = ret.get("data") if isinstance(ret, dict) else None
+            url = data.get("url") if isinstance(data, dict) else None
+            if isinstance(url, str) and url:
+                logger.info("zssm_explain: napcat %s ok, url=%s", action, url[:80])
+                return url
+            logger.warning("zssm_explain: napcat %s returned no url", action)
+        except Exception as e:
+            logger.warning("zssm_explain: napcat %s failed: %s", action, e)
+        return None
+
     @staticmethod
     def _extract_videos_from_onebot_message_payload(payload: Any) -> List[str]:
         """从 OneBot/Napcat get_msg/get_forward_msg 返回的 payload 中提取视频 URL/路径。"""
@@ -455,29 +505,95 @@ class ZssmExplain(Star):
             return None
 
     def _probe_duration_sec(self, ffprobe_path: Optional[str], video_path: str) -> Optional[float]:
+        """更稳健地探测视频时长：
+        - 尝试多源（format.duration、stream.duration、nb_frames/fps），并输出全部候选；
+        - 若存在多个候选，取中位数（median）以抵抗异常值；
+        - 失败返回 None。
+        """
         if not ffprobe_path:
             return None
+        candidates: List[float] = []
         try:
-            res = subprocess.run(
-                [ffprobe_path, "-v", "error", "-show_entries", "format=duration", "-of", "json", video_path],
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                check=False,
-            )
-            if res.returncode != 0:
-                return None
-            data = json.loads(res.stdout.decode("utf-8", errors="ignore") or "{}")
-            dur = None
-            if isinstance(data, dict):
-                fmt = data.get("format")
-                if isinstance(fmt, dict):
-                    d = fmt.get("duration")
+            # 1) format.duration
+            cmd1 = [ffprobe_path, "-v", "error", "-show_entries", "format=duration", "-of", "json", video_path]
+            res1 = subprocess.run(cmd1, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
+            if res1.returncode == 0:
+                try:
+                    data1 = json.loads(res1.stdout.decode("utf-8", errors="ignore") or "{}")
+                except Exception:
+                    data1 = {}
+                if isinstance(data1, dict):
+                    fmt = data1.get("format")
+                    if isinstance(fmt, dict):
+                        d = fmt.get("duration")
+                        try:
+                            dur = float(d)
+                            if dur and dur > 0:
+                                candidates.append(dur)
+                        except Exception:
+                            pass
+
+            # 2) 首个视频流：duration、nb_frames/fps
+            cmd2 = [
+                ffprobe_path, "-v", "error",
+                "-select_streams", "v:0",
+                "-show_entries", "stream=duration,nb_frames,avg_frame_rate,r_frame_rate",
+                "-of", "json",
+                video_path,
+            ]
+            res2 = subprocess.run(cmd2, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
+            if res2.returncode == 0:
+                try:
+                    data2 = json.loads(res2.stdout.decode("utf-8", errors="ignore") or "{}")
+                except Exception:
+                    data2 = {}
+                stream = None
+                if isinstance(data2, dict):
+                    streams = data2.get("streams")
+                    if isinstance(streams, list) and streams:
+                        s0 = streams[0]
+                        if isinstance(s0, dict):
+                            stream = s0
+                if isinstance(stream, dict):
+                    # duration
+                    d = stream.get("duration")
                     try:
                         dur = float(d)
+                        if dur and dur > 0:
+                            candidates.append(dur)
                     except Exception:
-                        dur = None
-            return dur
-        except Exception:
+                        pass
+                    # nb_frames / fps
+                    fps_txt = stream.get("avg_frame_rate") or stream.get("r_frame_rate") or "0/1"
+                    try:
+                        num, den = fps_txt.split("/")
+                        fps = float(num) / float(den) if float(den) != 0 else 0.0
+                    except Exception:
+                        fps = 0.0
+                    try:
+                        nb_frames = stream.get("nb_frames")
+                        nb = int(nb_frames) if nb_frames is not None and str(nb_frames).isdigit() else 0
+                    except Exception:
+                        nb = 0
+                    if fps > 0 and nb > 0:
+                        cand = nb / fps
+                        if cand > 0:
+                            candidates.append(cand)
+
+            if candidates:
+                # 记录所有候选并取中位数
+                c_sorted = sorted(candidates)
+                logger.info("zssm_explain: ffprobe duration candidates=%s", [round(x, 3) for x in c_sorted])
+                mid = len(c_sorted) // 2
+                if len(c_sorted) % 2 == 1:
+                    chosen = c_sorted[mid]
+                else:
+                    chosen = 0.5 * (c_sorted[mid - 1] + c_sorted[mid])
+                logger.info("zssm_explain: ffprobe chosen duration=%.3f", chosen)
+                return chosen
+            return None
+        except Exception as e:
+            logger.warning("zssm_explain: ffprobe duration failed: %s", e)
             return None
 
     async def _sample_frames_with_ffmpeg(self, ffmpeg_path: str, video_path: str, interval_sec: int, count_limit: int) -> List[str]:
@@ -594,6 +710,28 @@ class ZssmExplain(Star):
         asr_block = f"音频转写要点: \n{asr_text.strip()}" if isinstance(asr_text, str) and asr_text.strip() else ""
         return tmpl.format(meta_block=meta_block, asr_block=asr_block)
 
+    def _build_video_final_prompt(self, meta: Dict[str, Any], asr_text: Optional[str], captions: List[str]) -> str:
+        """构造最终汇总提示词：基于逐帧描述 + （可选）音频要点。"""
+        meta_items = []
+        name = meta.get("name")
+        if name:
+            meta_items.append(f"视频: {name}")
+        dur = meta.get("duration")
+        if isinstance(dur, (int, float)):
+            meta_items.append(f"时长: {int(dur)}s")
+        fcnt = meta.get("frames")
+        if isinstance(fcnt, int):
+            meta_items.append(f"关键帧: {fcnt} 张")
+        meta_block = "\n".join(meta_items)
+        caps_block = "\n".join([f"- {c.strip()}" for c in captions if isinstance(c, str) and c.strip()])
+        asr_block = f"音频转写要点: \n{asr_text.strip()}" if isinstance(asr_text, str) and asr_text.strip() else ""
+        final_prompt = (
+            "请根据以下关键帧描述与最后一张关键帧图片，总结整段视频的主要内容（中文，不超过100字）。"
+            "仅依据已给信息，信息不足请说明‘无法判断’，不要编造未出现的内容。\n"
+            f"{meta_block}\n关键帧描述：\n{caps_block}\n{asr_block}"
+        )
+        return final_prompt
+
     def _choose_stt_provider(self, event: AstrMessageEvent) -> Optional[Any]:
         """根据配置选择 STT（ASR）提供商：优先 asr_provider_id；否则使用当前会话 STT。"""
         pid = None
@@ -663,28 +801,37 @@ class ZssmExplain(Star):
             return
         logger.info("zssm_explain: video start src=%s ffmpeg=%s", (str(video_src)[:128] if video_src else ""), ffmpeg_path)
 
-        # 统一获取本地文件路径（支持 http/https 下载）
+        # 统一获取本地文件路径（支持 http/https 下载，Napcat 直链解析）
         max_mb = self._get_conf_int(VIDEO_MAX_SIZE_MB_KEY, DEFAULT_VIDEO_MAX_SIZE_MB, 1, 512)
         local_path = None
-        if isinstance(video_src, str) and video_src.lower().startswith(("http://", "https://")):
-            local_path = await self._download_to_temp(video_src, max_mb)
+        src = video_src
+        # 若不是 URL/绝对路径，尝试通过 Napcat file_id 获取直链
+        if isinstance(src, str) and (not self._is_http_url(src)) and (not self._is_abs_file(src)):
+            try:
+                resolved = await self._napcat_resolve_file_url(event, src)
+            except Exception:
+                resolved = None
+            if isinstance(resolved, str) and resolved:
+                src = resolved
+        if isinstance(src, str) and self._is_http_url(src):
+            local_path = await self._download_to_temp(src, max_mb)
             if not local_path:
                 yield self._reply_text_result(event, f"视频下载失败或超过大小限制（>{max_mb}MB）。")
                 return
         else:
             # 假定为本地路径
-            if not (isinstance(video_src, str) and os.path.isabs(video_src) and os.path.exists(video_src)):
+            if not (isinstance(src, str) and os.path.isabs(src) and os.path.exists(src)):
                 yield self._reply_text_result(event, "无法读取该视频源，请确认路径或链接有效。")
                 return
             # 大小检查
             try:
-                sz = os.path.getsize(video_src)
+                sz = os.path.getsize(src)
                 if sz > max_mb * 1024 * 1024:
                     yield self._reply_text_result(event, f"视频大小超过限制（>{max_mb}MB），请压缩或截取片段后重试。")
                     return
             except Exception:
                 pass
-            local_path = video_src
+            local_path = src
 
         # 时长检查（可选，缺少 ffprobe 时跳过）
         max_sec = self._get_conf_int(VIDEO_MAX_DURATION_SEC_KEY, DEFAULT_VIDEO_MAX_DURATION_SEC, 10, 3600)
@@ -696,12 +843,23 @@ class ZssmExplain(Star):
 
         # 抽帧
         interval = self._get_conf_int(VIDEO_FRAME_INTERVAL_SEC_KEY, DEFAULT_VIDEO_FRAME_INTERVAL_SEC, 1, 120)
-        limit = self._get_conf_int(VIDEO_FRAME_COUNT_LIMIT_KEY, DEFAULT_VIDEO_FRAME_COUNT_LIMIT, 1, 16)
         try:
             if isinstance(dur, (int, float)) and dur > 0:
-                frames = await self._sample_frames_equidistant(ffmpeg_path, local_path, float(dur), limit)
+                # 依据时长与间隔估算目标帧数
+                n_frames = max(1, int(math.ceil(float(dur) / max(1, interval))))
+                logger.info(
+                    "zssm_explain: sampling plan: duration=%.2fs interval=%ss => target_frames=%s",
+                    float(dur), interval, n_frames,
+                )
+                frames = await self._sample_frames_equidistant(ffmpeg_path, local_path, float(dur), n_frames)
             else:
-                frames = await self._sample_frames_with_ffmpeg(ffmpeg_path, local_path, interval, limit)
+                # 未获知时长时，以最大允许时长作为上界推导帧数
+                n_frames = max(1, int(math.ceil(float(max_sec) / max(1, interval))))
+                logger.info(
+                    "zssm_explain: sampling plan: unknown duration, use max_sec=%ss interval=%ss => target_frames=%s",
+                    max_sec, interval, n_frames,
+                )
+                frames = await self._sample_frames_with_ffmpeg(ffmpeg_path, local_path, interval, n_frames)
         except Exception as e:
             yield self._reply_text_result(event, f"抽帧失败：{e}")
             return
@@ -736,7 +894,7 @@ class ZssmExplain(Star):
             except Exception:
                 asr_text = None
 
-        # 组装并调用 LLM
+        # 组装并调用 LLM（多次调用：逐帧→最终汇总）
         try:
             provider = self.context.get_using_provider(umo=event.unified_msg_origin)
         except Exception as e:
@@ -751,35 +909,59 @@ class ZssmExplain(Star):
             "duration": dur if isinstance(dur, (int, float)) else None,
             "frames": len(image_urls),
         }
-        user_prompt = self._build_video_user_prompt(meta, asr_text)
-
         try:
             call_provider = self._select_video_provider(provider, image_urls)
             try:
                 pid = getattr(call_provider, "id", None) or getattr(call_provider, "provider_id", None) or call_provider.__class__.__name__
             except Exception:
                 pid = None
-            logger.info("zssm_explain: llm provider=%s, images=%d", pid or "unknown", len(image_urls))
-            llm_resp = await self._call_llm_with_fallback(
-                primary=call_provider,
-                session_provider=provider,
-                user_prompt=user_prompt,
-                system_prompt=system_prompt,
-                image_urls=image_urls,
-            )
+            logger.info("zssm_explain: llm provider=%s, frames=%d (multi-call)", pid or "unknown", len(image_urls))
+
+            # 1) 逐帧描述（前 n-1 帧）
+            captions: List[str] = []
+            if len(image_urls) > 1:
+                for idx, img in enumerate(image_urls[:-1], start=1):
+                    prompt_cap = DEFAULT_FRAME_CAPTION_PROMPT
+                    try:
+                        logger.info("zssm_explain: caption frame %d/%d", idx, len(image_urls)-1)
+                        resp = await self._call_llm_with_fallback(
+                            primary=call_provider,
+                            session_provider=provider,
+                            user_prompt=prompt_cap,
+                            system_prompt=system_prompt,
+                            image_urls=[img],
+                        )
+                        cap = self._pick_llm_text(resp)
+                        cap = self._sanitize_model_output(cap)
+                        if not cap:
+                            cap = "未识别"
+                        captions.append(cap)
+                        logger.info("zssm_explain: caption len=%d", len(cap))
+                    except Exception as e:
+                        logger.warning("zssm_explain: caption failed on frame %d: %s", idx, e)
+                        captions.append("未识别")
+
+            # 2) 最后一帧 + 汇总提示（总调用次数 = 帧数）
+            final_prompt = self._build_video_final_prompt(meta, asr_text, captions)
             try:
-                await call_event_hook(event, EventType.OnLLMResponseEvent, llm_resp)
+                resp_final = await self._call_llm_with_fallback(
+                    primary=call_provider,
+                    session_provider=provider,
+                    user_prompt=final_prompt,
+                    system_prompt=system_prompt,
+                    image_urls=[image_urls[-1]],
+                )
+            except Exception as e:
+                logger.error("zssm_explain: final summary call failed: %s", e)
+                raise
+
+            # 只对最终结果触发 OnLLMResponseEvent（避免中间过程外泄）
+            try:
+                await call_event_hook(event, EventType.OnLLMResponseEvent, resp_final)
             except Exception:
                 pass
-            reply_text = None
-            try:
-                ct = getattr(llm_resp, "completion_text", None)
-                if isinstance(ct, str) and ct.strip():
-                    reply_text = ct.strip()
-            except Exception:
-                reply_text = None
-            if not reply_text:
-                reply_text = self._pick_llm_text(llm_resp)
+
+            reply_text = self._pick_llm_text(resp_final)
             show_reasoning = False
             try:
                 cfg = self.context.get_config(umo=event.unified_msg_origin) or {}

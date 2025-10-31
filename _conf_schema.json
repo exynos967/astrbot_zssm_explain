@@ -25,12 +25,6 @@
     "default": 6,
     "hint": "每隔 N 秒取 1 帧"
   },
-  "video_frame_count_limit": {
-    "description": "最大关键帧数",
-    "type": "int",
-    "default": 6,
-    "hint": "限制帧数以控制 LLM 输入规模"
-  },
   "video_asr_enable": {
     "description": "是否启用音频转写（ASR）",
     "type": "bool",
