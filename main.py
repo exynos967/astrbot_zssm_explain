@@ -47,6 +47,11 @@ DEFAULT_URL_USER_PROMPT = (
     "正文片段: \n{snippet}"
 )
 
+DEFAULT_VIDEO_USER_PROMPT = (
+    "请解释这段视频的主要内容，输出简洁不超过100字。仅依据提供的关键帧与音频转写（如有）作答；若信息不足请明确说明‘无法判断’，不要编造未出现的内容。\n"
+    "{meta_block}\n{asr_block}"
+)
+
 # URL 识别/抓取的默认参数（可通过插件配置覆盖）
 URL_DETECT_ENABLE_KEY = "enable_url_detect"
 URL_FETCH_TIMEOUT_KEY = "url_timeout_sec"
@@ -74,11 +79,7 @@ DEFAULT_VIDEO_MAX_DURATION_SEC = 120
 DEFAULT_VIDEO_MAX_SIZE_MB = 50
 DEFAULT_FFMPEG_PATH = "ffmpeg"
 
-# 视频提示词模板（可被 _conf_schema.json 覆盖）
-DEFAULT_VIDEO_USER_PROMPT = (
-    "请解释这段视频的主要内容，输出简洁不超过100字。已提供关键帧与可用音频摘要（如有）。\n"
-    "{meta_block}\n{asr_block}"
-)
+
 
 
 @register(
@@ -184,6 +185,16 @@ class ZssmExplain(Star):
         videos: List[str] = []
         if not isinstance(chain, list):
             return videos
+        def _looks_like_video(name_or_url: str) -> bool:
+            if not isinstance(name_or_url, str) or not name_or_url:
+                return False
+            s = name_or_url.lower()
+            return any(
+                s.endswith(ext)
+                for ext in (
+                    ".mp4", ".mov", ".m4v", ".avi", ".webm", ".mkv", ".flv", ".wmv", ".ts", ".mpeg", ".mpg", ".3gp"
+                )
+            )
         for seg in chain:
             try:
                 if hasattr(Comp, "Video") and isinstance(seg, getattr(Comp, "Video")):
@@ -193,6 +204,20 @@ class ZssmExplain(Star):
                         videos.append(f)
                     elif isinstance(u, str) and u:
                         videos.append(u)
+                elif hasattr(Comp, "File") and isinstance(seg, getattr(Comp, "File")):
+                    # 大视频可能以 File 形式承载
+                    u = getattr(seg, "url", None)
+                    f = getattr(seg, "file", None)
+                    n = getattr(seg, "name", None)
+                    cand = None
+                    if isinstance(u, str) and u and _looks_like_video(u):
+                        cand = u
+                    elif isinstance(f, str) and f and (_looks_like_video(f) or os.path.isabs(f)):
+                        cand = f
+                    elif isinstance(n, str) and n and _looks_like_video(n) and isinstance(f, str) and f:
+                        cand = f
+                    if isinstance(cand, str) and cand:
+                        videos.append(cand)
                 elif hasattr(Comp, "Node") and isinstance(seg, getattr(Comp, "Node")):
                     content = getattr(seg, "content", None)
                     if isinstance(content, list):
@@ -270,10 +295,26 @@ class ZssmExplain(Star):
                             if "type" in seg and "data" in seg:
                                 t = seg.get("type")
                                 d = seg.get("data") or {}
-                                if t == "video" and isinstance(d, dict):
-                                    url = d.get("url") or d.get("file")
-                                    if isinstance(url, str) and url:
-                                        videos.append(url)
+                                if isinstance(d, dict):
+                                    if t == "video":
+                                        url = d.get("url") or d.get("file")
+                                        if isinstance(url, str) and url:
+                                            videos.append(url)
+                                    elif t == "file":
+                                        # 文件类型里也可能是视频
+                                        url = d.get("url") or d.get("file")
+                                        name = d.get("name") or d.get("filename")
+                                        def _looks_like_video(name_or_url: str) -> bool:
+                                            if not isinstance(name_or_url, str) or not name_or_url:
+                                                return False
+                                            s = name_or_url.lower()
+                                            return any(s.endswith(ext) for ext in (
+                                                ".mp4", ".mov", ".m4v", ".avi", ".webm", ".mkv", ".flv", ".wmv", ".ts", ".mpeg", ".mpg", ".3gp"
+                                            ))
+                                        if isinstance(url, str) and url and _looks_like_video(url):
+                                            videos.append(url)
+                                        elif isinstance(name, str) and _looks_like_video(name) and isinstance(url, str) and url:
+                                            videos.append(url)
                             else:
                                 # 转发节点内的 message/content 列表
                                 content = seg.get("content") or seg.get("message")
@@ -459,6 +500,7 @@ class ZssmExplain(Star):
                 shutil.rmtree(out_dir, ignore_errors=True)
             except Exception:
                 pass
+            logger.error("zssm_explain: ffmpeg fps-sampler failed (code=%s)", res.returncode)
             raise RuntimeError("ffmpeg sample frames failed")
         frames = []
         try:
@@ -473,6 +515,46 @@ class ZssmExplain(Star):
             except Exception:
                 pass
             raise RuntimeError("no frames generated")
+        return frames
+
+    async def _sample_frames_equidistant(self, ffmpeg_path: str, video_path: str, duration_sec: float, count_limit: int) -> List[str]:
+        """按等距时间点抽帧，覆盖全片。选择 N 个时间点：t_i = (i/(N+1))*duration。"""
+        N = max(1, int(count_limit))
+        out_dir = tempfile.mkdtemp(prefix="zssm_frames_")
+        loop = asyncio.get_running_loop()
+        frames: List[str] = []
+        times: List[float] = []
+        try:
+            total = max(0.0, float(duration_sec))
+            for i in range(1, N + 1):
+                t = (i / (N + 1.0)) * total
+                times.append(t)
+            logger.info("zssm_explain: equidistant times=%s", [round(x, 2) for x in times])
+            for idx, t in enumerate(times, start=1):
+                out_path = os.path.join(out_dir, f"frame_{idx:03d}.jpg")
+                cmd = [
+                    ffmpeg_path, "-y",
+                    "-ss", f"{max(0.0, t):.3f}",
+                    "-i", video_path,
+                    "-frames:v", "1",
+                    "-qscale:v", "2",
+                    out_path,
+                ]
+                def _run_one():
+                    return subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
+                res = await loop.run_in_executor(None, _run_one)
+                if res.returncode == 0 and os.path.exists(out_path):
+                    frames.append(out_path)
+                else:
+                    logger.warning("zssm_explain: ffmpeg sample at %.3fs failed (code=%s)", t, res.returncode)
+        except Exception as e:
+            logger.error("zssm_explain: equidistant sampler error: %s", e)
+        if not frames:
+            try:
+                shutil.rmtree(out_dir, ignore_errors=True)
+            except Exception:
+                pass
+            raise RuntimeError("no frames generated by equidistant sampler")
         return frames
 
     async def _extract_audio_wav(self, ffmpeg_path: str, video_path: str) -> Optional[str]:
@@ -579,6 +661,7 @@ class ZssmExplain(Star):
         if not ffmpeg_path:
             yield self._reply_text_result(event, "未检测到 ffmpeg，请安装系统 ffmpeg 或 Python 包 imageio-ffmpeg，并在插件配置中设置 ffmpeg_path。")
             return
+        logger.info("zssm_explain: video start src=%s ffmpeg=%s", (str(video_src)[:128] if video_src else ""), ffmpeg_path)
 
         # 统一获取本地文件路径（支持 http/https 下载）
         max_mb = self._get_conf_int(VIDEO_MAX_SIZE_MB_KEY, DEFAULT_VIDEO_MAX_SIZE_MB, 1, 512)
@@ -606,6 +689,7 @@ class ZssmExplain(Star):
         # 时长检查（可选，缺少 ffprobe 时跳过）
         max_sec = self._get_conf_int(VIDEO_MAX_DURATION_SEC_KEY, DEFAULT_VIDEO_MAX_DURATION_SEC, 10, 3600)
         dur = self._probe_duration_sec(self._resolve_ffprobe(), local_path)
+        logger.info("zssm_explain: probed duration=%s (max=%s)", dur if dur is not None else "unknown", max_sec)
         if isinstance(dur, (int, float)) and dur > max_sec:
             yield self._reply_text_result(event, f"视频时长超过限制（>{max_sec}s），请截取片段后重试。")
             return
@@ -614,10 +698,14 @@ class ZssmExplain(Star):
         interval = self._get_conf_int(VIDEO_FRAME_INTERVAL_SEC_KEY, DEFAULT_VIDEO_FRAME_INTERVAL_SEC, 1, 120)
         limit = self._get_conf_int(VIDEO_FRAME_COUNT_LIMIT_KEY, DEFAULT_VIDEO_FRAME_COUNT_LIMIT, 1, 16)
         try:
-            frames = await self._sample_frames_with_ffmpeg(ffmpeg_path, local_path, interval, limit)
+            if isinstance(dur, (int, float)) and dur > 0:
+                frames = await self._sample_frames_equidistant(ffmpeg_path, local_path, float(dur), limit)
+            else:
+                frames = await self._sample_frames_with_ffmpeg(ffmpeg_path, local_path, interval, limit)
         except Exception as e:
             yield self._reply_text_result(event, f"抽帧失败：{e}")
             return
+        logger.info("zssm_explain: sampled %d frames", len(frames))
         image_urls = self._filter_supported_images(frames)
         if not image_urls:
             yield self._reply_text_result(event, "未能生成可用关键帧，请检查 ffmpeg 或更换视频后重试。")
@@ -630,9 +718,15 @@ class ZssmExplain(Star):
                 wav = await self._extract_audio_wav(ffmpeg_path, local_path)
                 if wav and os.path.exists(wav):
                     stt = self._choose_stt_provider(event)
+                    try:
+                        sid = getattr(stt, "id", None) or getattr(stt, "provider_id", None) or stt.__class__.__name__
+                    except Exception:
+                        sid = None
+                    logger.info("zssm_explain: stt provider=%s", sid or "unknown")
                     if stt is not None:
                         try:
                             asr_text = await stt.get_text(wav)
+                            logger.info("zssm_explain: asr text length=%s", len(asr_text) if isinstance(asr_text, str) else 0)
                         except Exception:
                             asr_text = None
                     try:
@@ -661,6 +755,11 @@ class ZssmExplain(Star):
 
         try:
             call_provider = self._select_video_provider(provider, image_urls)
+            try:
+                pid = getattr(call_provider, "id", None) or getattr(call_provider, "provider_id", None) or call_provider.__class__.__name__
+            except Exception:
+                pid = None
+            logger.info("zssm_explain: llm provider=%s, images=%d", pid or "unknown", len(image_urls))
             llm_resp = await self._call_llm_with_fallback(
                 primary=call_provider,
                 session_provider=provider,
