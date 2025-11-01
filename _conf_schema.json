@@ -7,35 +7,35 @@
     "hint": "whitelist: 仅允许列表内群；blacklist: 拒绝列表内群；none: 不限制"
   },
   "group_list": {
-    "description": "群号列表（填 QQ 群号）",
+    "description": "群号列表",
     "type": "list",
     "items": { "type": "string" },
     "default": [],
     "hint": "仅在 whitelist/blacklist 下生效；留空等效于无限制"
   },
   "enable_video_explain": {
-    "description": "是否启用视频解释（抽帧+可选 ASR）",
+    "description": "是否启用视频解释",
     "type": "bool",
     "default": true,
     "hint": "启用后识别视频并进行解释，需 ffmpeg 支持"
+  },
+  "video_asr_enable": {
+    "description": "是否启用音频转写",
+    "type": "bool",
+    "default": false,
+    "hint": "调用 AstrBot 已配置的语音识别提供商"
+  },
+  "enable_url_detect": {
+    "description": "是否识别 URL 并输出网页简版摘要（2-8句）",
+    "type": "bool",
+    "default": true,
+    "hint": "关闭后仅按文本/图片解释"
   },
   "video_frame_interval_sec": {
     "description": "抽帧间隔（秒）",
     "type": "int",
     "default": 6,
     "hint": "每隔 N 秒取 1 帧"
-  },
-  "video_asr_enable": {
-    "description": "是否启用音频转写（ASR）",
-    "type": "bool",
-    "default": false,
-    "hint": "调用 AstrBot 已配置的语音识别提供商（STT）"
-  },
-  "asr_provider_id": {
-    "description": "ASR 提供商 ID（语音识别）",
-    "type": "string",
-    "_special": "select_provider_stt",
-    "hint": "可选；留空则使用当前会话 STT 提供商"
   },
   "video_max_duration_sec": {
     "description": "最大允许视频时长（秒）",
@@ -55,30 +55,6 @@
     "default": "ffmpeg",
     "hint": "可填写绝对路径；若为空将自动查找或尝试 imageio-ffmpeg"
   },
-  "text_provider_id": {
-    "description": "文本解释优先使用的 Provider ID",
-    "type": "string",
-    "_special": "select_provider",
-    "hint": "可选；留空则使用当前会话 Provider"
-  },
-  "image_provider_id": {
-    "description": "图片转述优先使用的 Provider ID",
-    "type": "string",
-    "_special": "select_provider",
-    "hint": "可选；留空则自动选择具备图片能力的 Provider"
-  },
-  "video_provider_id": {
-    "description": "视频解释优先使用的 Provider ID（建议支持图片输入）",
-    "type": "string",
-    "_special": "select_provider",
-    "hint": "可选；仅用于视频解释，不影响图片转述"
-  },
-  "enable_url_detect": {
-    "description": "是否识别 URL 并输出网页简版摘要（2-8句）",
-    "type": "bool",
-    "default": true,
-    "hint": "关闭后仅按文本/图片解释"
-  },
   "url_timeout_sec": {
     "description": "抓取网页超时时间（秒）",
     "type": "int",
@@ -90,5 +66,29 @@
     "type": "int",
     "default": 4000,
     "hint": "限制输入规模，避免过长上下文"
+  },
+  "asr_provider_id": {
+    "description": "ASR 提供商 ID",
+    "type": "string",
+    "_special": "select_provider_stt",
+    "hint": "留空则使用当前会话 STT 提供商"
+  },
+  "text_provider_id": {
+    "description": "文本解释优先使用的 Provider ID",
+    "type": "string",
+    "_special": "select_provider",
+    "hint": "留空则使用当前会话 Provider"
+  },
+  "image_provider_id": {
+    "description": "图片转述优先使用的 Provider ID",
+    "type": "string",
+    "_special": "select_provider",
+    "hint": "留空则自动选择具备图片能力的 Provider"
+  },
+  "video_provider_id": {
+    "description": "视频解释优先使用的 Provider ID",
+    "type": "string",
+    "_special": "select_provider",
+    "hint": "仅用于视频解释，不影响图片转述"
   }
 }
