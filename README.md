@@ -13,5 +13,10 @@
 - 注意：未回复且未携带内容时，会提示“请输入要解释的内容。”
 - Cloudflare：若目标站点启用 Cloudflare 导致抓取失败，将在日志中标注 `Cloudflare protection detected`，并向用户发送专门提示“目标站点启用 Cloudflare 防护，暂无法抓取网页内容...”。
 
+支持视频解释
 
-- 版本：v0.8.0
+# TODO
+
+解析b站链接
+
+- 版本：v1.0.0
