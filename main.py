@@ -150,8 +150,8 @@ class ZssmExplain(Star):
                             out.append(s)
                 return out
             if isinstance(v, str) and v.strip():
-                # 兼容以逗号/空白分隔的字符串
-                raw = [x.strip() for x in re.split(r"[\s,]+", v) if x.strip()]
+                # 兼容以逗号/空白/中文逗号/顿号分隔的字符串
+                raw = [x.strip() for x in re.split(r"[\s,，、]+", v) if x.strip()]
                 return raw
         except Exception:
             pass
@@ -164,11 +164,40 @@ class ZssmExplain(Star):
         - blacklist：拒绝列表内群使用
         - none：不限制
         当无法获取 group_id 时（如私聊），默认放行。
+
+        兼容性增强：
+        - 优先使用 event.get_group_id()
+        - 回退：群聊场景尝试从 session_id/unified_msg_origin 解析
+        - 再回退：尝试从原始 message_obj.group_id 获取
         """
+        gid = None
+        # 1) 官方获取
         try:
             gid = event.get_group_id()
         except Exception:
             gid = None
+        # 2) 从会话上下文回退解析（仅群聊）
+        if not gid:
+            try:
+                mt = getattr(event, "get_message_type", None)
+                mt = mt() if callable(mt) else None
+                mt_str = str(mt).lower() if mt is not None else ""
+                if "group" in mt_str or "guild" in mt_str:
+                    sid = None
+                    try:
+                        sid = event.get_session_id()
+                    except Exception:
+                        sid = None
+                    if isinstance(sid, str) and sid.strip():
+                        gid = sid.strip()
+            except Exception:
+                pass
+        # 3) 从原始消息对象回退
+        if not gid:
+            try:
+                gid = getattr(getattr(event, "message_obj", None), "group_id", None)
+            except Exception:
+                gid = None
         if not gid:
             return True  # 非群聊或无法识别，放行
 
@@ -178,9 +207,9 @@ class ZssmExplain(Star):
         glist = self._get_conf_list_str(GROUP_LIST_KEY)
 
         if mode == "whitelist":
-            return str(gid) in glist if glist else False
+            return str(gid).strip() in glist if glist else False
         if mode == "blacklist":
-            return str(gid) not in glist if glist else True
+            return str(gid).strip() not in glist if glist else True
         return True
 
     # ===== 视频相关工具 =====
