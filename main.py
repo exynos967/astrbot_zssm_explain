@@ -1842,7 +1842,6 @@ class ZssmExplain(Star):
                         pass
                     logger.warning("zssm_explain: urlscan screenshot still unavailable, aborting image fallback")
                     return None
-                text_hint = f"网页 {url} 受 Cloudflare 防护影响，已改用 urlscan 截图作为依据。"
                 try:
                     if isinstance(self._last_fetch_info, dict):
                         self._last_fetch_info["used_cf_screenshot"] = True
@@ -1857,8 +1856,13 @@ class ZssmExplain(Star):
                 if not local_image_path:
                     logger.warning("zssm_explain: failed to download liveshot image to temp file")
                     return None
-                user_prompt = build_user_prompt(text_hint, [local_image_path])
-                return (user_prompt, text_hint, [local_image_path])
+                cf_prompt = DEFAULT_URL_USER_PROMPT.format(
+                    url=url,
+                    title="(Cloudflare 截图)",
+                    desc="目标站点启用 Cloudflare，已改用 urlscan 截图作为依据。",
+                    snippet="由于无法直接抓取 HTML，请结合截图内容输出网页摘要。"
+                )
+                return (cf_prompt, None, [local_image_path])
 
         return None
 
