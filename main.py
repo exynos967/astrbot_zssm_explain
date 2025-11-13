@@ -8,7 +8,7 @@ import json
 import shutil
 import tempfile
 import subprocess
-from urllib.parse import urlparse, unquote
+from urllib.parse import urlparse, unquote, quote, urljoin
 from html import unescape
 import math
 
@@ -58,6 +58,18 @@ DEFAULT_FRAME_CAPTION_PROMPT = (
     "请根据这张关键帧图片，用一句中文描述画面要点；少于25字。若无法判断，请回答‘未识别’。"
 )
 
+
+def build_user_prompt(text: Optional[str], images: List[str]) -> str:
+    """使用顶部的默认提示词模板构造用户提示。"""
+    text_block = ("原始文本:\n" + text) if text else ""
+    tmpl = DEFAULT_IMAGE_USER_PROMPT if images else DEFAULT_TEXT_USER_PROMPT
+    return tmpl.format(text=text or "", text_block=text_block)
+
+
+def build_system_prompt() -> str:
+    """返回系统提示词。"""
+    return DEFAULT_SYSTEM_PROMPT
+
 # URL 识别/抓取的默认参数（可通过插件配置覆盖）
 URL_DETECT_ENABLE_KEY = "enable_url_detect"
 URL_FETCH_TIMEOUT_KEY = "url_timeout_sec"
@@ -72,6 +84,9 @@ VIDEO_MAX_DURATION_SEC_KEY = "video_max_duration_sec"
 VIDEO_MAX_SIZE_MB_KEY = "video_max_size_mb"
 FFMPEG_PATH_KEY = "ffmpeg_path"
 ASR_PROVIDER_ID_KEY = "asr_provider_id"
+CF_SCREENSHOT_ENABLE_KEY = "cf_screenshot_enable"
+CF_SCREENSHOT_WIDTH_KEY = "cf_screenshot_width"
+CF_SCREENSHOT_HEIGHT_KEY = "cf_screenshot_height"
 
 DEFAULT_URL_DETECT_ENABLE = True
 DEFAULT_URL_FETCH_TIMEOUT = 8
@@ -82,6 +97,9 @@ DEFAULT_VIDEO_ASR_ENABLE = False
 DEFAULT_VIDEO_MAX_DURATION_SEC = 120
 DEFAULT_VIDEO_MAX_SIZE_MB = 50
 DEFAULT_FFMPEG_PATH = "ffmpeg"
+DEFAULT_CF_SCREENSHOT_ENABLE = True
+DEFAULT_CF_SCREENSHOT_WIDTH = 1280
+DEFAULT_CF_SCREENSHOT_HEIGHT = 720
 
 
 
@@ -932,7 +950,7 @@ class ZssmExplain(Star):
         if not provider:
             yield self._reply_text_result(event, "未检测到可用的大语言模型提供商，请先在 AstrBot 配置中启用。")
             return
-        system_prompt = self._build_system_prompt()
+        system_prompt = build_system_prompt()
         meta = {
             "name": os.path.basename(local_path),
             "duration": dur if isinstance(dur, (int, float)) else None,
@@ -1355,19 +1373,6 @@ class ZssmExplain(Star):
                         continue
         return ("\n".join([x for x in texts if x]).strip(), images)
 
-    def _build_user_prompt(self, text: Optional[str], images: List[str]) -> str:
-        """仅使用文件顶部的默认常量构建用户提示词，不再读取配置。"""
-        text_block = ("原始文本:\n" + text) if text else ""
-        if images:
-            tmpl = DEFAULT_IMAGE_USER_PROMPT
-        else:
-            tmpl = DEFAULT_TEXT_USER_PROMPT
-        return tmpl.format(text=text or "", text_block=text_block)
-
-    def _build_system_prompt(self) -> str:
-        """仅使用文件顶部的默认系统提示词，不再读取配置。"""
-        return DEFAULT_SYSTEM_PROMPT
-
     @staticmethod
     def _is_zssm_trigger(text: str) -> bool:
         if not isinstance(text, str):
@@ -1477,6 +1482,197 @@ class ZssmExplain(Star):
         except Exception:
             pass
         return default
+
+    def _build_cf_screenshot_url(self, url: str) -> Optional[str]:
+        if not isinstance(url, str) or not url:
+            return None
+        width = self._get_conf_int(CF_SCREENSHOT_WIDTH_KEY, DEFAULT_CF_SCREENSHOT_WIDTH, 320, 2000)
+        height = self._get_conf_int(CF_SCREENSHOT_HEIGHT_KEY, DEFAULT_CF_SCREENSHOT_HEIGHT, 320, 2000)
+        try:
+            encoded = quote(url, safe="")
+        except Exception:
+            encoded = url
+        return f"https://urlscan.io/liveshot/?width={width}&height={height}&url={encoded}"
+
+    async def _probe_screenshot_url(self, url: str, per_request_timeout: int = 6) -> bool:
+        """尝试访问截图 URL，确认资源已经生成。"""
+        if not url:
+            return False
+        headers = {
+            "User-Agent": "AstrBot-zssm/1.0 (+https://github.com/xiaoxi68/astrbot_zssm_explain)",
+            "Range": "bytes=0-256",
+            "Accept": "image/avif,image/webp,image/*,*/*;q=0.8",
+        }
+        if aiohttp is not None:
+            try:
+                async with aiohttp.ClientSession(headers=headers) as session:
+                    async with session.get(url, timeout=per_request_timeout, allow_redirects=True) as resp:
+                        if 200 <= int(resp.status) < 400:
+                            await resp.content.readexactly(1)
+                            return True
+            except Exception:
+                pass
+        import urllib.request
+        import urllib.error
+
+        def _do() -> bool:
+            try:
+                req = urllib.request.Request(url, headers=headers)
+                with urllib.request.urlopen(req, timeout=per_request_timeout) as resp:
+                    status = getattr(resp, "status", 200)
+                    if 200 <= int(status) < 400:
+                        resp.read(1)
+                        return True
+            except Exception:
+                return False
+            return False
+
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(None, _do)
+
+    async def _wait_cf_screenshot_ready(
+        self,
+        url: str,
+        overall_timeout: float = 12.0,
+        interval_sec: float = 1.5,
+    ) -> bool:
+        """轮询 urlscan 截图是否已经可访问，避免将空链接传给多模态模型。"""
+        if not url:
+            return False
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + max(overall_timeout, 3.0)
+        attempt = 0
+        while True:
+            attempt += 1
+            if await self._probe_screenshot_url(url):
+                try:
+                    if isinstance(self._last_fetch_info, dict):
+                        self._last_fetch_info["cf_screenshot_ready_attempts"] = attempt
+                except Exception:
+                    pass
+                return True
+            if loop.time() >= deadline:
+                logger.warning("zssm_explain: urlscan screenshot not ready after %s attempts", attempt)
+                break
+            await asyncio.sleep(interval_sec)
+        return False
+
+    @staticmethod
+    def _extract_first_img_src(html: str) -> Optional[str]:
+        if not isinstance(html, str) or not html:
+            return None
+        m = re.search(r'<img[^>]+src=["\']([^"\']+)["\']', html, flags=re.IGNORECASE)
+        if m:
+            return unescape(m.group(1).strip())
+        return None
+
+    async def _resolve_liveshot_image_url(self, url: str, timeout_sec: int = 15) -> Optional[str]:
+        """确保拿到真正的图片 URL：若返回 HTML，则解析其中的 <img src> 并再次校验。"""
+        headers = {
+            "User-Agent": "AstrBot-zssm/1.0 (+https://github.com/xiaoxi68/astrbot_zssm_explain)",
+            "Accept": "image/avif,image/webp,image/*,*/*;q=0.8",
+        }
+
+        async def _fetch() -> Tuple[Optional[bytes], Optional[str]]:
+            if aiohttp is not None:
+                try:
+                    async with aiohttp.ClientSession(headers=headers) as session:
+                        async with session.get(url, timeout=timeout_sec, allow_redirects=True) as resp:
+                            if 200 <= int(resp.status) < 400:
+                                data = await resp.read()
+                                return data, resp.headers.get("Content-Type")
+                except Exception:
+                    pass
+            import urllib.request
+            import urllib.error
+
+            def _do() -> Tuple[Optional[bytes], Optional[str]]:
+                try:
+                    req = urllib.request.Request(url, headers=headers)
+                    with urllib.request.urlopen(req, timeout=timeout_sec) as resp:
+                        status = getattr(resp, "status", 200)
+                        if 200 <= int(status) < 400:
+                            data = resp.read()
+                            return data, resp.headers.get("Content-Type")
+                except Exception:
+                    return (None, None)
+                return (None, None)
+
+            loop = asyncio.get_running_loop()
+            return await loop.run_in_executor(None, _do)
+
+        data, content_type = await _fetch()
+        if not data:
+            return None
+        if isinstance(content_type, str) and "image" in content_type.lower():
+            return url
+        try:
+            html = data.decode("utf-8", errors="ignore")
+        except Exception:
+            html = ""
+        img_src = self._extract_first_img_src(html)
+        if not img_src:
+            return None
+        resolved = urljoin(url, img_src)
+        if not resolved.startswith("http"):
+            return None
+        ok = await self._probe_screenshot_url(resolved)
+        return resolved if ok else None
+
+    async def _download_image_to_temp(self, url: str, timeout_sec: int = 15) -> Optional[str]:
+        """下载图片到临时文件并返回路径。"""
+        if not url:
+            return None
+        headers = {
+            "User-Agent": "AstrBot-zssm/1.0 (+https://github.com/xiaoxi68/astrbot_zssm_explain)",
+            "Accept": "image/avif,image/webp,image/*,*/*;q=0.8",
+        }
+
+        async def _fetch() -> Tuple[Optional[bytes], Optional[str]]:
+            if aiohttp is not None:
+                try:
+                    async with aiohttp.ClientSession(headers=headers) as session:
+                        async with session.get(url, timeout=timeout_sec, allow_redirects=True) as resp:
+                            if 200 <= int(resp.status) < 400:
+                                data = await resp.read()
+                                return data, resp.headers.get("Content-Type")
+                except Exception:
+                    pass
+            import urllib.request
+            import urllib.error
+
+            def _do() -> Tuple[Optional[bytes], Optional[str]]:
+                try:
+                    req = urllib.request.Request(url, headers=headers)
+                    with urllib.request.urlopen(req, timeout=timeout_sec) as resp:
+                        status = getattr(resp, "status", 200)
+                        if 200 <= int(status) < 400:
+                            data = resp.read()
+                            return data, resp.headers.get("Content-Type")
+                except Exception:
+                    return (None, None)
+                return (None, None)
+
+            loop = asyncio.get_running_loop()
+            return await loop.run_in_executor(None, _do)
+
+        data, content_type = await _fetch()
+        if not data:
+            return None
+        suffix = ".png"
+        if isinstance(content_type, str):
+            if "jpeg" in content_type.lower():
+                suffix = ".jpg"
+            elif "webp" in content_type.lower():
+                suffix = ".webp"
+        try:
+            fd, path = tempfile.mkstemp(prefix="zssm_cf_", suffix=suffix)
+            with os.fdopen(fd, "wb") as f:
+                f.write(data)
+            return path
+        except Exception as e:
+            logger.warning(f"zssm_explain: failed to save screenshot temp file: {e}")
+            return None
 
     @staticmethod
     def _extract_urls_from_text(text: Optional[str]) -> List[str]:
@@ -1619,6 +1815,61 @@ class ZssmExplain(Star):
         user_prompt = DEFAULT_URL_USER_PROMPT.format(url=url, title=title or "(无)", desc=desc or "(无)", snippet=snippet)
         return user_prompt, title or ""
 
+    async def _prepare_url_prompt(self, url: str, timeout_sec: int) -> Optional[Tuple[str, Optional[str], List[str]]]:
+        """统一处理网页抓取：成功返回 HTML 摘要提示词；若因 Cloudflare 被拦截则回退到截图模式。"""
+        html = await self._fetch_html(url, timeout_sec)
+        if html:
+            user_prompt, _ = self._build_url_user_prompt(url, html)
+            return (user_prompt, None, [])
+
+        info = getattr(self, "_last_fetch_info", {}) or {}
+        is_cf = bool(info.get("cloudflare"))
+        if is_cf and self._get_conf_bool(CF_SCREENSHOT_ENABLE_KEY, DEFAULT_CF_SCREENSHOT_ENABLE):
+            screenshot_url = self._build_cf_screenshot_url(url)
+            if screenshot_url:
+                logger.warning(
+                    "zssm_explain: Cloudflare detected for %s (status=%s, via=%s); fallback to urlscan screenshot",
+                    url,
+                    info.get("status"),
+                    info.get("via"),
+                )
+                ready = await self._wait_cf_screenshot_ready(screenshot_url)
+                if not ready:
+                    try:
+                        if isinstance(self._last_fetch_info, dict):
+                            self._last_fetch_info["cf_screenshot_ready"] = False
+                    except Exception:
+                        pass
+                    logger.warning("zssm_explain: urlscan screenshot still unavailable, aborting image fallback")
+                    return None
+                text_hint = f"网页 {url} 受 Cloudflare 防护影响，已改用 urlscan 截图作为依据。"
+                try:
+                    if isinstance(self._last_fetch_info, dict):
+                        self._last_fetch_info["used_cf_screenshot"] = True
+                        self._last_fetch_info["cf_screenshot_ready"] = True
+                except Exception:
+                    pass
+                final_image_url = await self._resolve_liveshot_image_url(screenshot_url)
+                if not final_image_url:
+                    logger.warning("zssm_explain: failed to resolve liveshot image from html response")
+                    return None
+                local_image_path = await self._download_image_to_temp(final_image_url)
+                if not local_image_path:
+                    logger.warning("zssm_explain: failed to download liveshot image to temp file")
+                    return None
+                user_prompt = build_user_prompt(text_hint, [local_image_path])
+                return (user_prompt, text_hint, [local_image_path])
+
+        return None
+
+    def _build_url_failure_message(self) -> str:
+        info = getattr(self, "_last_fetch_info", {}) or {}
+        if info.get("cloudflare"):
+            if self._get_conf_bool(CF_SCREENSHOT_ENABLE_KEY, DEFAULT_CF_SCREENSHOT_ENABLE):
+                return "目标站点启用 Cloudflare 防护，截图降级失败，请稍后重试或改为发送手动截图/摘录内容。"
+            return "目标站点启用 Cloudflare 防护，因未启用截图降级无法抓取，请开启 cf_screenshot_enable 或稍后再试。"
+        return "网页获取失败或不受支持，请稍后重试并确认链接可访问。"
+
     def _pick_llm_text(self, llm_resp: object) -> str:
         # 1) 优先解析 AstrBot 的结果链（MessageChain）
         try:
@@ -1757,24 +2008,15 @@ class ZssmExplain(Star):
             if urls:
                 target_url = urls[0]
                 timeout_sec = self._get_conf_int(URL_FETCH_TIMEOUT_KEY, DEFAULT_URL_FETCH_TIMEOUT, 2, 60)
-                html = await self._fetch_html(target_url, timeout_sec)
-                if not html:
-                    info = getattr(self, "_last_fetch_info", {}) or {}
-                    if info.get("cloudflare"):
-                        logger.warning(
-                            "zssm_explain: Cloudflare protection detected for URL: %s (status=%s, via=%s)",
-                            target_url, info.get("status"), info.get("via")
-                        )
-                        yield self._reply_text_result(event, "目标站点启用 Cloudflare 防护，暂无法抓取网页内容。请稍后重试，或发送页面截图/复制关键段落。")
-                    else:
-                        yield self._reply_text_result(event, "网页获取失败或不支持，请稍后再试或检查链接可访问性。")
+                url_ctx = await self._prepare_url_prompt(target_url, timeout_sec)
+                if not url_ctx:
+                    yield self._reply_text_result(event, self._build_url_failure_message())
                     event.stop_event()
                     return
-                user_prompt, _page_title = self._build_url_user_prompt(target_url, html)
-                text, images = None, []  # 网页模式不直接传原文文本
+                user_prompt, text, images = url_ctx
             else:
                 text, images = inline, []
-                user_prompt = self._build_user_prompt(text, images)
+                user_prompt = build_user_prompt(text, images)
         else:
             # 2) 无内联时，优先检测是否存在视频
             try:
@@ -1795,23 +2037,14 @@ class ZssmExplain(Star):
             if urls:
                 target_url = urls[0]
                 timeout_sec = self._get_conf_int(URL_FETCH_TIMEOUT_KEY, DEFAULT_URL_FETCH_TIMEOUT, 2, 60)
-                html = await self._fetch_html(target_url, timeout_sec)
-                if not html:
-                    info = getattr(self, "_last_fetch_info", {}) or {}
-                    if info.get("cloudflare"):
-                        logger.warning(
-                            "zssm_explain: Cloudflare protection detected for URL: %s (status=%s, via=%s)",
-                            target_url, info.get("status"), info.get("via")
-                        )
-                        yield self._reply_text_result(event, "目标站点启用 Cloudflare 防护，暂无法抓取网页内容。请稍后重试，或发送页面截图/复制关键段落。")
-                    else:
-                        yield self._reply_text_result(event, "网页获取失败或不支持，请稍后再试或检查链接可访问性。")
+                url_ctx = await self._prepare_url_prompt(target_url, timeout_sec)
+                if not url_ctx:
+                    yield self._reply_text_result(event, self._build_url_failure_message())
                     event.stop_event()
                     return
-                user_prompt, _page_title = self._build_url_user_prompt(target_url, html)
-                text, images = None, []
+                user_prompt, text, images = url_ctx
             else:
-                user_prompt = self._build_user_prompt(text, images)
+                user_prompt = build_user_prompt(text, images)
 
         try:
             provider = self.context.get_using_provider(umo=event.unified_msg_origin)
@@ -1823,7 +2056,7 @@ class ZssmExplain(Star):
             yield self._reply_text_result(event, "未检测到可用的大语言模型提供商，请先在 AstrBot 配置中启用。")
             return
 
-        system_prompt = self._build_system_prompt()
+        system_prompt = build_system_prompt()
         image_urls = self._filter_supported_images(images)
 
         try:

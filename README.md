@@ -11,7 +11,8 @@
 - 文本支持：可在配置中指定“文本模型”（Provider ID）；失败回退到当前会话 Provider。
 - 提示词：默认提示词位于 `main.py` 顶部 `DEFAULT_*` 常量，直接修改即可。
 - 注意：未回复且未携带内容时，会提示“请输入要解释的内容。”
-- Cloudflare：若目标站点启用 Cloudflare 导致抓取失败，将在日志中标注 `Cloudflare protection detected`，并向用户发送专门提示“目标站点启用 Cloudflare 防护，暂无法抓取网页内容...”。
+- Cloudflare：内置降级策略。若检测到 Cloudflare 防护，自动调用 `https://urlscan.io/liveshot/` 获取网页截图，解析 `<img>` 地址并将图片下载到临时文件，再交给多模态模型；若截图也失败，则提示用户手动提供截图/摘录。
+- 截图降级会在后台等待截图生成（最多约 10 秒）；若最终仍未生成，会提示“截图降级失败”，此时可重试或手动上传截图。
 
 支持视频解释
 
@@ -20,3 +21,13 @@
 解析b站链接
 
 - 版本：v1.3.0
+
+## Cloudflare 请求降级配置
+
+| 配置键 | 类型 | 默认值 | 说明 |
+| --- | --- | --- | --- |
+| `cf_screenshot_enable` | bool | `true` | 是否启用 Cloudflare 截图降级。当 HTML 抓取被屏蔽时自动走图片解释。 |
+| `cf_screenshot_width` | int | `1280` | 截图宽度（px），传入 urlscan `width` 参数。 |
+| `cf_screenshot_height` | int | `720` | 截图高度（px），传入 urlscan `height` 参数。 |
+
+> 当 `cf_screenshot_enable=false` 或 urlscan 截图失败时，会提示用户“Cloudflare 防护导致无法抓取”，同时建议手动提供截图或开启降级。
