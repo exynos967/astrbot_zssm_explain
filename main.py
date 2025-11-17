@@ -1081,13 +1081,18 @@ class ZssmExplain(Star):
         return ("\n".join([t for t in texts if t]).strip(), images)
 
     @staticmethod
-    def _try_extract_from_reply_component(reply_comp: object) -> Tuple[Optional[str], List[str]]:
-        """尽量从 Reply 组件中得到被引用消息的文本与图片。"""
+    def _try_extract_from_reply_component(reply_comp: object) -> Tuple[Optional[str], List[str], bool]:
+        """尽量从 Reply 组件中得到被引用消息的文本与图片。
+
+        返回值第三项标记是否检测到其中包含合并转发节点（Forward/Node/Nodes）。"""
         for attr in ("message", "origin", "content"):
             payload = getattr(reply_comp, attr, None)
             if isinstance(payload, list):
-                return ZssmExplain._extract_text_and_images_from_chain(payload)
-        return (None, [])
+                text, images = ZssmExplain._extract_text_and_images_from_chain(payload)
+                # 检测 payload 中是否包含合并转发相关组件
+                has_forward = ZssmExplain._chain_has_forward(payload)
+                return (text, images, has_forward)
+        return (None, [], False)
 
     @staticmethod
     def _get_reply_message_id(reply_comp: object) -> Optional[str]:
@@ -1274,9 +1279,14 @@ class ZssmExplain(Star):
 
         raise RuntimeError("all providers failed for current request")
 
-    async def _extract_quoted_payload(self, event: AstrMessageEvent) -> Tuple[Optional[str], List[str]]:
+    async def _extract_quoted_payload(self, event: AstrMessageEvent) -> Tuple[Optional[str], List[str], bool]:
         """从当前事件中获取被回复消息的文本与图片。
-        优先：Reply 携带嵌入消息；回退：OneBot get_msg；失败：(None, [])。
+        优先：Reply 携带嵌入消息；回退：OneBot get_msg；失败：(None, [], False)。
+
+        返回:
+        - text: 提取到的文本（可为空字符串）
+        - images: 提取到的图片列表
+        - from_forward: 是否来源于“合并转发”结构（含 Forward/Node/Nodes 或 get_forward_msg）
         """
         try:
             chain = event.get_messages()
@@ -1293,11 +1303,11 @@ class ZssmExplain(Star):
                 pass
 
         if not reply_comp:
-            return (None, [])
+            return (None, [], False)
 
-        text, images = self._try_extract_from_reply_component(reply_comp)
+        text, images, from_forward = self._try_extract_from_reply_component(reply_comp)
         if text or images:
-            return (text, images)
+            return (text, images, from_forward)
 
         reply_id = self._get_reply_message_id(reply_comp)
         platform_name = None
@@ -1315,6 +1325,7 @@ class ZssmExplain(Star):
                 agg_texts: List[str] = [t2] if t2 else []
                 agg_imgs: List[str] = list(imgs2)
                 # 检测是否包含合并转发段，尝试调用 get_forward_msg 拉取节点
+                from_forward = False
                 try:
                     msg_list = data.get("message") if isinstance(data, dict) else None
                     if isinstance(msg_list, list):
@@ -1322,6 +1333,7 @@ class ZssmExplain(Star):
                             if not isinstance(seg, dict):
                                 continue
                             if seg.get("type") in ("forward", "forward_msg", "nodes"):
+                                from_forward = True
                                 d = seg.get("data", {}) if isinstance(seg.get("data"), dict) else {}
                                 fid = d.get("id")
                                 if isinstance(fid, str) and fid:
@@ -1338,12 +1350,29 @@ class ZssmExplain(Star):
                     pass
                 if agg_texts or agg_imgs:
                     logger.info("zssm_explain: fetched origin via get_msg")
-                    return ("\n".join([x for x in agg_texts if x]).strip(), agg_imgs)
+                    return ("\n".join([x for x in agg_texts if x]).strip(), agg_imgs, from_forward)
             except Exception as e:
                 logger.warning(f"zssm_explain: get_msg failed: {e}")
 
         logger.info("zssm_explain: reply component found but no embedded origin; consider platform API to fetch by id")
-        return (None, [])
+        return (None, [], False)
+
+    @staticmethod
+    def _chain_has_forward(chain: List[object]) -> bool:
+        """检测一段消息链中是否包含合并转发相关组件（Forward/Node/Nodes）。"""
+        if not isinstance(chain, list):
+            return False
+        for seg in chain:
+            try:
+                if hasattr(Comp, "Forward") and isinstance(seg, getattr(Comp, "Forward")):
+                    return True
+                if hasattr(Comp, "Node") and isinstance(seg, getattr(Comp, "Node")):
+                    return True
+                if hasattr(Comp, "Nodes") and isinstance(seg, getattr(Comp, "Nodes")):
+                    return True
+            except Exception:
+                continue
+        return False
 
     @staticmethod
     def _extract_from_onebot_forward_payload(payload: Any) -> Tuple[str, List[str]]:
@@ -1815,6 +1844,15 @@ class ZssmExplain(Star):
         user_prompt = DEFAULT_URL_USER_PROMPT.format(url=url, title=title or "(无)", desc=desc or "(无)", snippet=snippet)
         return user_prompt, title or ""
 
+    def _build_url_brief_for_forward(self, url: str, html: str) -> Tuple[str, str, str]:
+        """为合并转发场景构造网址的精简信息摘要（标题/描述/正文片段）。"""
+        title = self._extract_title(html)
+        desc = self._extract_meta_desc(html)
+        plain = self._strip_html(html)
+        max_chars = self._get_conf_int(URL_MAX_CHARS_KEY, DEFAULT_URL_MAX_CHARS, min_v=1000, max_v=50000)
+        snippet = plain[:max_chars]
+        return title or "", desc or "", snippet
+
     async def _prepare_url_prompt(self, url: str, timeout_sec: int) -> Optional[Tuple[str, Optional[str], List[str]]]:
         """统一处理网页抓取：成功返回 HTML 摘要提示词；若因 Cloudflare 被拦截则回退到截图模式。"""
         html = await self._fetch_html(url, timeout_sec)
@@ -2032,13 +2070,16 @@ class ZssmExplain(Star):
                     yield r
                 return
             # 其次，尝试被回复消息中的文本/图片
-            text, images = await self._extract_quoted_payload(event)
+            text, images, from_forward = await self._extract_quoted_payload(event)
             if not text and not images:
                 yield self._reply_text_result(event, "请输入要解释的内容。")
                 event.stop_event()
                 return
+            # 对于来源于“合并转发”的聊天记录：始终以“整段聊天记录”为主，
+            # 若其中包含网址，则在聊天记录解释的基础上，尝试附加网页摘要信息。
             urls = self._extract_urls_from_text(text) if (enable_url and text) else []
-            if urls:
+            if urls and not from_forward:
+                # 非合并转发场景，沿用原有“网页摘要优先”的行为
                 target_url = urls[0]
                 timeout_sec = self._get_conf_int(URL_FETCH_TIMEOUT_KEY, DEFAULT_URL_FETCH_TIMEOUT, 2, 60)
                 url_ctx = await self._prepare_url_prompt(target_url, timeout_sec)
@@ -2047,6 +2088,28 @@ class ZssmExplain(Star):
                     event.stop_event()
                     return
                 user_prompt, text, images = url_ctx
+            elif urls and from_forward:
+                # 合并转发 + 含网址：以聊天记录解释为主，并在可能的情况下附加网页摘要信息
+                base_prompt = build_user_prompt(text, images)
+                target_url = urls[0]
+                timeout_sec = self._get_conf_int(URL_FETCH_TIMEOUT_KEY, DEFAULT_URL_FETCH_TIMEOUT, 2, 60)
+                extra_block = ""
+                try:
+                    html = await self._fetch_html(target_url, timeout_sec)
+                except Exception:
+                    html = None
+                if isinstance(html, str) and html.strip():
+                    title, desc, snippet = self._build_url_brief_for_forward(target_url, html)
+                    extra_block = (
+                        "\n\n此外，这段聊天记录中包含一个网页链接，请结合下面的网页关键信息一起解释整段对话：\n"
+                        f"网址: {target_url}\n"
+                        f"标题: {title or '(未获取)'}\n"
+                        f"描述: {desc or '(未获取)'}\n"
+                        "正文片段:\n"
+                        f"{snippet}"
+                    )
+                # 若网页抓取失败，则仅使用聊天记录解释（base_prompt）即可
+                user_prompt = base_prompt + extra_block
             else:
                 user_prompt = build_user_prompt(text, images)
 
