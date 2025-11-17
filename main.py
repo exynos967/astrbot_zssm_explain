@@ -4,12 +4,10 @@ from typing import List, Tuple, Optional, Any, Dict
 import os
 import asyncio
 import re
-import json
 import shutil
 import tempfile
 import subprocess
-from urllib.parse import urlparse, unquote, quote, urljoin
-from html import unescape
+from urllib.parse import urlparse, unquote
 import math
 
 try:
@@ -24,51 +22,39 @@ import astrbot.api.message_components as Comp
 from astrbot.core.star.star_handler import EventType
 from astrbot.core.pipeline.context_utils import call_event_hook
 
-# === 可编辑的默认提示词（用户可直接在此处修改） ===
-DEFAULT_SYSTEM_PROMPT = (
-    "你是一个中文助理，擅长从被引用的消息中提炼含义、意图和注意事项。请注意不要输出政治相关内容。"
+from .url_utils import (
+    strip_html,
+    extract_title,
+    extract_meta_desc,
+    build_cf_screenshot_url,
+    fetch_html,
+    wait_cf_screenshot_ready,
+    download_image_to_temp,
+    resolve_liveshot_image_url,
+)
+from .message_utils import extract_quoted_payload
+from .video_utils import (
+    extract_videos_from_chain,
+    extract_videos_from_event,
+    is_http_url,
+    is_abs_file,
+    napcat_resolve_file_url,
+    extract_videos_from_onebot_message_payload,
+    probe_duration_sec,
+)
+from .prompt_utils import (
+    DEFAULT_URL_USER_PROMPT,
+    DEFAULT_VIDEO_USER_PROMPT,
+    DEFAULT_FRAME_CAPTION_PROMPT,
+    build_user_prompt,
+    build_system_prompt,
 )
 
-DEFAULT_TEXT_USER_PROMPT = (
-    "请解释这条被回复的消息的含义，输出简洁不超过100字。请注意不要输出政治相关内容。\n"
-    "原始文本：\n{text}"
-)
-
-DEFAULT_IMAGE_USER_PROMPT = (
-    "请解释这条被回复的消息/图片的含义，输出简洁不超过100字。请注意不要输出政治相关内容。\n"
-    "{text_block}\n包含图片：若无法直接读取图片，请结合上下文或文件名描述。"
-)
-
-DEFAULT_URL_USER_PROMPT = (
-    "你将看到一个网页的关键信息，请输出简版摘要（2-8句，中文）。请注意不要输出政治相关内容。"
-    "避免口水话，保留事实与结论，适当含链接上下文。\n"
-    "网址: {url}\n"
-    "标题: {title}\n"
-    "描述: {desc}\n"
-    "正文片段: \n{snippet}"
-)
-
-DEFAULT_VIDEO_USER_PROMPT = (
-    "请解释这段视频的主要内容，输出简洁不超过100字。仅依据提供的关键帧与音频转写（如有）作答；若信息不足请明确说明‘无法判断’，不要编造未出现的内容。请注意不要输出政治相关内容。\n"
-    "{meta_block}\n{asr_block}"
-)
-
-# 单帧描述提示词（逐帧多次调用使用）
-DEFAULT_FRAME_CAPTION_PROMPT = (
-    "请根据这张关键帧图片，用一句中文描述画面要点；少于25字。若无法判断，请回答‘未识别’。"
-)
-
-
-def build_user_prompt(text: Optional[str], images: List[str]) -> str:
-    """使用顶部的默认提示词模板构造用户提示。"""
-    text_block = ("原始文本:\n" + text) if text else ""
-    tmpl = DEFAULT_IMAGE_USER_PROMPT if images else DEFAULT_TEXT_USER_PROMPT
-    return tmpl.format(text=text or "", text_block=text_block)
-
-
-def build_system_prompt() -> str:
-    """返回系统提示词。"""
-    return DEFAULT_SYSTEM_PROMPT
+"""
+默认提示词已集中放在 prompt_utils.py 中：
+- DEFAULT_* 常量用于不同流程的默认文案
+- build_* 函数用于构造系统/用户提示词
+"""
 
 # URL 识别/抓取的默认参数（可通过插件配置覆盖）
 URL_DETECT_ENABLE_KEY = "enable_url_detect"
@@ -108,7 +94,7 @@ DEFAULT_CF_SCREENSHOT_HEIGHT = 720
     "zssm_explain",
     "薄暝",
     "zssm，支持关键词“zssm”（忽略前缀）与“zssm + 内容”直接解释；引用消息（含@）正常处理；支持 QQ 合并转发；未回复仅发 zssm 时提示；默认提示词可在 main.py 顶部修改。",
-    "1.5.0",
+    "1.6.0",
     "https://github.com/xiaoxi68/astrbot_zssm_explain",
 )
 class ZssmExplain(Star):
@@ -233,111 +219,21 @@ class ZssmExplain(Star):
     # ===== 视频相关工具 =====
     @staticmethod
     def _extract_videos_from_chain(chain: List[object]) -> List[str]:
-        videos: List[str] = []
-        if not isinstance(chain, list):
-            return videos
-        def _looks_like_video(name_or_url: str) -> bool:
-            if not isinstance(name_or_url, str) or not name_or_url:
-                return False
-            s = name_or_url.lower()
-            return any(
-                s.endswith(ext)
-                for ext in (
-                    ".mp4", ".mov", ".m4v", ".avi", ".webm", ".mkv", ".flv", ".wmv", ".ts", ".mpeg", ".mpg", ".3gp"
-                )
-            )
-        for seg in chain:
-            try:
-                if hasattr(Comp, "Video") and isinstance(seg, getattr(Comp, "Video")):
-                    f = getattr(seg, "file", None)
-                    u = getattr(seg, "url", None)
-                    if isinstance(f, str) and f:
-                        videos.append(f)
-                    elif isinstance(u, str) and u:
-                        videos.append(u)
-                elif hasattr(Comp, "File") and isinstance(seg, getattr(Comp, "File")):
-                    # 大视频可能以 File 形式承载
-                    u = getattr(seg, "url", None)
-                    f = getattr(seg, "file", None)
-                    n = getattr(seg, "name", None)
-                    cand = None
-                    if isinstance(u, str) and u and _looks_like_video(u):
-                        cand = u
-                    elif isinstance(f, str) and f and (_looks_like_video(f) or os.path.isabs(f)):
-                        cand = f
-                    elif isinstance(n, str) and n and _looks_like_video(n) and isinstance(f, str) and f:
-                        cand = f
-                    if isinstance(cand, str) and cand:
-                        videos.append(cand)
-                elif hasattr(Comp, "Node") and isinstance(seg, getattr(Comp, "Node")):
-                    content = getattr(seg, "content", None)
-                    if isinstance(content, list):
-                        videos.extend(ZssmExplain._extract_videos_from_chain(content))
-                elif hasattr(Comp, "Nodes") and isinstance(seg, getattr(Comp, "Nodes")):
-                    nodes = getattr(seg, "nodes", None) or getattr(seg, "content", None)
-                    if isinstance(nodes, list):
-                        for node in nodes:
-                            c = getattr(node, "content", None)
-                            if isinstance(c, list):
-                                videos.extend(ZssmExplain._extract_videos_from_chain(c))
-                elif hasattr(Comp, "Forward") and isinstance(seg, getattr(Comp, "Forward")):
-                    nodes = getattr(seg, "nodes", None) or getattr(seg, "content", None)
-                    if isinstance(nodes, list):
-                        for node in nodes:
-                            c = getattr(node, "content", None)
-                            if isinstance(c, list):
-                                videos.extend(ZssmExplain._extract_videos_from_chain(c))
-            except Exception:
-                continue
-        return videos
+        """兼容旧接口，委托 video_utils.extract_videos_from_chain。"""
+        return extract_videos_from_chain(chain)
 
     async def _extract_videos_from_event(self, event: AstrMessageEvent) -> List[str]:
-        # 先找被回复消息中的视频
-        try:
-            chain = event.get_messages()
-        except Exception:
-            chain = getattr(event.message_obj, "message", []) or []
-        reply_comp = None
-        for seg in chain:
-            try:
-                if isinstance(seg, Comp.Reply):
-                    reply_comp = seg
-                    break
-            except Exception:
-                pass
-        if reply_comp:
-            for attr in ("message", "origin", "content"):
-                payload = getattr(reply_comp, attr, None)
-                if isinstance(payload, list):
-                    vids = self._extract_videos_from_chain(payload)
-                    if vids:
-                        return vids
-            # 无内嵌内容时，尝试通过平台能力（OneBot/Napcat）用 message_id 拉取原消息
-            reply_id = self._get_reply_message_id(reply_comp)
-            platform_name = None
-            try:
-                platform_name = event.get_platform_name()
-            except Exception:
-                platform_name = None
-            if reply_id and platform_name == "aiocqhttp" and hasattr(event, "bot"):
-                try:
-                    data = await event.bot.get_msg(message_id=int(reply_id))
-                    vids = self._extract_videos_from_onebot_message_payload(data)
-                    if vids:
-                        return vids
-                except Exception:
-                    pass
-        # 没有 Reply 或 Reply 无视频，则直接从当前消息链找视频
-        return self._extract_videos_from_chain(chain)
+        """兼容旧接口，委托 video_utils.extract_videos_from_event。"""
+        return await extract_videos_from_event(event)
 
     # ===== Napcat (aiocqhttp) 文件直链解析 =====
     @staticmethod
     def _is_http_url(s: Optional[str]) -> bool:
-        return isinstance(s, str) and s.lower().startswith(("http://", "https://"))
+        return is_http_url(s)
 
     @staticmethod
     def _is_abs_file(s: Optional[str]) -> bool:
-        return isinstance(s, str) and os.path.isabs(s)
+        return is_abs_file(s)
 
     def _is_napcat(self, event: AstrMessageEvent) -> bool:
         try:
@@ -346,81 +242,13 @@ class ZssmExplain(Star):
             return False
 
     async def _napcat_resolve_file_url(self, event: AstrMessageEvent, file_id: str) -> Optional[str]:
-        """使用 Napcat 接口将文件/视频的 file_id 解析为可下载 URL。
-        - 群聊: POST /get_group_file_url { group_id, file_id }
-        - 私聊: POST /get_private_file_url { file_id }
-        返回 url 或 None。
-        """
-        if not (isinstance(file_id, str) and file_id):
-            return None
-        if not self._is_napcat(event):
-            return None
-        params: Dict[str, Any] = {"file_id": file_id}
-        action = "get_private_file_url"
-        try:
-            gid = event.get_group_id()
-        except Exception:
-            gid = None
-        if gid:
-            params = {"group_id": gid, "file_id": file_id}
-            action = "get_group_file_url"
-        try:
-            ret = await event.bot.api.call_action(action, **params)
-            data = ret.get("data") if isinstance(ret, dict) else None
-            url = data.get("url") if isinstance(data, dict) else None
-            if isinstance(url, str) and url:
-                logger.info("zssm_explain: napcat %s ok, url=%s", action, url[:80])
-                return url
-            logger.warning("zssm_explain: napcat %s returned no url", action)
-        except Exception as e:
-            logger.warning("zssm_explain: napcat %s failed: %s", action, e)
-        return None
+        """兼容旧接口，委托 video_utils.napcat_resolve_file_url。"""
+        return await napcat_resolve_file_url(event, file_id)
 
     @staticmethod
     def _extract_videos_from_onebot_message_payload(payload: Any) -> List[str]:
-        """从 OneBot/Napcat get_msg/get_forward_msg 返回的 payload 中提取视频 URL/路径。"""
-        videos: List[str] = []
-        data = ZssmExplain._ob_data(payload) if isinstance(payload, dict) else {}
-        if isinstance(data, dict):
-            # 常见字段 message/messages/nodes
-            candidates = data.get("message") or data.get("messages") or data.get("nodes") or data.get("nodeList")
-            if isinstance(candidates, list):
-                for seg in candidates:
-                    try:
-                        if isinstance(seg, dict):
-                            # 可能是消息段，或转发节点
-                            if "type" in seg and "data" in seg:
-                                t = seg.get("type")
-                                d = seg.get("data") or {}
-                                if isinstance(d, dict):
-                                    if t == "video":
-                                        url = d.get("url") or d.get("file")
-                                        if isinstance(url, str) and url:
-                                            videos.append(url)
-                                    elif t == "file":
-                                        # 文件类型里也可能是视频
-                                        url = d.get("url") or d.get("file")
-                                        name = d.get("name") or d.get("filename")
-                                        def _looks_like_video(name_or_url: str) -> bool:
-                                            if not isinstance(name_or_url, str) or not name_or_url:
-                                                return False
-                                            s = name_or_url.lower()
-                                            return any(s.endswith(ext) for ext in (
-                                                ".mp4", ".mov", ".m4v", ".avi", ".webm", ".mkv", ".flv", ".wmv", ".ts", ".mpeg", ".mpg", ".3gp"
-                                            ))
-                                        if isinstance(url, str) and url and _looks_like_video(url):
-                                            videos.append(url)
-                                        elif isinstance(name, str) and _looks_like_video(name) and isinstance(url, str) and url:
-                                            videos.append(url)
-                            else:
-                                # 转发节点内的 message/content 列表
-                                content = seg.get("content") or seg.get("message")
-                                if isinstance(content, list):
-                                    inner = ZssmExplain._extract_videos_from_onebot_message_payload({"message": content})
-                                    videos.extend(inner)
-                    except Exception:
-                        continue
-        return videos
+        """兼容旧接口，委托 video_utils.extract_videos_from_onebot_message_payload。"""
+        return extract_videos_from_onebot_message_payload(payload)
 
     def _resolve_ffmpeg(self) -> Optional[str]:
         # 配置优先
@@ -552,96 +380,8 @@ class ZssmExplain(Star):
             return None
 
     def _probe_duration_sec(self, ffprobe_path: Optional[str], video_path: str) -> Optional[float]:
-        """更稳健地探测视频时长：
-        - 尝试多源（format.duration、stream.duration、nb_frames/fps），并输出全部候选；
-        - 若存在多个候选，取中位数（median）以抵抗异常值；
-        - 失败返回 None。
-        """
-        if not ffprobe_path:
-            return None
-        candidates: List[float] = []
-        try:
-            # 1) format.duration
-            cmd1 = [ffprobe_path, "-v", "error", "-show_entries", "format=duration", "-of", "json", video_path]
-            res1 = subprocess.run(cmd1, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
-            if res1.returncode == 0:
-                try:
-                    data1 = json.loads(res1.stdout.decode("utf-8", errors="ignore") or "{}")
-                except Exception:
-                    data1 = {}
-                if isinstance(data1, dict):
-                    fmt = data1.get("format")
-                    if isinstance(fmt, dict):
-                        d = fmt.get("duration")
-                        try:
-                            dur = float(d)
-                            if dur and dur > 0:
-                                candidates.append(dur)
-                        except Exception:
-                            pass
-
-            # 2) 首个视频流：duration、nb_frames/fps
-            cmd2 = [
-                ffprobe_path, "-v", "error",
-                "-select_streams", "v:0",
-                "-show_entries", "stream=duration,nb_frames,avg_frame_rate,r_frame_rate",
-                "-of", "json",
-                video_path,
-            ]
-            res2 = subprocess.run(cmd2, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
-            if res2.returncode == 0:
-                try:
-                    data2 = json.loads(res2.stdout.decode("utf-8", errors="ignore") or "{}")
-                except Exception:
-                    data2 = {}
-                stream = None
-                if isinstance(data2, dict):
-                    streams = data2.get("streams")
-                    if isinstance(streams, list) and streams:
-                        s0 = streams[0]
-                        if isinstance(s0, dict):
-                            stream = s0
-                if isinstance(stream, dict):
-                    # duration
-                    d = stream.get("duration")
-                    try:
-                        dur = float(d)
-                        if dur and dur > 0:
-                            candidates.append(dur)
-                    except Exception:
-                        pass
-                    # nb_frames / fps
-                    fps_txt = stream.get("avg_frame_rate") or stream.get("r_frame_rate") or "0/1"
-                    try:
-                        num, den = fps_txt.split("/")
-                        fps = float(num) / float(den) if float(den) != 0 else 0.0
-                    except Exception:
-                        fps = 0.0
-                    try:
-                        nb_frames = stream.get("nb_frames")
-                        nb = int(nb_frames) if nb_frames is not None and str(nb_frames).isdigit() else 0
-                    except Exception:
-                        nb = 0
-                    if fps > 0 and nb > 0:
-                        cand = nb / fps
-                        if cand > 0:
-                            candidates.append(cand)
-
-            if candidates:
-                # 记录所有候选并取中位数
-                c_sorted = sorted(candidates)
-                logger.info("zssm_explain: ffprobe duration candidates=%s", [round(x, 3) for x in c_sorted])
-                mid = len(c_sorted) // 2
-                if len(c_sorted) % 2 == 1:
-                    chosen = c_sorted[mid]
-                else:
-                    chosen = 0.5 * (c_sorted[mid - 1] + c_sorted[mid])
-                logger.info("zssm_explain: ffprobe chosen duration=%.3f", chosen)
-                return chosen
-            return None
-        except Exception as e:
-            logger.warning("zssm_explain: ffprobe duration failed: %s", e)
-            return None
+        """兼容旧接口，委托 video_utils.probe_duration_sec。"""
+        return probe_duration_sec(ffprobe_path, video_path)
 
     async def _sample_frames_with_ffmpeg(self, ffmpeg_path: str, video_path: str, interval_sec: int, count_limit: int) -> List[str]:
         out_dir = tempfile.mkdtemp(prefix="zssm_frames_")
@@ -1032,130 +772,7 @@ class ZssmExplain(Star):
             except Exception:
                 pass
 
-    @staticmethod
-    def _extract_text_and_images_from_chain(chain: List[object]) -> Tuple[str, List[str]]:
-        """从一段消息链中提取纯文本与图片地址/路径；支持合并转发节点的递归提取。"""
-        texts: List[str] = []
-        images: List[str] = []
-        for seg in chain:
-            try:
-                if isinstance(seg, Comp.Plain):
-                    txt = getattr(seg, "text", None)
-                    texts.append(txt if isinstance(txt, str) else str(seg))
-                elif isinstance(seg, Comp.Image):
-                    f = getattr(seg, "file", None)
-                    u = getattr(seg, "url", None)
-                    if isinstance(f, str) and f:
-                        images.append(f)
-                    elif isinstance(u, str) and u:
-                        images.append(u)
-                elif hasattr(Comp, "Node") and isinstance(seg, getattr(Comp, "Node")):
-                    content = getattr(seg, "content", None)
-                    if isinstance(content, list):
-                        t2, i2 = ZssmExplain._extract_text_and_images_from_chain(content)
-                        if t2:
-                            texts.append(t2)
-                        images.extend(i2)
-                elif hasattr(Comp, "Nodes") and isinstance(seg, getattr(Comp, "Nodes")):
-                    nodes = getattr(seg, "nodes", None) or getattr(seg, "content", None)
-                    if isinstance(nodes, list):
-                        for node in nodes:
-                            c = getattr(node, "content", None)
-                            if isinstance(c, list):
-                                t2, i2 = ZssmExplain._extract_text_and_images_from_chain(c)
-                                if t2:
-                                    texts.append(t2)
-                                images.extend(i2)
-                elif hasattr(Comp, "Forward") and isinstance(seg, getattr(Comp, "Forward")):
-                    nodes = getattr(seg, "nodes", None) or getattr(seg, "content", None)
-                    if isinstance(nodes, list):
-                        for node in nodes:
-                            c = getattr(node, "content", None)
-                            if isinstance(c, list):
-                                t2, i2 = ZssmExplain._extract_text_and_images_from_chain(c)
-                                if t2:
-                                    texts.append(t2)
-                                images.extend(i2)
-            except (AttributeError, TypeError, ValueError) as e:
-                logger.warning(f"zssm_explain: parse chain segment failed: {e}")
-        return ("\n".join([t for t in texts if t]).strip(), images)
-
-    @staticmethod
-    def _try_extract_from_reply_component(reply_comp: object) -> Tuple[Optional[str], List[str], bool]:
-        """尽量从 Reply 组件中得到被引用消息的文本与图片。
-
-        返回值第三项标记是否检测到其中包含合并转发节点（Forward/Node/Nodes）。"""
-        for attr in ("message", "origin", "content"):
-            payload = getattr(reply_comp, attr, None)
-            if isinstance(payload, list):
-                text, images = ZssmExplain._extract_text_and_images_from_chain(payload)
-                # 检测 payload 中是否包含合并转发相关组件
-                has_forward = ZssmExplain._chain_has_forward(payload)
-                return (text, images, has_forward)
-        return (None, [], False)
-
-    @staticmethod
-    def _get_reply_message_id(reply_comp: object) -> Optional[str]:
-        """从 Reply 组件中尽力获取原消息的 message_id（OneBot/Napcat 常见为 id）。"""
-        for key in ("id", "message_id", "reply_id", "messageId", "message_seq"):
-            val = getattr(reply_comp, key, None)
-            if isinstance(val, (str, int)) and str(val):
-                return str(val)
-        data = getattr(reply_comp, "data", None)
-        if isinstance(data, dict):
-            for key in ("id", "message_id", "reply", "messageId", "message_seq"):
-                val = data.get(key)
-                if isinstance(val, (str, int)) and str(val):
-                    return str(val)
-        return None
-
-    @staticmethod
-    def _ob_data(obj: Any) -> Dict[str, Any]:
-        """OneBot 风格响应可能包裹在 data 字段中，展开后返回字典。"""
-        if isinstance(obj, dict):
-            data = obj.get("data")
-            if isinstance(data, dict):
-                return data
-            return obj
-        return {}
-
-    @staticmethod
-    def _extract_from_onebot_message_payload(payload: Any) -> Tuple[str, List[str]]:
-        """从 OneBot/Napcat get_msg 返回的 payload 中提取文本与图片；识别 forward/nodes 由上层处理。"""
-        texts: List[str] = []
-        images: List[str] = []
-        data = ZssmExplain._ob_data(payload) if isinstance(payload, dict) else {}
-        if isinstance(data, dict):
-            msg = data.get("message") or data.get("messages")
-            if isinstance(msg, list):
-                for seg in msg:
-                    try:
-                        if not isinstance(seg, dict):
-                            continue
-                        t = seg.get("type")
-                        d = seg.get("data", {}) if isinstance(seg.get("data"), dict) else {}
-                        if t in ("text", "plain"):
-                            txt = d.get("text")
-                            if isinstance(txt, str) and txt:
-                                texts.append(txt)
-                        elif t == "image":
-                            url = d.get("url") or d.get("file")
-                            if isinstance(url, str) and url:
-                                images.append(url)
-                        # 对于 forward/nodes，不在此层解析，由上层触发 get_forward_msg 获取节点
-                    except Exception as e:
-                        logger.warning(f"zssm_explain: parse onebot segment failed: {e}")
-                return ("\n".join([t for t in texts if t]).strip(), images)
-            elif isinstance(msg, str) and msg:
-                texts.append(msg)
-                return ("\n".join(texts).strip(), images)
-            raw = data.get("raw_message")
-            if isinstance(raw, str) and raw:
-                texts.append(raw)
-                return ("\n".join(texts).strip(), images)
-        # 无法解析出有意义的文本，返回空字符串而非对象字符串，避免误导 LLM
-        logger.warning("zssm_explain: failed to extract text from OneBot payload; fallback to empty text")
-        return ("", images)
+    # 文本与图片解析等通用工具已迁移至 message_utils 模块
 
     @staticmethod
     def _filter_supported_images(images: List[str]) -> List[str]:
@@ -1280,127 +897,8 @@ class ZssmExplain(Star):
         raise RuntimeError("all providers failed for current request")
 
     async def _extract_quoted_payload(self, event: AstrMessageEvent) -> Tuple[Optional[str], List[str], bool]:
-        """从当前事件中获取被回复消息的文本与图片。
-        优先：Reply 携带嵌入消息；回退：OneBot get_msg；失败：(None, [], False)。
-
-        返回:
-        - text: 提取到的文本（可为空字符串）
-        - images: 提取到的图片列表
-        - from_forward: 是否来源于“合并转发”结构（含 Forward/Node/Nodes 或 get_forward_msg）
-        """
-        try:
-            chain = event.get_messages()
-        except Exception:
-            chain = getattr(event.message_obj, "message", []) or []
-
-        reply_comp = None
-        for seg in chain:
-            try:
-                if isinstance(seg, Comp.Reply):
-                    reply_comp = seg
-                    break
-            except Exception:
-                pass
-
-        if not reply_comp:
-            return (None, [], False)
-
-        text, images, from_forward = self._try_extract_from_reply_component(reply_comp)
-        if text or images:
-            return (text, images, from_forward)
-
-        reply_id = self._get_reply_message_id(reply_comp)
-        platform_name = None
-        try:
-            platform_name = event.get_platform_name()
-        except Exception:
-            platform_name = None
-
-        if reply_id and platform_name == "aiocqhttp" and hasattr(event, "bot"):
-            try:
-                ret: Dict[str, Any] = await event.bot.api.call_action("get_msg", message_id=reply_id)
-                data = ZssmExplain._ob_data(ret)
-                # 先解析普通文本/图片
-                t2, imgs2 = self._extract_from_onebot_message_payload(data)
-                agg_texts: List[str] = [t2] if t2 else []
-                agg_imgs: List[str] = list(imgs2)
-                # 检测是否包含合并转发段，尝试调用 get_forward_msg 拉取节点
-                from_forward = False
-                try:
-                    msg_list = data.get("message") if isinstance(data, dict) else None
-                    if isinstance(msg_list, list):
-                        for seg in msg_list:
-                            if not isinstance(seg, dict):
-                                continue
-                            if seg.get("type") in ("forward", "forward_msg", "nodes"):
-                                from_forward = True
-                                d = seg.get("data", {}) if isinstance(seg.get("data"), dict) else {}
-                                fid = d.get("id")
-                                if isinstance(fid, str) and fid:
-                                    try:
-                                        fwd = await event.bot.api.call_action("get_forward_msg", id=fid)
-                                        ft, fi = self._extract_from_onebot_forward_payload(fwd)
-                                        if ft:
-                                            agg_texts.append(ft)
-                                        if fi:
-                                            agg_imgs.extend(fi)
-                                    except Exception as fe:
-                                        logger.warning(f"zssm_explain: get_forward_msg failed: {fe}")
-                except Exception:
-                    pass
-                if agg_texts or agg_imgs:
-                    logger.info("zssm_explain: fetched origin via get_msg")
-                    return ("\n".join([x for x in agg_texts if x]).strip(), agg_imgs, from_forward)
-            except Exception as e:
-                logger.warning(f"zssm_explain: get_msg failed: {e}")
-
-        logger.info("zssm_explain: reply component found but no embedded origin; consider platform API to fetch by id")
-        return (None, [], False)
-
-    @staticmethod
-    def _chain_has_forward(chain: List[object]) -> bool:
-        """检测一段消息链中是否包含合并转发相关组件（Forward/Node/Nodes）。"""
-        if not isinstance(chain, list):
-            return False
-        for seg in chain:
-            try:
-                if hasattr(Comp, "Forward") and isinstance(seg, getattr(Comp, "Forward")):
-                    return True
-                if hasattr(Comp, "Node") and isinstance(seg, getattr(Comp, "Node")):
-                    return True
-                if hasattr(Comp, "Nodes") and isinstance(seg, getattr(Comp, "Nodes")):
-                    return True
-            except Exception:
-                continue
-        return False
-
-    @staticmethod
-    def _extract_from_onebot_forward_payload(payload: Any) -> Tuple[str, List[str]]:
-        """解析 OneBot get_forward_msg 返回的 messages/nodes 列表，汇总文本与图片。"""
-        texts: List[str] = []
-        images: List[str] = []
-        data = ZssmExplain._ob_data(payload) if isinstance(payload, dict) else {}
-        if isinstance(data, dict):
-            msgs = (
-                data.get("messages")
-                or data.get("message")
-                or data.get("nodes")
-                or data.get("nodeList")
-            )
-            if isinstance(msgs, list):
-                for node in msgs:
-                    try:
-                        content = None
-                        if isinstance(node, dict):
-                            content = node.get("content") or node.get("message")
-                        if isinstance(content, list):
-                            t, i = ZssmExplain._extract_from_onebot_message_payload({"message": content})
-                            if t:
-                                texts.append(t)
-                            images.extend(i)
-                    except Exception:
-                        continue
-        return ("\n".join([x for x in texts if x]).strip(), images)
+        """兼容旧接口，内部委托给 message_utils.extract_quoted_payload。"""
+        return await extract_quoted_payload(event)
 
     @staticmethod
     def _is_zssm_trigger(text: str) -> bool:
@@ -1512,141 +1010,6 @@ class ZssmExplain(Star):
             pass
         return default
 
-    def _build_cf_screenshot_url(self, url: str) -> Optional[str]:
-        if not isinstance(url, str) or not url:
-            return None
-        width = self._get_conf_int(CF_SCREENSHOT_WIDTH_KEY, DEFAULT_CF_SCREENSHOT_WIDTH, 320, 2000)
-        height = self._get_conf_int(CF_SCREENSHOT_HEIGHT_KEY, DEFAULT_CF_SCREENSHOT_HEIGHT, 320, 2000)
-        try:
-            encoded = quote(url, safe="")
-        except Exception:
-            encoded = url
-        return f"https://urlscan.io/liveshot/?width={width}&height={height}&url={encoded}"
-
-    async def _probe_screenshot_url(self, url: str, per_request_timeout: int = 6) -> bool:
-        """尝试访问截图 URL，确认资源已经生成。"""
-        if not url:
-            return False
-        headers = {
-            "User-Agent": "AstrBot-zssm/1.0 (+https://github.com/xiaoxi68/astrbot_zssm_explain)",
-            "Range": "bytes=0-256",
-            "Accept": "image/avif,image/webp,image/*,*/*;q=0.8",
-        }
-        if aiohttp is not None:
-            try:
-                async with aiohttp.ClientSession(headers=headers) as session:
-                    async with session.get(url, timeout=per_request_timeout, allow_redirects=True) as resp:
-                        if 200 <= int(resp.status) < 400:
-                            await resp.content.readexactly(1)
-                            return True
-            except Exception:
-                pass
-        import urllib.request
-        import urllib.error
-
-        def _do() -> bool:
-            try:
-                req = urllib.request.Request(url, headers=headers)
-                with urllib.request.urlopen(req, timeout=per_request_timeout) as resp:
-                    status = getattr(resp, "status", 200)
-                    if 200 <= int(status) < 400:
-                        resp.read(1)
-                        return True
-            except Exception:
-                return False
-            return False
-
-        loop = asyncio.get_running_loop()
-        return await loop.run_in_executor(None, _do)
-
-    async def _wait_cf_screenshot_ready(
-        self,
-        url: str,
-        overall_timeout: float = 12.0,
-        interval_sec: float = 1.5,
-    ) -> bool:
-        """轮询 urlscan 截图是否已经可访问，避免将空链接传给多模态模型。"""
-        if not url:
-            return False
-        loop = asyncio.get_running_loop()
-        deadline = loop.time() + max(overall_timeout, 3.0)
-        attempt = 0
-        while True:
-            attempt += 1
-            if await self._probe_screenshot_url(url):
-                try:
-                    if isinstance(self._last_fetch_info, dict):
-                        self._last_fetch_info["cf_screenshot_ready_attempts"] = attempt
-                except Exception:
-                    pass
-                return True
-            if loop.time() >= deadline:
-                logger.warning("zssm_explain: urlscan screenshot not ready after %s attempts", attempt)
-                break
-            await asyncio.sleep(interval_sec)
-        return False
-
-    @staticmethod
-    def _extract_first_img_src(html: str) -> Optional[str]:
-        if not isinstance(html, str) or not html:
-            return None
-        m = re.search(r'<img[^>]+src=["\']([^"\']+)["\']', html, flags=re.IGNORECASE)
-        if m:
-            return unescape(m.group(1).strip())
-        return None
-
-    async def _resolve_liveshot_image_url(self, url: str, timeout_sec: int = 15) -> Optional[str]:
-        """确保拿到真正的图片 URL：若返回 HTML，则解析其中的 <img src> 并再次校验。"""
-        headers = {
-            "User-Agent": "AstrBot-zssm/1.0 (+https://github.com/xiaoxi68/astrbot_zssm_explain)",
-            "Accept": "image/avif,image/webp,image/*,*/*;q=0.8",
-        }
-
-        async def _fetch() -> Tuple[Optional[bytes], Optional[str]]:
-            if aiohttp is not None:
-                try:
-                    async with aiohttp.ClientSession(headers=headers) as session:
-                        async with session.get(url, timeout=timeout_sec, allow_redirects=True) as resp:
-                            if 200 <= int(resp.status) < 400:
-                                data = await resp.read()
-                                return data, resp.headers.get("Content-Type")
-                except Exception:
-                    pass
-            import urllib.request
-            import urllib.error
-
-            def _do() -> Tuple[Optional[bytes], Optional[str]]:
-                try:
-                    req = urllib.request.Request(url, headers=headers)
-                    with urllib.request.urlopen(req, timeout=timeout_sec) as resp:
-                        status = getattr(resp, "status", 200)
-                        if 200 <= int(status) < 400:
-                            data = resp.read()
-                            return data, resp.headers.get("Content-Type")
-                except Exception:
-                    return (None, None)
-                return (None, None)
-
-            loop = asyncio.get_running_loop()
-            return await loop.run_in_executor(None, _do)
-
-        data, content_type = await _fetch()
-        if not data:
-            return None
-        if isinstance(content_type, str) and "image" in content_type.lower():
-            return url
-        try:
-            html = data.decode("utf-8", errors="ignore")
-        except Exception:
-            html = ""
-        img_src = self._extract_first_img_src(html)
-        if not img_src:
-            return None
-        resolved = urljoin(url, img_src)
-        if not resolved.startswith("http"):
-            return None
-        ok = await self._probe_screenshot_url(resolved)
-        return resolved if ok else None
 
     async def _download_image_to_temp(self, url: str, timeout_sec: int = 15) -> Optional[str]:
         """下载图片到临时文件并返回路径。"""
@@ -1719,126 +1082,10 @@ class ZssmExplain(Star):
                 seen.add(u)
         return uniq
 
-    async def _fetch_html(self, url: str, timeout_sec: int) -> Optional[str]:
-        """获取网页 HTML 文本：优先 aiohttp；回退 urllib 在线程池中执行，避免阻塞事件循环。"""
-        def _mark(status: Optional[int] = None, headers: Optional[Dict[str, str]] = None, text_hint: Optional[str] = None, via: str = "", error: Optional[str] = None):
-            headers = headers or {}
-            # 简易 Cloudflare 识别：server=cloudflare 或存在 cf-* 响应头；或文本提示
-            server = str(headers.get("server", "")).lower()
-            cf_header = any(h.lower().startswith("cf-") for h in headers.keys()) if headers else False
-            text_has_cf = False
-            if isinstance(text_hint, str):
-                tl = text_hint.lower()
-                if "cloudflare" in tl or "attention required" in tl or "enable javascript and cookies" in tl:
-                    text_has_cf = True
-            is_cf = ("cloudflare" in server) or cf_header or text_has_cf
-            self._last_fetch_info = {
-                "url": url,
-                "status": status,
-                "cloudflare": is_cf,
-                "via": via,
-                "error": error,
-            }
-
-        async def _aiohttp_fetch() -> Optional[str]:
-            if aiohttp is None:
-                return None
-            try:
-                async with aiohttp.ClientSession(headers={
-                    "User-Agent": "AstrBot-zssm/1.0 (+https://github.com/xiaoxi68/astrbot_zssm_explain)"
-                }) as session:
-                    async with session.get(url, timeout=timeout_sec, allow_redirects=True) as resp:
-                        status = int(resp.status)
-                        hdrs = {k: v for k, v in resp.headers.items()}
-                        if 200 <= status < 400:
-                            text = await resp.text()
-                            _mark(status=status, headers=hdrs, text_hint=text[:512], via="aiohttp")
-                            return text
-                        # 非 2xx/3xx，记录并返回 None
-                        _mark(status=status, headers=hdrs, text_hint=None, via="aiohttp")
-                        return None
-            except Exception as e:
-                logger.warning(f"zssm_explain: aiohttp fetch failed: {e}")
-                _mark(status=None, headers=None, text_hint=None, via="aiohttp", error=str(e))
-                return None
-
-        async def _urllib_fetch() -> Optional[str]:
-            import urllib.request
-            import urllib.error
-            def _do() -> Optional[str]:
-                try:
-                    req = urllib.request.Request(url, headers={
-                        "User-Agent": "AstrBot-zssm/1.0 (+https://github.com/xiaoxi68/astrbot_zssm_explain)"
-                    })
-                    with urllib.request.urlopen(req, timeout=timeout_sec) as resp:
-                        data = resp.read()
-                        # 尝试从头部/内容推断编码；回退 utf-8
-                        enc = resp.headers.get_content_charset() or "utf-8"
-                        try:
-                            text = data.decode(enc, errors="replace")
-                            _mark(status=getattr(resp, "status", 200), headers=dict(resp.headers), text_hint=text[:512], via="urllib")
-                            return text
-                        except Exception:
-                            text = data.decode("utf-8", errors="replace")
-                            _mark(status=getattr(resp, "status", 200), headers=dict(resp.headers), text_hint=text[:512], via="urllib")
-                            return text
-                except urllib.error.HTTPError as e:  # 带状态码与响应头
-                    try:
-                        body = e.read() or b""
-                        hint = body.decode("utf-8", errors="ignore")[:512]
-                    except Exception:
-                        hint = None
-                    hdrs = dict(getattr(e, "headers", {}) or {})
-                    _mark(status=getattr(e, "code", None), headers=hdrs, text_hint=hint, via="urllib", error=str(e))
-                    logger.warning(f"zssm_explain: urllib fetch failed: {e}")
-                    return None
-                except Exception as e:
-                    _mark(status=None, headers=None, text_hint=None, via="urllib", error=str(e))
-                    logger.warning(f"zssm_explain: urllib fetch failed: {e}")
-                    return None
-            loop = asyncio.get_running_loop()
-            return await loop.run_in_executor(None, _do)
-
-        html = await _aiohttp_fetch()
-        if html is not None:
-            return html
-        return await _urllib_fetch()
-
-    @staticmethod
-    def _strip_html(html: str) -> str:
-        # 去掉 script/style
-        html = re.sub(r"<script[\s\S]*?</script>", " ", html, flags=re.IGNORECASE)
-        html = re.sub(r"<style[\s\S]*?</style>", " ", html, flags=re.IGNORECASE)
-        # 基础去标签
-        text = re.sub(r"<[^>]+>", " ", html)
-        text = unescape(text)
-        text = re.sub(r"\s+", " ", text)
-        return text.strip()
-
-    @staticmethod
-    def _extract_title(html: str) -> str:
-        m = re.search(r"<title[^>]*>(.*?)</title>", html, flags=re.IGNORECASE | re.DOTALL)
-        if m:
-            return unescape(re.sub(r"\s+", " ", m.group(1)).strip())
-        return ""
-
-    @staticmethod
-    def _extract_meta_desc(html: str) -> str:
-        # 常见 meta 描述字段
-        for name in [
-            r"name=\"description\"",
-            r"property=\"og:description\"",
-            r"name=\"twitter:description\"",
-        ]:
-            m = re.search(rf"<meta[^>]+{name}[^>]+content=\"(.*?)\"[^>]*>", html, flags=re.IGNORECASE | re.DOTALL)
-            if m:
-                return unescape(re.sub(r"\s+", " ", m.group(1)).strip())
-        return ""
-
     def _build_url_user_prompt(self, url: str, html: str) -> Tuple[str, str]:
-        title = self._extract_title(html)
-        desc = self._extract_meta_desc(html)
-        plain = self._strip_html(html)
+        title = extract_title(html)
+        desc = extract_meta_desc(html)
+        plain = strip_html(html)
         max_chars = self._get_conf_int(URL_MAX_CHARS_KEY, DEFAULT_URL_MAX_CHARS, min_v=1000, max_v=50000)
         snippet = plain[:max_chars]
         user_prompt = DEFAULT_URL_USER_PROMPT.format(url=url, title=title or "(无)", desc=desc or "(无)", snippet=snippet)
@@ -1846,16 +1093,16 @@ class ZssmExplain(Star):
 
     def _build_url_brief_for_forward(self, url: str, html: str) -> Tuple[str, str, str]:
         """为合并转发场景构造网址的精简信息摘要（标题/描述/正文片段）。"""
-        title = self._extract_title(html)
-        desc = self._extract_meta_desc(html)
-        plain = self._strip_html(html)
+        title = extract_title(html)
+        desc = extract_meta_desc(html)
+        plain = strip_html(html)
         max_chars = self._get_conf_int(URL_MAX_CHARS_KEY, DEFAULT_URL_MAX_CHARS, min_v=1000, max_v=50000)
         snippet = plain[:max_chars]
         return title or "", desc or "", snippet
 
     async def _prepare_url_prompt(self, url: str, timeout_sec: int) -> Optional[Tuple[str, Optional[str], List[str]]]:
         """统一处理网页抓取：成功返回 HTML 摘要提示词；若因 Cloudflare 被拦截则回退到截图模式。"""
-        html = await self._fetch_html(url, timeout_sec)
+        html = await fetch_html(url, timeout_sec, self._last_fetch_info)
         if html:
             user_prompt, _ = self._build_url_user_prompt(url, html)
             return (user_prompt, None, [])
@@ -1863,7 +1110,11 @@ class ZssmExplain(Star):
         info = getattr(self, "_last_fetch_info", {}) or {}
         is_cf = bool(info.get("cloudflare"))
         if is_cf and self._get_conf_bool(CF_SCREENSHOT_ENABLE_KEY, DEFAULT_CF_SCREENSHOT_ENABLE):
-            screenshot_url = self._build_cf_screenshot_url(url)
+            screenshot_url = build_cf_screenshot_url(
+                url,
+                self._get_conf_int(CF_SCREENSHOT_WIDTH_KEY, DEFAULT_CF_SCREENSHOT_WIDTH, 320, 4096),
+                self._get_conf_int(CF_SCREENSHOT_HEIGHT_KEY, DEFAULT_CF_SCREENSHOT_HEIGHT, 240, 4096),
+            )
             if screenshot_url:
                 logger.warning(
                     "zssm_explain: Cloudflare detected for %s (status=%s, via=%s); fallback to urlscan screenshot",
@@ -1871,7 +1122,7 @@ class ZssmExplain(Star):
                     info.get("status"),
                     info.get("via"),
                 )
-                ready = await self._wait_cf_screenshot_ready(screenshot_url)
+                ready = await wait_cf_screenshot_ready(screenshot_url, self._last_fetch_info)
                 if not ready:
                     try:
                         if isinstance(self._last_fetch_info, dict):
@@ -1886,11 +1137,11 @@ class ZssmExplain(Star):
                         self._last_fetch_info["cf_screenshot_ready"] = True
                 except Exception:
                     pass
-                final_image_url = await self._resolve_liveshot_image_url(screenshot_url)
+                final_image_url = await resolve_liveshot_image_url(screenshot_url)
                 if not final_image_url:
                     logger.warning("zssm_explain: failed to resolve liveshot image from html response")
                     return None
-                local_image_path = await self._download_image_to_temp(final_image_url)
+                local_image_path = await download_image_to_temp(final_image_url)
                 if not local_image_path:
                     logger.warning("zssm_explain: failed to download liveshot image to temp file")
                     return None
@@ -2095,7 +1346,7 @@ class ZssmExplain(Star):
                 timeout_sec = self._get_conf_int(URL_FETCH_TIMEOUT_KEY, DEFAULT_URL_FETCH_TIMEOUT, 2, 60)
                 extra_block = ""
                 try:
-                    html = await self._fetch_html(target_url, timeout_sec)
+                    html = await fetch_html(target_url, timeout_sec, self._last_fetch_info)
                 except Exception:
                     html = None
                 if isinstance(html, str) and html.strip():
