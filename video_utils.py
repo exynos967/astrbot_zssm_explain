@@ -55,10 +55,11 @@ def extract_videos_from_chain(chain: List[object]) -> List[str]:
             if hasattr(Comp, "Video") and isinstance(seg, getattr(Comp, "Video")):
                 f = getattr(seg, "file", None)
                 u = getattr(seg, "url", None)
-                if isinstance(f, str) and f:
-                    videos.append(f)
-                elif isinstance(u, str) and u:
+                # 对于视频组件，优先使用 URL，其次才回退到 file/path
+                if isinstance(u, str) and u:
                     videos.append(u)
+                elif isinstance(f, str) and f:
+                    videos.append(f)
             elif hasattr(Comp, "File") and isinstance(seg, getattr(Comp, "File")):
                 u = getattr(seg, "url", None)
                 f = getattr(seg, "file", None)
@@ -127,10 +128,48 @@ async def extract_videos_from_event(event: AstrMessageEvent) -> List[str]:
             platform_name = None
         if reply_id and platform_name == "aiocqhttp" and hasattr(event, "bot"):
             try:
-                data = await event.bot.get_msg(message_id=int(reply_id))
-                vids = extract_videos_from_onebot_message_payload(data)
+                vids: List[str] = []
+                # Napcat/OneBot 分支：优先使用底层 api.call_action 以获得完整 payload
+                if is_napcat(event) and hasattr(event.bot, "api"):
+                    ret: Dict[str, Any] = await event.bot.api.call_action("get_msg", message_id=reply_id)
+                    data = ob_data(ret)
+                    # 1) 直接从原消息中提取视频
+                    vids.extend(extract_videos_from_onebot_message_payload(data))
+                    # 2) 检测其中是否包含 forward/nodes，并拉取合并转发节点中的视频
+                    try:
+                        msg_list = data.get("message") if isinstance(data, dict) else None
+                        if isinstance(msg_list, list):
+                            for seg in msg_list:
+                                if not isinstance(seg, dict):
+                                    continue
+                                if seg.get("type") in ("forward", "forward_msg", "nodes"):
+                                    d = seg.get("data", {}) if isinstance(seg.get("data"), dict) else {}
+                                    fid = d.get("id")
+                                    if isinstance(fid, str) and fid:
+                                        try:
+                                            fwd = await event.bot.api.call_action("get_forward_msg", id=fid)
+                                            from_forward = extract_videos_from_onebot_forward_payload(fwd)
+                                            if from_forward:
+                                                vids.extend(from_forward)
+                                        except Exception as fe:
+                                            logger.warning("zssm_explain: get_forward_msg for video failed: %s", fe)
+                    except Exception:
+                        pass
+                else:
+                    # 其他 OneBot 实现，沿用通用 get_msg 接口
+                    data = await event.bot.get_msg(message_id=int(reply_id))
+                    vids.extend(extract_videos_from_onebot_message_payload(data))
+
                 if vids:
-                    return vids
+                    # 去重保持顺序
+                    uniq: List[str] = []
+                    seen = set()
+                    for v in vids:
+                        if isinstance(v, str) and v and v not in seen:
+                            seen.add(v)
+                            uniq.append(v)
+                    if uniq:
+                        return uniq
             except Exception:
                 pass
     return extract_videos_from_chain(chain)
@@ -179,8 +218,13 @@ async def napcat_resolve_file_url(event: AstrMessageEvent, file_id: str) -> Opti
     return None
 
 
-def extract_videos_from_onebot_message_payload(payload: Any) -> List[str]:
-    """从 OneBot/Napcat get_msg/get_forward_msg 返回的 payload 中提取视频 URL/路径。"""
+def extract_videos_from_onebot_message_payload(payload: Any, prefer_file_id: bool = False) -> List[str]:
+    """从 OneBot/Napcat get_msg/get_forward_msg 返回的 payload 中提取视频 URL/路径。
+
+    - 默认行为：优先使用 url 字段，回退 file 字段（兼容通用 OneBot 实现）。
+    - 当 prefer_file_id=True 且存在 file 字段时，优先返回 file（用于 Napcat，结合 get_*_file_url
+      接口将 file_id 解析为下载 URL，避免直接使用可能不稳定的 url 字段）。
+    """
     videos: List[str] = []
     data = ob_data(payload) if isinstance(payload, dict) else {}
     if isinstance(data, dict):
@@ -194,6 +238,8 @@ def extract_videos_from_onebot_message_payload(payload: Any) -> List[str]:
                             d = seg.get("data") or {}
                             if isinstance(d, dict):
                                 if t == "video":
+                                    # 对于 OneBot/Napcat 视频段，优先使用 url 字段，
+                                    # file 字段通常为内部标识，不直接作为下载链接。
                                     url = d.get("url") or d.get("file")
                                     if isinstance(url, str) and url:
                                         videos.append(url)
@@ -230,8 +276,34 @@ def extract_videos_from_onebot_message_payload(payload: Any) -> List[str]:
                         else:
                             content = seg.get("content") or seg.get("message")
                             if isinstance(content, list):
-                                inner = extract_videos_from_onebot_message_payload({"message": content})
+                                inner = extract_videos_from_onebot_message_payload({"message": content}, prefer_file_id=prefer_file_id)
                                 videos.extend(inner)
+                except Exception:
+                    continue
+    return videos
+
+
+def extract_videos_from_onebot_forward_payload(payload: Any) -> List[str]:
+    """解析 OneBot get_forward_msg 返回的 messages/nodes/nodeList，汇总其中的视频 URL/路径。"""
+    videos: List[str] = []
+    data = ob_data(payload) if isinstance(payload, dict) else {}
+    if isinstance(data, dict):
+        msgs = (
+            data.get("messages")
+            or data.get("message")
+            or data.get("nodes")
+            or data.get("nodeList")
+        )
+        if isinstance(msgs, list):
+            for node in msgs:
+                try:
+                    content = None
+                    if isinstance(node, dict):
+                        content = node.get("content") or node.get("message")
+                    if isinstance(content, list):
+                        inner = extract_videos_from_onebot_message_payload({"message": content})
+                        if inner:
+                            videos.extend(inner)
                 except Exception:
                     continue
     return videos

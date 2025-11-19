@@ -247,7 +247,11 @@ class ZssmExplain(Star):
 
     @staticmethod
     def _extract_videos_from_onebot_message_payload(payload: Any) -> List[str]:
-        """兼容旧接口，委托 video_utils.extract_videos_from_onebot_message_payload。"""
+        """兼容旧接口，委托 video_utils.extract_videos_from_onebot_message_payload。
+
+        该静态方法目前仅用于保持向后兼容，内部仍使用默认行为（prefer_file_id=False），
+        实际 Napcat 相关的 file_id 优先策略在 video_utils.extract_videos_from_event 中处理。
+        """
         return extract_videos_from_onebot_message_payload(payload)
 
     def _resolve_ffmpeg(self) -> Optional[str]:
