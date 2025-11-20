@@ -196,25 +196,33 @@ async def napcat_resolve_file_url(event: AstrMessageEvent, file_id: str) -> Opti
         return None
     if not is_napcat(event):
         return None
-    params: Dict[str, Any] = {"file_id": file_id}
-    action = "get_private_file_url"
+    # 优先根据上下文决定调用顺序：群聊先尝试群文件接口，再尝试私聊文件接口；
+    # 私聊则只调用 get_private_file_url。
     try:
         gid = event.get_group_id()
     except Exception:
         gid = None
+
+    actions: List[Dict[str, Any]] = []
     if gid:
-        params = {"group_id": gid, "file_id": file_id}
-        action = "get_group_file_url"
-    try:
-        ret = await event.bot.api.call_action(action, **params)
-        data = ret.get("data") if isinstance(ret, dict) else None
-        url = data.get("url") if isinstance(data, dict) else None
-        if isinstance(url, str) and url:
-            logger.info("zssm_explain: napcat %s ok, url=%s", action, url[:80])
-            return url
-        logger.warning("zssm_explain: napcat %s returned no url", action)
-    except Exception as e:
-        logger.warning("zssm_explain: napcat %s failed: %s", action, e)
+        actions.append({"action": "get_group_file_url", "params": {"group_id": gid, "file_id": file_id}})
+        actions.append({"action": "get_private_file_url", "params": {"file_id": file_id}})
+    else:
+        actions.append({"action": "get_private_file_url", "params": {"file_id": file_id}})
+
+    for item in actions:
+        action = item["action"]
+        params = item["params"]
+        try:
+            ret = await event.bot.api.call_action(action, **params)
+            data = ret.get("data") if isinstance(ret, dict) else None
+            url = data.get("url") if isinstance(data, dict) else None
+            if isinstance(url, str) and url:
+                logger.info("zssm_explain: napcat %s ok, url=%s", action, url[:80])
+                return url
+            logger.warning("zssm_explain: napcat %s returned no url", action)
+        except Exception as e:
+            logger.warning("zssm_explain: napcat %s failed: %s", action, e)
     return None
 
 

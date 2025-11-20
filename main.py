@@ -32,7 +32,7 @@ from .url_utils import (
     download_image_to_temp,
     resolve_liveshot_image_url,
 )
-from .message_utils import extract_quoted_payload
+from .message_utils import extract_quoted_payload, get_reply_message_id
 from .video_utils import (
     extract_videos_from_chain,
     extract_videos_from_event,
@@ -60,6 +60,7 @@ from .prompt_utils import (
 URL_DETECT_ENABLE_KEY = "enable_url_detect"
 URL_FETCH_TIMEOUT_KEY = "url_timeout_sec"
 URL_MAX_CHARS_KEY = "url_max_chars"
+KEYWORD_ZSSM_ENABLE_KEY = "enable_keyword_zssm"
 GROUP_LIST_MODE_KEY = "group_list_mode"
 GROUP_LIST_KEY = "group_list"
 VIDEO_PROVIDER_ID_KEY = "video_provider_id"
@@ -94,7 +95,7 @@ DEFAULT_CF_SCREENSHOT_HEIGHT = 720
     "zssm_explain",
     "薄暝",
     "zssm，支持关键词“zssm”（忽略前缀）与“zssm + 内容”直接解释；引用消息（含@）正常处理；支持 QQ 合并转发；未回复仅发 zssm 时提示；默认提示词可在 main.py 顶部修改。",
-    "1.6.0",
+    "2.0.0",
     "https://github.com/xiaoxi68/astrbot_zssm_explain",
 )
 class ZssmExplain(Star):
@@ -1324,7 +1325,7 @@ class ZssmExplain(Star):
                 async for r in self._explain_video(event, vids[0]):
                     yield r
                 return
-            # 其次，尝试被回复消息中的文本/图片
+            # 3) 再尝试被回复消息中的文本/图片
             text, images, from_forward = await self._extract_quoted_payload(event)
             if not text and not images:
                 yield self._reply_text_result(event, "请输入要解释的内容。")
@@ -1440,6 +1441,9 @@ class ZssmExplain(Star):
         """关键词触发：忽略常见前缀/Reply/At 等，检测首个 Plain 段的 zssm。
         避免与 /zssm 指令重复：若以 /zssm 开头则交由指令处理。
         """
+        # 配置开关：允许用户关闭正则关键词触发，仅保留 /zssm 指令。
+        if not self._get_conf_bool(KEYWORD_ZSSM_ENABLE_KEY, True):
+            return
         # 群聊权限控制：不满足条件则直接忽略
         try:
             if not self._is_group_allowed(event):

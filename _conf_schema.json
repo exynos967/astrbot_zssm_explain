@@ -31,6 +31,18 @@
     "default": true,
     "hint": "关闭后仅按文本/图片解释"
   },
+  "enable_keyword_zssm": {
+    "description": "是否启用“zssm”关键词自动触发",
+    "type": "bool",
+    "default": true,
+    "hint": "关闭后仅响应 /zssm 指令，不再通过纯文本“zssm”自动触发"
+  },
+  "cf_screenshot_enable": {
+    "description": "Cloudflare 截图降级",
+    "type": "bool",
+    "default": true,
+    "hint": "开启后在 HTML 被 CF 拦截时改用 urlscan 截图"
+  },
   "video_frame_interval_sec": {
     "description": "抽帧间隔（秒）",
     "type": "int",
@@ -66,12 +78,6 @@
     "type": "int",
     "default": 4000,
     "hint": "限制输入规模，避免过长上下文"
-  },
-  "cf_screenshot_enable": {
-    "description": "Cloudflare 截图降级",
-    "type": "bool",
-    "default": true,
-    "hint": "开启后在 HTML 被 CF 拦截时改用 urlscan 截图"
   },
   "cf_screenshot_width": {
     "description": "Cloudflare 截图宽度（px）",
