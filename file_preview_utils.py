@@ -2,11 +2,17 @@ from __future__ import annotations
 
 from typing import Iterable, Optional, Set, Dict, Any, List
 import os
+import io
 
 try:
     import aiohttp  # type: ignore[import-not-found]
 except Exception:  # pragma: no cover
     aiohttp = None
+
+try:
+    import PyPDF2  # type: ignore[import-not-found]
+except Exception:  # pragma: no cover
+    PyPDF2 = None  # type: ignore[assignment]
 
 from astrbot.api import logger
 from astrbot.api.event import AstrMessageEvent
@@ -299,17 +305,17 @@ async def build_group_file_preview(
     if summary:
         meta_lines.append(f"说明: {summary}")
 
-    # 仅对配置允许的文本扩展名尝试内容预览
+    # 仅对配置允许的文本扩展名或 PDF 尝试内容预览
     if not url or aiohttp is None:
         return "\n".join(meta_lines)
 
     name_lower = str(file_name).lower()
     _, ext = os.path.splitext(name_lower)
-    if ext not in text_exts:
-        # 非文本类文件暂不尝试解析内容
+    is_pdf = ext == ".pdf"
+    if ext not in text_exts and not is_pdf:
+        # 非文本类/非 PDF 文件暂不尝试解析内容
         return "\n".join(meta_lines)
 
-    max_bytes = 4096
     snippet = ""
     size_hint = ""
 
@@ -322,6 +328,7 @@ async def build_group_file_preview(
                     )
                 else:
                     cl = resp.headers.get("Content-Length")
+                    sz = None
                     if cl and cl.isdigit():
                         sz = int(cl)
                         if sz >= 0:
@@ -331,19 +338,64 @@ async def build_group_file_preview(
                                 size_hint = f"{sz / 1024:.1f} KB"
                             else:
                                 size_hint = f"{sz / 1024 / 1024:.2f} MB"
-                            # 若配置了最大文件大小且当前文件超出阈值，则仅返回元信息
-                            if isinstance(max_size_bytes, int) and max_size_bytes > 0 and sz > max_size_bytes:
+                            # 若为非 PDF 文件且配置了最大文件大小，且当前文件超出阈值，则仅返回元信息
+                            if not is_pdf and isinstance(max_size_bytes, int) and max_size_bytes > 0 and sz > max_size_bytes:
                                 meta_lines.append(f"大小: {size_hint}")
                                 meta_lines.append("（文件体积较大，已跳过内容预览，仅展示元信息）")
                                 return "\n".join(meta_lines)
-                    data = await resp.content.read(max_bytes)
-                    try:
-                        text = data.decode("utf-8", errors="ignore")
-                    except Exception:
-                        text = ""
-                    text = text.strip()
-                    if text:
-                        snippet = text if len(text) <= 400 else (text[:400] + " ...")
+                    # PDF：尝试使用 PyPDF2 提取文本
+                    if is_pdf and PyPDF2 is not None:
+                        # 固定读取不超过约 2MB 的二进制内容，再按转换后的 Markdown 文本大小与全局限制比较
+                        limit = 2 * 1024 * 1024
+                        buf = io.BytesIO()
+                        total = 0
+                        async for chunk in resp.content.iter_chunked(8192):
+                            if not chunk:
+                                break
+                            total += len(chunk)
+                            if isinstance(limit, int) and total > limit:
+                                break
+                            buf.write(chunk)
+                        try:
+                            buf.seek(0)
+                            reader = PyPDF2.PdfReader(buf)  # type: ignore[call-arg]
+                            md_pages: List[str] = []
+                            # 遍历全部页面，构造简单的 Markdown 结构（按页分块）
+                            for idx, page in enumerate(reader.pages, start=1):
+                                try:
+                                    t = page.extract_text()  # type: ignore[call-arg]
+                                except Exception:
+                                    t = None
+                                if isinstance(t, str) and t.strip():
+                                    md_pages.append(f"### 第 {idx} 页\n\n{t.strip()}")
+                            text = "\n\n---\n\n".join(md_pages).strip()
+                        except Exception as e:
+                            logger.warning(f"zssm_explain: pdf text extract failed: {e}")
+                            text = ""
+                        if text:
+                            # 对于 PDF，按提取出的 Markdown 文本大小进行限制，而非 PDF 文件体积
+                            if isinstance(max_size_bytes, int) and max_size_bytes > 0:
+                                try:
+                                    txt_bytes = len(text.encode("utf-8", errors="ignore"))
+                                except Exception:
+                                    txt_bytes = len(text)
+                                if txt_bytes > max_size_bytes:
+                                    if size_hint:
+                                        meta_lines.append(f"大小: {size_hint}")
+                                    meta_lines.append("（PDF 文本内容较长，已跳过内容预览，仅展示元信息）")
+                                    return "\n".join(meta_lines)
+                            snippet = text if len(text) <= 400 else (text[:400] + " ...")
+                    else:
+                        # 纯文本类文件：读取前 4KB 作为预览
+                        max_bytes = 4096
+                        data = await resp.content.read(max_bytes)
+                        try:
+                            text = data.decode("utf-8", errors="ignore")
+                        except Exception:
+                            text = ""
+                        text = text.strip()
+                        if text:
+                            snippet = text if len(text) <= 400 else (text[:400] + " ...")
     except Exception as e:
         logger.warning(f"zssm_explain: preview group file content failed: {e}")
 

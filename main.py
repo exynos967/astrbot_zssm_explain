@@ -78,8 +78,7 @@ VIDEO_MAX_SIZE_MB_KEY = "video_max_size_mb"
 FFMPEG_PATH_KEY = "ffmpeg_path"
 ASR_PROVIDER_ID_KEY = "asr_provider_id"
 CF_SCREENSHOT_ENABLE_KEY = "cf_screenshot_enable"
-CF_SCREENSHOT_WIDTH_KEY = "cf_screenshot_width"
-CF_SCREENSHOT_HEIGHT_KEY = "cf_screenshot_height"
+CF_SCREENSHOT_SIZE_KEY = "cf_screenshot_size"
 KEEP_ORIGINAL_PERSONA_KEY = "keep_original_persona"
 FILE_PREVIEW_EXTS_KEY = "file_preview_exts"
 FILE_PREVIEW_MAX_SIZE_KB_KEY = "file_preview_max_size_kb"
@@ -94,8 +93,7 @@ DEFAULT_VIDEO_MAX_DURATION_SEC = 120
 DEFAULT_VIDEO_MAX_SIZE_MB = 50
 DEFAULT_FFMPEG_PATH = "ffmpeg"
 DEFAULT_CF_SCREENSHOT_ENABLE = True
-DEFAULT_CF_SCREENSHOT_WIDTH = 1280
-DEFAULT_CF_SCREENSHOT_HEIGHT = 720
+DEFAULT_CF_SCREENSHOT_SIZE = "1280x720"
 DEFAULT_KEEP_ORIGINAL_PERSONA = False
 DEFAULT_FILE_PREVIEW_EXTS = "txt,md,log,json,csv,ini,cfg,yml,yaml,py"
 DEFAULT_FILE_PREVIEW_MAX_SIZE_KB = 8192
@@ -1065,6 +1063,29 @@ class ZssmExplain(Star):
         except Exception:
             return None
 
+    def _get_cf_screenshot_size(self) -> Tuple[int, int]:
+        """从配置解析 Cloudflare 截图尺寸（宽、高，带边界校验）。"""
+        raw = self._get_conf_str(CF_SCREENSHOT_SIZE_KEY, DEFAULT_CF_SCREENSHOT_SIZE)
+        w, h = 1280, 720
+        if isinstance(raw, str) and "x" in raw.lower():
+            try:
+                parts = raw.lower().split("x")
+                if len(parts) == 2:
+                    w = int(parts[0].strip())
+                    h = int(parts[1].strip())
+            except Exception:
+                w, h = 1280, 720
+        # 边界与兜底
+        try:
+            w = max(320, min(int(w), 4096))
+        except Exception:
+            w = 1280
+        try:
+            h = max(240, min(int(h), 4096))
+        except Exception:
+            h = 720
+        return w, h
+
     def _build_system_prompt(self) -> str:
         """根据配置构造系统提示词，可选附加“保持原始人格设定回复”指示。"""
         sp = build_system_prompt()
@@ -1175,10 +1196,11 @@ class ZssmExplain(Star):
         info = getattr(self, "_last_fetch_info", {}) or {}
         is_cf = bool(info.get("cloudflare"))
         if is_cf and self._get_conf_bool(CF_SCREENSHOT_ENABLE_KEY, DEFAULT_CF_SCREENSHOT_ENABLE):
+            width, height = self._get_cf_screenshot_size()
             screenshot_url = build_cf_screenshot_url(
                 url,
-                self._get_conf_int(CF_SCREENSHOT_WIDTH_KEY, DEFAULT_CF_SCREENSHOT_WIDTH, 320, 4096),
-                self._get_conf_int(CF_SCREENSHOT_HEIGHT_KEY, DEFAULT_CF_SCREENSHOT_HEIGHT, 240, 4096),
+                width,
+                height,
             )
             if screenshot_url:
                 logger.warning(

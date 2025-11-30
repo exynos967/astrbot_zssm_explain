@@ -85,17 +85,11 @@
     "default": 6000,
     "hint": "限制输入规模，避免过长上下文"
   },
-  "cf_screenshot_width": {
-    "description": "Cloudflare 截图宽度（px）",
-    "type": "int",
-    "default": 1280,
-    "hint": "传递给 urlscan `width` 参数，建议 320-2000"
-  },
-  "cf_screenshot_height": {
-    "description": "Cloudflare 截图高度（px）",
-    "type": "int",
-    "default": 720,
-    "hint": "传递给 urlscan `height` 参数，建议 320-2000"
+  "cf_screenshot_size": {
+    "description": "Cloudflare 截图尺寸（宽x高，px）",
+    "type": "string",
+    "default": "1280x720",
+    "hint": "格式示例：1280x720，对应 width 和 height；建议宽 320-2000、高 240-4096"
   },
   "file_preview_max_size_kb": {
     "description": "群文件内容预览允许的最大文件大小（KB）",
