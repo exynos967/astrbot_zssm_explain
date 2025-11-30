@@ -114,5 +114,11 @@
     "type": "string",
     "_special": "select_provider",
     "hint": "仅用于视频解释，不影响图片转述"
+  },
+  "keep_original_persona": {
+    "description": "是否保持原始人格设定参与回复",
+    "type": "bool",
+    "default": false,
+    "hint": "开启后会在系统提示词中附加“保持原始人格设定回复”，尽量保持会话原有人设与说话风格"
   }
 }

@@ -75,6 +75,7 @@ ASR_PROVIDER_ID_KEY = "asr_provider_id"
 CF_SCREENSHOT_ENABLE_KEY = "cf_screenshot_enable"
 CF_SCREENSHOT_WIDTH_KEY = "cf_screenshot_width"
 CF_SCREENSHOT_HEIGHT_KEY = "cf_screenshot_height"
+KEEP_ORIGINAL_PERSONA_KEY = "keep_original_persona"
 
 DEFAULT_URL_DETECT_ENABLE = True
 DEFAULT_URL_FETCH_TIMEOUT = 8
@@ -88,6 +89,7 @@ DEFAULT_FFMPEG_PATH = "ffmpeg"
 DEFAULT_CF_SCREENSHOT_ENABLE = True
 DEFAULT_CF_SCREENSHOT_WIDTH = 1280
 DEFAULT_CF_SCREENSHOT_HEIGHT = 720
+DEFAULT_KEEP_ORIGINAL_PERSONA = False
 
 
 
@@ -96,7 +98,7 @@ DEFAULT_CF_SCREENSHOT_HEIGHT = 720
     "zssm_explain",
     "薄暝",
     "zssm，支持关键词“zssm”（忽略前缀）与“zssm + 内容”直接解释；引用消息（含@）正常处理；支持 QQ 合并转发；未回复仅发 zssm 时提示；默认提示词可在 main.py 顶部修改。",
-    "2.2.0",
+    "2.3.0",
     "https://github.com/xiaoxi68/astrbot_zssm_explain",
 )
 class ZssmExplain(Star):
@@ -696,7 +698,7 @@ class ZssmExplain(Star):
         if not provider:
             yield self._reply_text_result(event, "未检测到可用的大语言模型提供商，请先在 AstrBot 配置中启用。")
             return
-        system_prompt = build_system_prompt()
+        system_prompt = self._build_system_prompt()
         meta = {
             "name": os.path.basename(local_path),
             "duration": dur if isinstance(dur, (int, float)) else None,
@@ -1023,6 +1025,16 @@ class ZssmExplain(Star):
         except Exception:
             pass
         return default
+
+    def _build_system_prompt(self) -> str:
+        """根据配置构造系统提示词，可选附加“保持原始人格设定回复”指示。"""
+        sp = build_system_prompt()
+        try:
+            if self._get_conf_bool(KEEP_ORIGINAL_PERSONA_KEY, DEFAULT_KEEP_ORIGINAL_PERSONA):
+                sp = sp + "\n保持原始人格设定回复。"
+        except Exception:
+            pass
+        return sp
 
 
     async def _download_image_to_temp(self, url: str, timeout_sec: int = 15) -> Optional[str]:
@@ -1410,7 +1422,7 @@ class ZssmExplain(Star):
             yield self._reply_text_result(event, "未检测到可用的大语言模型提供商，请先在 AstrBot 配置中启用。")
             return
 
-        system_prompt = build_system_prompt()
+        system_prompt = self._build_system_prompt()
         image_urls = self._filter_supported_images(images)
 
         try:
