@@ -54,6 +54,7 @@ from .file_preview_utils import (
     build_text_exts_from_config,
     extract_file_preview_from_reply,
     extract_group_file_video_url_from_reply,
+    pdf_bytes_to_markdown,
 )
 
 """
@@ -105,7 +106,7 @@ DEFAULT_FILE_PREVIEW_MAX_SIZE_KB = 8192
     "zssm_explain",
     "薄暝",
     "zssm，支持关键词“zssm”（忽略前缀）与“zssm + 内容”直接解释；引用消息（含@）正常处理；支持 QQ 合并转发；未回复仅发 zssm 时提示；默认提示词可在 main.py 顶部修改。",
-    "3.1.0",
+    "3.2.0",
     "https://github.com/xiaoxi68/astrbot_zssm_explain",
 )
 class ZssmExplain(Star):
@@ -1097,6 +1098,73 @@ class ZssmExplain(Star):
         return sp
 
 
+    async def _fetch_pdf_bytes(self, url: str, timeout_sec: int, max_bytes: int) -> Optional[bytes]:
+        """拉取 PDF 二进制内容，限制最大体积，避免将二进制内容按文本处理。
+
+        返回值为不超过 max_bytes 的二进制数据，超出或失败时返回 None。
+        """
+        if not url or not isinstance(max_bytes, int) or max_bytes <= 0:
+            return None
+        headers = {
+            "User-Agent": "AstrBot-zssm/1.0 (+https://github.com/xiaoxi68/astrbot_zssm_explain)",
+            "Accept": "application/pdf,*/*;q=0.8",
+        }
+
+        async def _aiohttp_fetch() -> Optional[bytes]:
+            if aiohttp is None:
+                return None
+            try:
+                async with aiohttp.ClientSession(headers=headers) as session:
+                    async with session.get(url, timeout=timeout_sec, allow_redirects=True) as resp:
+                        status = int(resp.status)
+                        if 200 <= status < 400:
+                            data = await resp.content.read(max_bytes + 1)
+                            if len(data) > max_bytes:
+                                logger.warning("zssm_explain: pdf over size limit when fetching url=%s", url)
+                                return None
+                            return data
+            except Exception as e:
+                logger.warning(f"zssm_explain: aiohttp fetch pdf failed: {e}")
+                return None
+            return None
+
+        data = await _aiohttp_fetch()
+        if data is not None:
+            return data
+
+        import urllib.request
+        import urllib.error
+
+        def _do() -> Optional[bytes]:
+            try:
+                req = urllib.request.Request(url, headers=headers)
+                with urllib.request.urlopen(req, timeout=timeout_sec) as resp:
+                    status = getattr(resp, "status", 200)
+                    if not (200 <= int(status) < 400):
+                        return None
+                    chunks: List[bytes] = []
+                    remaining = max_bytes + 1
+                    while remaining > 0:
+                        chunk = resp.read(min(8192, remaining))
+                        if not chunk:
+                            break
+                        chunks.append(chunk)
+                        remaining -= len(chunk)
+                        if remaining <= 0:
+                            logger.warning("zssm_explain: pdf over size limit in urllib fetch url=%s", url)
+                            return None
+                    return b"".join(chunks)
+            except urllib.error.HTTPError as e:
+                logger.warning(f"zssm_explain: urllib fetch pdf failed: {e}")
+                return None
+            except Exception as e:
+                logger.warning(f"zssm_explain: urllib fetch pdf failed: {e}")
+                return None
+
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(None, _do)
+
+
     async def _download_image_to_temp(self, url: str, timeout_sec: int = 15) -> Optional[str]:
         """下载图片到临时文件并返回路径。"""
         if not url:
@@ -1187,7 +1255,41 @@ class ZssmExplain(Star):
         return title or "", desc or "", snippet
 
     async def _prepare_url_prompt(self, url: str, timeout_sec: int) -> Optional[Tuple[str, Optional[str], List[str]]]:
-        """统一处理网页抓取：成功返回 HTML 摘要提示词；若因 Cloudflare 被拦截则回退到截图模式。"""
+        """统一处理网页抓取：成功返回 HTML/Markdown 摘要提示词；若因 Cloudflare 被拦截则回退到截图模式。
+
+        对于以 .pdf 结尾的链接，优先尝试按 PDF 文档处理，使用 PyPDF2 提取 Markdown 文本，
+        避免将二进制内容误当作 HTML 文本导致 LLM 看到乱码。
+        """
+        # 1) 特判 PDF 链接：直接按 PDF 处理并生成 Markdown 片段
+        try:
+            path = urlparse(url).path
+            _, ext = os.path.splitext(str(path).lower())
+        except Exception:
+            ext = ""
+        if ext == ".pdf":
+            max_bytes = self._get_file_preview_max_bytes()
+            if not isinstance(max_bytes, int) or max_bytes <= 0:
+                max_bytes = 2 * 1024 * 1024
+            pdf_bytes = await self._fetch_pdf_bytes(url, timeout_sec, max_bytes)
+            if pdf_bytes:
+                text = pdf_bytes_to_markdown(pdf_bytes)
+                if text:
+                    max_chars = self._get_conf_int(
+                        URL_MAX_CHARS_KEY,
+                        DEFAULT_URL_MAX_CHARS,
+                        min_v=1000,
+                        max_v=50000,
+                    )
+                    snippet = text[:max_chars]
+                    user_prompt = DEFAULT_URL_USER_PROMPT.format(
+                        url=url,
+                        title="(PDF 文档)",
+                        desc="从 PDF 正文中提取的文本内容。",
+                        snippet=snippet,
+                    )
+                    return (user_prompt, None, [])
+
+        # 2) 常规 HTML 场景
         html = await fetch_html(url, timeout_sec, self._last_fetch_info)
         if html:
             user_prompt, _ = self._build_url_user_prompt(url, html)

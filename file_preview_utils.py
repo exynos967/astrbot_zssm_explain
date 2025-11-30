@@ -3,11 +3,17 @@ from __future__ import annotations
 from typing import Iterable, Optional, Set, Dict, Any, List
 import os
 import io
+import re
 
 try:
     import aiohttp  # type: ignore[import-not-found]
 except Exception:  # pragma: no cover
     aiohttp = None
+
+try:
+    import fitz  # type: ignore[import-not-found]
+except Exception:  # pragma: no cover
+    fitz = None  # type: ignore[assignment]
 
 try:
     import PyPDF2  # type: ignore[import-not-found]
@@ -45,6 +51,151 @@ def build_text_exts_from_config(raw: str, default_exts: Iterable[str]) -> Set[st
             p = "." + p
         base.add(p)
     return base
+
+
+def _normalize_pdf_page_text(raw: Optional[str]) -> str:
+    """将单页 PDF 提取出的原始文本整理为更适合 LLM 处理的 Markdown 段落。
+
+    - 合并同一段落内的换行，保留空行作为段落分隔
+    - 尝试保留简单的列表/编号结构
+    """
+    if not isinstance(raw, str):
+        return ""
+    lines = [ln.rstrip() for ln in raw.splitlines()]
+    blocks: List[str] = []
+    current: List[str] = []
+
+    bullet_pattern = re.compile(r"^(\s*[-*•·]\s+|\s*\d{1,3}[.)]\s+)")
+
+    def flush_paragraph() -> None:
+        if not current:
+            return
+        joined = " ".join(s.strip() for s in current if s.strip())
+        if joined:
+            blocks.append(joined)
+        current.clear()
+
+    for line in lines:
+        s = line.strip()
+        if not s:
+            flush_paragraph()
+            continue
+        # 列表/编号行：直接单独成段，避免被错误合并
+        if bullet_pattern.match(s):
+            flush_paragraph()
+            blocks.append(s)
+            continue
+        current.append(s)
+
+    flush_paragraph()
+    return "\n\n".join(blocks).strip()
+
+
+def pdf_bytes_to_markdown(data: bytes, max_pages: Optional[int] = None) -> str:
+    """将 PDF 二进制内容转换为简单 Markdown 文本。
+
+    - 按页生成 `### 第 N 页` 标题
+    - 每页内部按段落拆分，合并过多换行
+    - max_pages 为正数时，仅转换前若干页
+    """
+    if not data:
+        return ""
+
+    # 优先使用 PyMuPDF 的 markdown 输出，保留原有章节标题结构
+    if fitz is not None:
+        try:
+            doc = fitz.open(stream=data, filetype="pdf")  # type: ignore[arg-type]
+            page_count = int(getattr(doc, "page_count", len(doc)))  # type: ignore[arg-type]
+            md_pages: List[str] = []
+            for idx in range(page_count):
+                page_no = idx + 1
+                if isinstance(max_pages, int) and max_pages > 0 and page_no > max_pages:
+                    break
+                try:
+                    page = doc.load_page(idx)
+                    # 直接使用 PyMuPDF 的 markdown 模式，保留标题/列表等结构
+                    md = page.get_text("markdown") or page.get_text("text")
+                except Exception:
+                    md = ""
+                if isinstance(md, str):
+                    md = md.strip()
+                if md:
+                    md_pages.append(f"### 第 {page_no} 页\n\n{md}")
+            if md_pages:
+                return "\n\n---\n\n".join(md_pages).strip()
+        except Exception as e:  # pragma: no cover - 环境可能无 PyMuPDF
+            logger.warning(f"zssm_explain: PyMuPDF markdown extract failed: {e}")
+
+    # 回退到 PyPDF2 的纯文本提取，再做简单 Markdown 规整
+    if PyPDF2 is None:
+        return ""
+    try:
+        reader = PyPDF2.PdfReader(io.BytesIO(data))  # type: ignore[call-arg]
+    except Exception as e:
+        logger.warning(f"zssm_explain: pdf read failed: {e}")
+        return ""
+
+    md_pages_fallback: List[str] = []
+    for idx, page in enumerate(reader.pages, start=1):
+        if isinstance(max_pages, int) and max_pages > 0 and idx > max_pages:
+            break
+        try:
+            raw = page.extract_text()  # type: ignore[call-arg]
+        except Exception:
+            raw = None
+        text = _normalize_pdf_page_text(raw)
+        if text:
+            md_pages_fallback.append(f"### 第 {idx} 页\n\n{text}")
+    return "\n\n---\n\n".join(md_pages_fallback).strip()
+
+
+def _find_first_file_in_message_list(msg_list: List[Any]) -> Optional[Dict[str, Any]]:
+    """在 OneBot/Napcat 消息段列表中查找首个 type=file 段，支持简单嵌套 content/message。"""
+    if not isinstance(msg_list, list):
+        return None
+    for seg in msg_list:
+        try:
+            if not isinstance(seg, dict):
+                continue
+            t = seg.get("type")
+            d = seg.get("data") if isinstance(seg.get("data"), dict) else {}
+            if t == "file" and isinstance(d, dict):
+                return seg
+            content = seg.get("content") or seg.get("message")
+            if isinstance(content, list):
+                inner = _find_first_file_in_message_list(content)
+                if inner is not None:
+                    return inner
+        except Exception:
+            continue
+    return None
+
+
+def _find_first_file_in_forward_payload(payload: Any) -> Optional[Dict[str, Any]]:
+    """在 OneBot get_forward_msg 返回的结构中查找首个文件段。"""
+    data = ob_data(payload) if isinstance(payload, dict) else {}
+    if not isinstance(data, dict):
+        return None
+    msgs = (
+        data.get("messages")
+        or data.get("message")
+        or data.get("nodes")
+        or data.get("nodeList")
+    )
+    if not isinstance(msgs, list):
+        return None
+    for node in msgs:
+        try:
+            content = None
+            if isinstance(node, dict):
+                content = node.get("content") or node.get("message")
+            if isinstance(content, list):
+                seg = _find_first_file_in_message_list(content)
+                if seg is not None:
+                    return seg
+        except Exception:
+            continue
+    return None
 
 
 async def extract_file_preview_from_reply(
@@ -95,16 +246,34 @@ async def extract_file_preview_from_reply(
     if not isinstance(msg_list, list):
         return None
 
-    file_seg = None
-    for seg in msg_list:
-        try:
-            if not isinstance(seg, dict):
+    # 1) 优先在原始消息的顶层段中查找文件
+    file_seg = _find_first_file_in_message_list(msg_list)
+
+    # 2) 若未找到文件，尝试处理 Napcat “合并转发”场景：查找 forward 段并通过 get_forward_msg 拉取节点
+    if not file_seg:
+        for seg in msg_list:
+            try:
+                if not isinstance(seg, dict):
+                    continue
+                t = seg.get("type")
+                if t not in ("forward", "forward_msg", "nodes"):
+                    continue
+                d = seg.get("data") if isinstance(seg.get("data"), dict) else {}
+                fid = d.get("id")
+                if not isinstance(fid, str) or not fid:
+                    continue
+                try:
+                    fwd = await event.bot.api.call_action("get_forward_msg", id=fid)
+                except Exception as fe:
+                    logger.warning(f"zssm_explain: get_forward_msg for file preview failed: {fe}")
+                    continue
+                inner = _find_first_file_in_forward_payload(fwd)
+                if inner is not None:
+                    file_seg = inner
+                    break
+            except Exception:
                 continue
-            if seg.get("type") == "file":
-                file_seg = seg
-                break
-        except Exception:
-            continue
+
     if not file_seg:
         return None
 
@@ -343,7 +512,7 @@ async def build_group_file_preview(
                                 meta_lines.append(f"大小: {size_hint}")
                                 meta_lines.append("（文件体积较大，已跳过内容预览，仅展示元信息）")
                                 return "\n".join(meta_lines)
-                    # PDF：尝试使用 PyPDF2 提取文本
+                    # PDF：尝试使用 PyPDF2 将内容转换为 Markdown 文本
                     if is_pdf and PyPDF2 is not None:
                         # 固定读取不超过约 2MB 的二进制内容，再按转换后的 Markdown 文本大小与全局限制比较
                         limit = 2 * 1024 * 1024
@@ -357,18 +526,8 @@ async def build_group_file_preview(
                                 break
                             buf.write(chunk)
                         try:
-                            buf.seek(0)
-                            reader = PyPDF2.PdfReader(buf)  # type: ignore[call-arg]
-                            md_pages: List[str] = []
-                            # 遍历全部页面，构造简单的 Markdown 结构（按页分块）
-                            for idx, page in enumerate(reader.pages, start=1):
-                                try:
-                                    t = page.extract_text()  # type: ignore[call-arg]
-                                except Exception:
-                                    t = None
-                                if isinstance(t, str) and t.strip():
-                                    md_pages.append(f"### 第 {idx} 页\n\n{t.strip()}")
-                            text = "\n\n---\n\n".join(md_pages).strip()
+                            pdf_bytes = buf.getvalue()
+                            text = pdf_bytes_to_markdown(pdf_bytes)
                         except Exception as e:
                             logger.warning(f"zssm_explain: pdf text extract failed: {e}")
                             text = ""
