@@ -81,6 +81,7 @@ CF_SCREENSHOT_WIDTH_KEY = "cf_screenshot_width"
 CF_SCREENSHOT_HEIGHT_KEY = "cf_screenshot_height"
 KEEP_ORIGINAL_PERSONA_KEY = "keep_original_persona"
 FILE_PREVIEW_EXTS_KEY = "file_preview_exts"
+FILE_PREVIEW_MAX_SIZE_KB_KEY = "file_preview_max_size_kb"
 
 DEFAULT_URL_DETECT_ENABLE = True
 DEFAULT_URL_FETCH_TIMEOUT = 8
@@ -96,6 +97,7 @@ DEFAULT_CF_SCREENSHOT_WIDTH = 1280
 DEFAULT_CF_SCREENSHOT_HEIGHT = 720
 DEFAULT_KEEP_ORIGINAL_PERSONA = False
 DEFAULT_FILE_PREVIEW_EXTS = "txt,md,log,json,csv,ini,cfg,yml,yaml,py"
+DEFAULT_FILE_PREVIEW_MAX_SIZE_KB = 8192
 
 
 
@@ -1051,6 +1053,17 @@ class ZssmExplain(Star):
         base_default = [ext.strip() for ext in DEFAULT_FILE_PREVIEW_EXTS.split(",") if ext.strip()]
         return build_text_exts_from_config(raw, base_default)
 
+    def _get_file_preview_max_bytes(self) -> Optional[int]:
+        """获取允许尝试内容预览的群文件最大体积（字节）。"""
+        try:
+            kb = self._get_conf_int(FILE_PREVIEW_MAX_SIZE_KB_KEY, DEFAULT_FILE_PREVIEW_MAX_SIZE_KB, 1, 1024 * 1024)
+        except Exception:
+            kb = DEFAULT_FILE_PREVIEW_MAX_SIZE_KB
+        try:
+            return int(kb) * 1024
+        except Exception:
+            return None
+
     def _build_system_prompt(self) -> str:
         """根据配置构造系统提示词，可选附加“保持原始人格设定回复”指示。"""
         sp = build_system_prompt()
@@ -1400,6 +1413,7 @@ class ZssmExplain(Star):
                 file_preview = await extract_file_preview_from_reply(
                     event,
                     text_exts=self._get_file_preview_exts(),
+                    max_size_bytes=self._get_file_preview_max_bytes(),
                 )
             except Exception:
                 file_preview = None

@@ -82,7 +82,7 @@
   "url_max_chars": {
     "description": "参与摘要的正文片段最大长度（字符）",
     "type": "int",
-    "default": 4000,
+    "default": 6000,
     "hint": "限制输入规模，避免过长上下文"
   },
   "cf_screenshot_width": {
@@ -96,6 +96,12 @@
     "type": "int",
     "default": 720,
     "hint": "传递给 urlscan `height` 参数，建议 320-2000"
+  },
+  "file_preview_max_size_kb": {
+    "description": "群文件内容预览允许的最大文件大小（KB）",
+    "type": "int",
+    "default": 100,
+    "hint": "超过该大小的群文件仅展示文件名和说明，不尝试读取内容片段"
   },
   "file_preview_exts": {
     "description": "群文件内容预览的文本扩展名（逗号分隔，不含点）",

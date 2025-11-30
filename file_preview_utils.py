@@ -44,6 +44,7 @@ def build_text_exts_from_config(raw: str, default_exts: Iterable[str]) -> Set[st
 async def extract_file_preview_from_reply(
     event: AstrMessageEvent,
     text_exts: Set[str],
+    max_size_bytes: Optional[int] = None,
 ) -> Optional[str]:
     """尝试从被回复的 Napcat 文件消息中构造文件内容预览文本。
 
@@ -110,7 +111,14 @@ async def extract_file_preview_from_reply(
     if not isinstance(file_id, str) or not file_id:
         return None
 
-    return await build_group_file_preview(event, file_id, file_name, summary, text_exts)
+    return await build_group_file_preview(
+        event=event,
+        file_id=file_id,
+        file_name=file_name,
+        summary=summary,
+        text_exts=text_exts,
+        max_size_bytes=max_size_bytes,
+    )
 
 
 async def build_group_file_preview(
@@ -119,6 +127,7 @@ async def build_group_file_preview(
     file_name: str,
     summary: str,
     text_exts: Set[str],
+    max_size_bytes: Optional[int] = None,
 ) -> Optional[str]:
     """获取群文件下载链接，尝试读取文本内容片段并构造预览。
 
@@ -186,6 +195,11 @@ async def build_group_file_preview(
                                 size_hint = f"{sz / 1024:.1f} KB"
                             else:
                                 size_hint = f"{sz / 1024 / 1024:.2f} MB"
+                            # 若配置了最大文件大小且当前文件超出阈值，则仅返回元信息
+                            if isinstance(max_size_bytes, int) and max_size_bytes > 0 and sz > max_size_bytes:
+                                meta_lines.append(f"大小: {size_hint}")
+                                meta_lines.append("（文件体积较大，已跳过内容预览，仅展示元信息）")
+                                return "\n".join(meta_lines)
                     data = await resp.content.read(max_bytes)
                     try:
                         text = data.decode("utf-8", errors="ignore")
@@ -204,4 +218,3 @@ async def build_group_file_preview(
         meta_lines.append(snippet)
 
     return "\n".join(meta_lines)
-
