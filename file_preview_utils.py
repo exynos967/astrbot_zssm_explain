@@ -209,24 +209,37 @@ async def extract_group_file_video_url_from_reply(
         gid = event.get_group_id()
     except Exception:
         gid = None
-    if not gid:
-        return None
-    try:
-        group_id = int(gid)
-    except Exception:
-        return None
+    url: Optional[str] = None
 
-    # 调用 Napcat get_group_file_url 获取下载链接
-    try:
-        url_result = await event.bot.api.call_action(
-            "get_group_file_url",
-            group_id=group_id,
-            file_id=file_id,
-        )
-        url = url_result.get("url") if isinstance(url_result, dict) else None
-    except Exception as e:
-        logger.warning(f"zssm_explain: get_group_file_url for video file failed: {e}")
-        url = None
+    # 群聊：使用 get_group_file_url
+    if gid:
+        try:
+            group_id = int(gid)
+        except Exception:
+            group_id = None
+        if group_id is not None:
+            try:
+                url_result = await event.bot.api.call_action(
+                    "get_group_file_url",
+                    group_id=group_id,
+                    file_id=file_id,
+                )
+                url = url_result.get("url") if isinstance(url_result, dict) else None
+            except Exception as e:
+                logger.warning(f"zssm_explain: get_group_file_url for video file failed: {e}")
+
+    # 私聊：使用 get_private_file_url
+    if not url:
+        try:
+            url_result = await event.bot.api.call_action(
+                "get_private_file_url",
+                file_id=file_id,
+            )
+            data = url_result.get("data") if isinstance(url_result, dict) else None
+            if isinstance(data, dict):
+                url = data.get("url")
+        except Exception as e:
+            logger.warning(f"zssm_explain: get_private_file_url for video file failed: {e}")
 
     return url or None
 
@@ -248,25 +261,38 @@ async def build_group_file_preview(
         gid = event.get_group_id()
     except Exception:
         gid = None
-    if not gid:
-        return None
 
-    try:
-        group_id = int(gid)
-    except Exception:
-        return None
+    url: Optional[str] = None
 
-    # 调用 Napcat get_group_file_url 获取下载链接
-    try:
-        url_result = await event.bot.api.call_action(
-            "get_group_file_url",
-            group_id=group_id,
-            file_id=file_id,
-        )
-        url = url_result.get("url") if isinstance(url_result, dict) else None
-    except Exception as e:
-        logger.warning(f"zssm_explain: get_group_file_url failed: {e}")
-        url = None
+    # 群聊：优先使用 get_group_file_url
+    if gid:
+        try:
+            group_id = int(gid)
+        except Exception:
+            group_id = None
+        if group_id is not None:
+            try:
+                url_result = await event.bot.api.call_action(
+                    "get_group_file_url",
+                    group_id=group_id,
+                    file_id=file_id,
+                )
+                url = url_result.get("url") if isinstance(url_result, dict) else None
+            except Exception as e:
+                logger.warning(f"zssm_explain: get_group_file_url failed: {e}")
+
+    # 私聊或群聊兜底：使用 get_private_file_url
+    if not url:
+        try:
+            url_result = await event.bot.api.call_action(
+                "get_private_file_url",
+                file_id=file_id,
+            )
+            data = url_result.get("data") if isinstance(url_result, dict) else None
+            if isinstance(data, dict):
+                url = data.get("url")
+        except Exception as e:
+            logger.warning(f"zssm_explain: get_private_file_url failed: {e}")
 
     # 元信息部分（即使无法下载，也可以使用）
     meta_lines: List[str] = [f"[群文件] {file_name}"]
