@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from typing import List, Tuple, Optional, Any, Dict
+import json
 
 from astrbot.api import logger
 from astrbot.api.event import AstrMessageEvent
@@ -74,6 +75,92 @@ def chain_has_forward(chain: List[object]) -> bool:
     return False
 
 
+def _strip_bracket_prefix(text: str) -> str:
+    """去掉类似 [QQ小程序] / 【聊天记录】 这样的前缀标签。"""
+    if not isinstance(text, str):
+        return ""
+    s = text.strip()
+    if not s:
+        return ""
+    if s.startswith("["):
+        end = s.find("]")
+        if end != -1:
+            return s[end + 1 :].strip()
+    if s.startswith("【"):
+        end = s.find("】")
+        if end != -1:
+            return s[end + 1 :].strip()
+    return s
+
+
+def _format_json_share(data: Dict[str, Any]) -> str:
+    """
+    解析 Napcat/OneBot json 消息 (data.data 对应的结构化 JSON)，提取关键信息。
+
+    支持：
+    - 聊天记录: app = com.tencent.multimsg
+    - QQ 小程序分享（含 B 站小程序）: app = com.tencent.miniapp_01
+    - 普通图文/小程序卡片: app = com.tencent.tuwen.lua
+    """
+    if not isinstance(data, dict):
+        return ""
+
+    app = data.get("app") or ""
+
+    # 3) 合并转发聊天记录
+    if app == "com.tencent.multimsg":
+        prompt = data.get("prompt") or data.get("desc") or "[聊天记录]"
+        detail = data.get("meta", {}).get("detail", {}) or {}
+        summary = detail.get("summary") or ""
+        source = detail.get("source") or ""
+        lines = [str(prompt).strip() or "[聊天记录]"]
+        if source:
+            lines.append(f"来源: {source}")
+        if summary:
+            lines.append(f"摘要: {summary}")
+        return "\n".join(lines)
+
+    # 2) B 站等 QQ 小程序分享
+    if app == "com.tencent.miniapp_01":
+        detail = data.get("meta", {}).get("detail_1", {}) or {}
+        raw_prompt = str(data.get("prompt") or "").strip()
+        title = _strip_bracket_prefix(raw_prompt) or detail.get("desc") or "无标题"
+        desc = detail.get("desc") or ""
+        url = detail.get("qqdocurl") or detail.get("url") or ""
+        preview = detail.get("preview") or ""
+        app_title = detail.get("title") or "小程序"
+
+        lines = [f"[小程序分享 - {app_title}]", f"标题: {title}"]
+        if desc:
+            lines.append(f"简介: {desc}")
+        if url:
+            lines.append(f"跳转链接: {url}")
+        if preview:
+            lines.append(f"封面图: {preview}")
+        return "\n".join(lines)
+
+    # 1) 通用图文/小程序卡片（如小红书、微信图文）
+    if app == "com.tencent.tuwen.lua":
+        news = data.get("meta", {}).get("news", {}) or {}
+        title = news.get("title") or "无标题"
+        desc = news.get("desc") or ""
+        url = news.get("jumpUrl") or ""
+        preview = news.get("preview") or ""
+        tag = news.get("tag") or "图文消息"
+        lines = [f"[图文/小程序分享 - {tag}]", f"标题: {title}"]
+        if desc:
+            lines.append(f"简介: {desc}")
+        if url:
+            lines.append(f"跳转链接: {url}")
+        if preview:
+            lines.append(f"封面图: {preview}")
+        return "\n".join(lines)
+
+    # 兜底：未知 JSON 类型，使用 prompt/desc 作为简要说明
+    prompt = data.get("prompt") or data.get("desc") or ""
+    return str(prompt) if prompt else ""
+
+
 def try_extract_from_reply_component(reply_comp: object) -> Tuple[Optional[str], List[str], bool]:
     """尽量从 Reply 组件中得到被引用消息的文本与图片。
 
@@ -134,6 +221,17 @@ def extract_from_onebot_message_payload(payload: Any) -> Tuple[str, List[str]]:
                         url = d.get("url") or d.get("file")
                         if isinstance(url, str) and url:
                             images.append(url)
+                    elif t == "json":
+                        # Napcat JSON 消息：核心数据在 data.data 中，需要再次解析
+                        raw = d.get("data")
+                        if isinstance(raw, str) and raw.strip():
+                            try:
+                                inner = json.loads(raw)
+                                summary = _format_json_share(inner)
+                                if summary:
+                                    texts.append(summary)
+                            except Exception as e:
+                                logger.warning(f"zssm_explain: parse json segment failed: {e}")
                     # 对于 forward/nodes，不在此层解析，由上层触发 get_forward_msg 获取节点
                 except Exception as e:
                     logger.warning(f"zssm_explain: parse onebot segment failed: {e}")
