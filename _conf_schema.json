@@ -43,6 +43,12 @@
     "default": true,
     "hint": "开启后在 HTML 被 CF 拦截时改用 urlscan 截图"
   },
+  "keep_original_persona": {
+    "description": "是否保持原始人格设定参与回复",
+    "type": "bool",
+    "default": false,
+    "hint": "开启后会在系统提示词中附加“保持原始人格设定回复”，尽量保持会话原有人设与说话风格"
+  },
   "video_frame_interval_sec": {
     "description": "抽帧间隔（秒）",
     "type": "int",
@@ -91,6 +97,12 @@
     "default": 720,
     "hint": "传递给 urlscan `height` 参数，建议 320-2000"
   },
+  "file_preview_exts": {
+    "description": "群文件内容预览的文本扩展名（逗号分隔，不含点）",
+    "type": "string",
+    "default": "txt,md,log,json,csv,ini,cfg,yml,yaml,py",
+    "hint": "仅对这些后缀的群文件尝试读取部分内容并交给 LLM 解释，可在此处自定义列表"
+  },
   "asr_provider_id": {
     "description": "ASR 提供商 ID",
     "type": "string",
@@ -114,11 +126,5 @@
     "type": "string",
     "_special": "select_provider",
     "hint": "仅用于视频解释，不影响图片转述"
-  },
-  "keep_original_persona": {
-    "description": "是否保持原始人格设定参与回复",
-    "type": "bool",
-    "default": false,
-    "hint": "开启后会在系统提示词中附加“保持原始人格设定回复”，尽量保持会话原有人设与说话风格"
   }
 }

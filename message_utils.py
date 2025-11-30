@@ -232,6 +232,17 @@ def extract_from_onebot_message_payload(payload: Any) -> Tuple[str, List[str]]:
                                     texts.append(summary)
                             except Exception as e:
                                 logger.warning(f"zssm_explain: parse json segment failed: {e}")
+                    elif t == "file":
+                        # Napcat 文件消息：data.file 为标识，data.name/summary 为展示信息
+                        name = d.get("name") or d.get("file") or "未命名文件"
+                        summary = d.get("summary") or ""
+                        file_id = d.get("file") or ""
+                        parts = [f"[群文件] {name}"]
+                        if summary:
+                            parts.append(f"说明: {summary}")
+                        if file_id:
+                            parts.append(f"文件标识: {file_id}")
+                        texts.append("\n".join(parts))
                     # 对于 forward/nodes，不在此层解析，由上层触发 get_forward_msg 获取节点
                 except Exception as e:
                     logger.warning(f"zssm_explain: parse onebot segment failed: {e}")

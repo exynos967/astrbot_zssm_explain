@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import List, Tuple, Optional, Any, Dict
+from typing import List, Tuple, Optional, Any, Dict, Set
 import os
 import asyncio
 import re
@@ -33,7 +33,7 @@ from .url_utils import (
     download_image_to_temp,
     resolve_liveshot_image_url,
 )
-from .message_utils import extract_quoted_payload, get_reply_message_id
+from .message_utils import extract_quoted_payload
 from .video_utils import (
     extract_videos_from_chain,
     extract_videos_from_event,
@@ -49,6 +49,10 @@ from .prompt_utils import (
     DEFAULT_FRAME_CAPTION_PROMPT,
     build_user_prompt,
     build_system_prompt,
+)
+from .file_preview_utils import (
+    build_text_exts_from_config,
+    extract_file_preview_from_reply,
 )
 
 """
@@ -76,6 +80,7 @@ CF_SCREENSHOT_ENABLE_KEY = "cf_screenshot_enable"
 CF_SCREENSHOT_WIDTH_KEY = "cf_screenshot_width"
 CF_SCREENSHOT_HEIGHT_KEY = "cf_screenshot_height"
 KEEP_ORIGINAL_PERSONA_KEY = "keep_original_persona"
+FILE_PREVIEW_EXTS_KEY = "file_preview_exts"
 
 DEFAULT_URL_DETECT_ENABLE = True
 DEFAULT_URL_FETCH_TIMEOUT = 8
@@ -90,6 +95,7 @@ DEFAULT_CF_SCREENSHOT_ENABLE = True
 DEFAULT_CF_SCREENSHOT_WIDTH = 1280
 DEFAULT_CF_SCREENSHOT_HEIGHT = 720
 DEFAULT_KEEP_ORIGINAL_PERSONA = False
+DEFAULT_FILE_PREVIEW_EXTS = "txt,md,log,json,csv,ini,cfg,yml,yaml,py"
 
 
 
@@ -1039,6 +1045,12 @@ class ZssmExplain(Star):
             pass
         return default
 
+    def _get_file_preview_exts(self) -> Set[str]:
+        """从配置构造文本文件预览的扩展名集合（含点）。"""
+        raw = self._get_conf_str(FILE_PREVIEW_EXTS_KEY, DEFAULT_FILE_PREVIEW_EXTS)
+        base_default = [ext.strip() for ext in DEFAULT_FILE_PREVIEW_EXTS.split(",") if ext.strip()]
+        return build_text_exts_from_config(raw, base_default)
+
     def _build_system_prompt(self) -> str:
         """根据配置构造系统提示词，可选附加“保持原始人格设定回复”指示。"""
         sp = build_system_prompt()
@@ -1383,6 +1395,19 @@ class ZssmExplain(Star):
                 return
             # 3) 再尝试被回复消息中的文本/图片
             text, images, from_forward = await self._extract_quoted_payload(event)
+            # 若仍未提取到文本/图片，尝试从群文件构造内容预览
+            try:
+                file_preview = await extract_file_preview_from_reply(
+                    event,
+                    text_exts=self._get_file_preview_exts(),
+                )
+            except Exception:
+                file_preview = None
+            if file_preview:
+                if text:
+                    text = f"{file_preview}\n\n{text}"
+                else:
+                    text = file_preview
             if not text and not images:
                 yield self._reply_text_result(event, "请输入要解释的内容。")
                 event.stop_event()
