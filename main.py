@@ -53,6 +53,7 @@ from .prompt_utils import (
 from .file_preview_utils import (
     build_text_exts_from_config,
     extract_file_preview_from_reply,
+    extract_group_file_video_url_from_reply,
 )
 
 """
@@ -1404,6 +1405,15 @@ class ZssmExplain(Star):
                 vids = []
             if vids:
                 async for r in self._explain_video(event, vids[0]):
+                    yield r
+                return
+            # 2.1) 若未检测到视频，再尝试“被回复的群文件”是否为视频后缀
+            try:
+                v_url = await extract_group_file_video_url_from_reply(event)
+            except Exception:
+                v_url = None
+            if v_url:
+                async for r in self._explain_video(event, v_url):
                     yield r
                 return
             # 3) 再尝试被回复消息中的文本/图片
