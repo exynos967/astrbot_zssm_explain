@@ -98,7 +98,7 @@ DEFAULT_KEEP_ORIGINAL_PERSONA = False
     "zssm_explain",
     "薄暝",
     "zssm，支持关键词“zssm”（忽略前缀）与“zssm + 内容”直接解释；引用消息（含@）正常处理；支持 QQ 合并转发；未回复仅发 zssm 时提示；默认提示词可在 main.py 顶部修改。",
-    "2.3.0",
+    "2.4.0",
     "https://github.com/xiaoxi68/astrbot_zssm_explain",
 )
 class ZssmExplain(Star):
@@ -637,19 +637,32 @@ class ZssmExplain(Star):
             return
 
         # 抽帧
+        is_gif = False
+        try:
+            if isinstance(local_path, str) and local_path.lower().endswith(".gif"):
+                is_gif = True
+        except Exception:
+            is_gif = False
+
         interval = self._get_conf_int(VIDEO_FRAME_INTERVAL_SEC_KEY, DEFAULT_VIDEO_FRAME_INTERVAL_SEC, 1, 120)
         try:
             if isinstance(dur, (int, float)) and dur > 0:
-                # 依据时长与间隔估算目标帧数
-                n_frames = max(1, int(math.ceil(float(dur) / max(1, interval))))
+                # 依据时长与间隔估算目标帧数；GIF 固定抽 1 帧
+                if is_gif:
+                    n_frames = 1
+                else:
+                    n_frames = max(1, int(math.ceil(float(dur) / max(1, interval))))
                 logger.info(
                     "zssm_explain: sampling plan: duration=%.2fs interval=%ss => target_frames=%s",
                     float(dur), interval, n_frames,
                 )
                 frames = await self._sample_frames_equidistant(ffmpeg_path, local_path, float(dur), n_frames)
             else:
-                # 未获知时长时，以最大允许时长作为上界推导帧数
-                n_frames = max(1, int(math.ceil(float(max_sec) / max(1, interval))))
+                # 未获知时长时，以最大允许时长作为上界推导帧数；GIF 固定抽 1 帧
+                if is_gif:
+                    n_frames = 1
+                else:
+                    n_frames = max(1, int(math.ceil(float(max_sec) / max(1, interval))))
                 logger.info(
                     "zssm_explain: sampling plan: unknown duration, use max_sec=%ss interval=%ss => target_frames=%s",
                     max_sec, interval, n_frames,

@@ -47,6 +47,7 @@ def extract_videos_from_chain(chain: List[object]) -> List[str]:
                 ".mpeg",
                 ".mpg",
                 ".3gp",
+                ".gif",
             )
         )
 
@@ -274,6 +275,7 @@ def extract_videos_from_onebot_message_payload(payload: Any, prefer_file_id: boo
                                                 ".mpeg",
                                                 ".mpg",
                                                 ".3gp",
+                                                ".gif",
                                             )
                                         )
 
