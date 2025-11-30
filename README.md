@@ -31,3 +31,6 @@
 | `cf_screenshot_height` | int | `720` | 截图高度（px），传入 urlscan `height` 参数。 |
 
 > 当 `cf_screenshot_enable=false` 或 urlscan 截图失败时，会提示用户“Cloudflare 防护导致无法抓取”，同时建议手动提供截图或开启降级。
+
+## 特别感谢
+- Reina[https://github.com/Ri-Nai] 本插件参考了他的json消息处理代码并完善了json卡片消息的处理
