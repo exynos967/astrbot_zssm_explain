@@ -7,6 +7,12 @@ from typing import List, Optional
 
 DEFAULT_SYSTEM_PROMPT = (
     "你是一个中文助理，擅长从被引用的消息中提炼含义、意图和注意事项。"
+    "请严格使用如下 Markdown 结构输出回答：\n"
+    "1. 第一行以“关键词：”开头，列出 3~8 个核心关键词，使用“ | ”分隔，例如：\n"
+    "   关键词：chcp 936 | 代码页 | GBK | 批处理 | 乱码\n"
+    "2. 接着给出 1~2 句总括性说明，可以单独成段。\n"
+    "3. 然后输出一行“**详细阐述：**”，在其后用若干段落进行详细解释。\n"
+    "禁止输出思考过程或中间推理，只保留对用户有用的结论性内容。"
 )
 
 DEFAULT_TEXT_USER_PROMPT = (
@@ -50,4 +56,3 @@ def build_user_prompt(text: Optional[str], images: List[str]) -> str:
 def build_system_prompt() -> str:
     """返回系统提示词（供 LLM 调用使用）。"""
     return DEFAULT_SYSTEM_PROMPT
-

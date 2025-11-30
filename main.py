@@ -9,6 +9,7 @@ import tempfile
 import subprocess
 from urllib.parse import urlparse, unquote
 import math
+import time
 
 try:
     import aiohttp  # 优先使用异步 HTTP 客户端
@@ -95,7 +96,7 @@ DEFAULT_CF_SCREENSHOT_HEIGHT = 720
     "zssm_explain",
     "薄暝",
     "zssm，支持关键词“zssm”（忽略前缀）与“zssm + 内容”直接解释；引用消息（含@）正常处理；支持 QQ 合并转发；未回复仅发 zssm 时提示；默认提示词可在 main.py 顶部修改。",
-    "2.1.0",
+    "2.2.0",
     "https://github.com/xiaoxi68/astrbot_zssm_explain",
 )
 class ZssmExplain(Star):
@@ -702,6 +703,7 @@ class ZssmExplain(Star):
             "frames": len(image_urls),
         }
         try:
+            start_ts = time.perf_counter()
             call_provider = self._select_video_provider(provider, image_urls)
             try:
                 pid = getattr(call_provider, "id", None) or getattr(call_provider, "provider_id", None) or call_provider.__class__.__name__
@@ -763,6 +765,13 @@ class ZssmExplain(Star):
                 show_reasoning = False
             if not show_reasoning:
                 reply_text = self._sanitize_model_output(reply_text)
+
+            elapsed = None
+            try:
+                elapsed = time.perf_counter() - start_ts
+            except Exception:
+                elapsed = None
+            reply_text = self._format_explain_output(reply_text, elapsed_sec=elapsed)
             yield self._reply_text_result(event, reply_text)
             try:
                 event.stop_event()
@@ -1270,6 +1279,28 @@ class ZssmExplain(Star):
         # 5) 若清洗后为空，则回退原文（避免误删全部内容）
         return s or text.strip()
 
+    def _format_explain_output(
+        self,
+        content: str,
+        elapsed_sec: Optional[float] = None,
+    ) -> str:
+        """统一格式化解释结果，仅追加耗时信息。
+
+        “关键词：...” 行以及“**详细阐述：**”等结构由 LLM 自行生成。
+        """
+        if not isinstance(content, str):
+            content = "" if content is None else str(content)
+        body = content.strip()
+        if not body:
+            return ""
+
+        parts: List[str] = [body]
+        if isinstance(elapsed_sec, (int, float)) and elapsed_sec > 0:
+            parts.append("")
+            parts.append(f"cost: {elapsed_sec:.3f}s")
+
+        return "\n".join(parts)
+
     def _get_config_provider(self, key: str) -> Optional[Any]:
         """根据插件配置项（text_provider_id / image_provider_id）返回 Provider 实例。"""
         try:
@@ -1384,6 +1415,7 @@ class ZssmExplain(Star):
 
         try:
             # 统一选择与回退
+            start_ts = time.perf_counter()
             call_provider = self._select_primary_provider(provider, image_urls)
             llm_resp = await self._call_llm_with_fallback(
                 primary=call_provider,
@@ -1419,6 +1451,13 @@ class ZssmExplain(Star):
                 show_reasoning = False
             if not show_reasoning:
                 reply_text = self._sanitize_model_output(reply_text)
+
+            elapsed = None
+            try:
+                elapsed = time.perf_counter() - start_ts
+            except Exception:
+                elapsed = None
+            reply_text = self._format_explain_output(reply_text, elapsed_sec=elapsed)
             yield self._reply_text_result(event, reply_text)
             # 防止后续流程重复处理当前事件
             try:
