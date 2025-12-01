@@ -13,6 +13,12 @@
     "default": [],
     "hint": "仅在 whitelist/blacklist 下生效；留空等效于无限制"
   },
+  "video_asr_enable": {
+    "description": "是否启用音频转写",
+    "type": "bool",
+    "default": false,
+    "hint": "开启后将尝试调用 ASR 提供商（asr_provider_id 为空时使用当前会话 STT 提供商）"
+  },
   "enable_url_detect": {
     "description": "是否识别 URL 并输出网页简版摘要（2-8句）",
     "type": "bool",
@@ -34,7 +40,7 @@
   "keep_original_persona": {
     "description": "是否保持原始人格设定参与回复",
     "type": "bool",
-    "default": false,
+    "default": true,
     "hint": "开启后会在系统提示词中附加“保持原始人格设定回复”，尽量保持会话原有人设与说话风格"
   },
   "video_frame_interval_sec": {
@@ -91,12 +97,6 @@
     "default": "txt,md,log,json,csv,ini,cfg,yml,yaml,py",
     "hint": "仅对这些后缀的群文件尝试读取部分内容并交给 LLM 解释，可在此处自定义列表"
   },
-  "asr_provider_id": {
-    "description": "ASR 提供商 ID",
-    "type": "string",
-    "_special": "select_provider_stt",
-    "hint": "留空则使用当前会话 STT 提供商"
-  },
   "text_provider_id": {
     "description": "文本解释优先使用的 Provider ID",
     "type": "string",
@@ -114,5 +114,11 @@
     "type": "string",
     "_special": "select_provider",
     "hint": "仅用于视频解释，不影响图片转述"
+  },
+  "asr_provider_id": {
+    "description": "ASR 提供商 ID",
+    "type": "string",
+    "_special": "select_provider_stt",
+    "hint": "留空则使用当前会话 STT 提供商"
   }
 }

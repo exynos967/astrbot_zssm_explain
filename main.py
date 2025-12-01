@@ -72,6 +72,7 @@ GROUP_LIST_MODE_KEY = "group_list_mode"
 GROUP_LIST_KEY = "group_list"
 VIDEO_PROVIDER_ID_KEY = "video_provider_id"
 VIDEO_FRAME_INTERVAL_SEC_KEY = "video_frame_interval_sec"
+VIDEO_ASR_ENABLE_KEY = "video_asr_enable"
 VIDEO_MAX_DURATION_SEC_KEY = "video_max_duration_sec"
 VIDEO_MAX_SIZE_MB_KEY = "video_max_size_mb"
 FFMPEG_PATH_KEY = "ffmpeg_path"
@@ -86,6 +87,7 @@ DEFAULT_URL_DETECT_ENABLE = True
 DEFAULT_URL_FETCH_TIMEOUT = 8
 DEFAULT_URL_MAX_CHARS = 6000
 DEFAULT_VIDEO_FRAME_INTERVAL_SEC = 6
+DEFAULT_VIDEO_ASR_ENABLE = False
 DEFAULT_VIDEO_MAX_DURATION_SEC = 120
 DEFAULT_VIDEO_MAX_SIZE_MB = 50
 DEFAULT_FFMPEG_PATH = "ffmpeg"
@@ -102,7 +104,7 @@ DEFAULT_FILE_PREVIEW_MAX_SIZE_KB = 8192
     "zssm_explain",
     "薄暝",
     "zssm，支持关键词“zssm”（忽略前缀）与“zssm + 内容”直接解释；引用消息（含@）正常处理；支持 QQ 合并转发；未回复仅发 zssm 时提示；默认提示词可在 main.py 顶部修改。",
-    "3.3.0",
+    "3.5.0",
     "https://github.com/xiaoxi68/astrbot_zssm_explain",
 )
 class ZssmExplain(Star):
@@ -685,16 +687,14 @@ class ZssmExplain(Star):
             yield self._reply_text_result(event, "未能生成可用关键帧，请检查 ffmpeg 或更换视频后重试。")
             return
 
-        # 可选 ASR：仅当配置了 asr_provider_id 时启用
+        # 可选 ASR：由 video_asr_enable + asr_provider_id 控制
         asr_text = None
-        raw_asr_pid = ""
+        asr_enabled = False
         try:
-            raw_asr_pid = self._get_conf_str(ASR_PROVIDER_ID_KEY, "")
+            asr_enabled = self._get_conf_bool(VIDEO_ASR_ENABLE_KEY, DEFAULT_VIDEO_ASR_ENABLE)
         except Exception:
-            raw_asr_pid = ""
-        if isinstance(raw_asr_pid, str):
-            raw_asr_pid = raw_asr_pid.strip()
-        if raw_asr_pid:
+            asr_enabled = DEFAULT_VIDEO_ASR_ENABLE
+        if asr_enabled:
             try:
                 wav = await self._extract_audio_wav(ffmpeg_path, local_path)
                 if wav and os.path.exists(wav):
