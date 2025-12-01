@@ -71,9 +71,7 @@ KEYWORD_ZSSM_ENABLE_KEY = "enable_keyword_zssm"
 GROUP_LIST_MODE_KEY = "group_list_mode"
 GROUP_LIST_KEY = "group_list"
 VIDEO_PROVIDER_ID_KEY = "video_provider_id"
-ENABLE_VIDEO_EXPLAIN_KEY = "enable_video_explain"
 VIDEO_FRAME_INTERVAL_SEC_KEY = "video_frame_interval_sec"
-VIDEO_ASR_ENABLE_KEY = "video_asr_enable"
 VIDEO_MAX_DURATION_SEC_KEY = "video_max_duration_sec"
 VIDEO_MAX_SIZE_MB_KEY = "video_max_size_mb"
 FFMPEG_PATH_KEY = "ffmpeg_path"
@@ -87,9 +85,7 @@ FILE_PREVIEW_MAX_SIZE_KB_KEY = "file_preview_max_size_kb"
 DEFAULT_URL_DETECT_ENABLE = True
 DEFAULT_URL_FETCH_TIMEOUT = 8
 DEFAULT_URL_MAX_CHARS = 6000
-DEFAULT_ENABLE_VIDEO_EXPLAIN = True
 DEFAULT_VIDEO_FRAME_INTERVAL_SEC = 6
-DEFAULT_VIDEO_ASR_ENABLE = False
 DEFAULT_VIDEO_MAX_DURATION_SEC = 120
 DEFAULT_VIDEO_MAX_SIZE_MB = 50
 DEFAULT_FFMPEG_PATH = "ffmpeg"
@@ -106,7 +102,7 @@ DEFAULT_FILE_PREVIEW_MAX_SIZE_KB = 8192
     "zssm_explain",
     "薄暝",
     "zssm，支持关键词“zssm”（忽略前缀）与“zssm + 内容”直接解释；引用消息（含@）正常处理；支持 QQ 合并转发；未回复仅发 zssm 时提示；默认提示词可在 main.py 顶部修改。",
-    "3.2.0",
+    "3.3.0",
     "https://github.com/xiaoxi68/astrbot_zssm_explain",
 )
 class ZssmExplain(Star):
@@ -594,9 +590,13 @@ class ZssmExplain(Star):
         return session_provider
 
     async def _explain_video(self, event: AstrMessageEvent, video_src: str):
-        # 配置检查
-        if not self._get_conf_bool(ENABLE_VIDEO_EXPLAIN_KEY, DEFAULT_ENABLE_VIDEO_EXPLAIN):
-            yield self._reply_text_result(event, "视频解释功能未启用。")
+        # 配置检查：未配置 video_provider_id 时视为未启用视频解释
+        cfg_video_provider = self._get_config_provider(VIDEO_PROVIDER_ID_KEY)
+        if cfg_video_provider is None:
+            yield self._reply_text_result(
+                event,
+                "视频解释未配置可用的模型提供商，请在插件配置中选择 video_provider_id 后再试。",
+            )
             return
         ffmpeg_path = self._resolve_ffmpeg()
         if not ffmpeg_path:
@@ -685,9 +685,16 @@ class ZssmExplain(Star):
             yield self._reply_text_result(event, "未能生成可用关键帧，请检查 ffmpeg 或更换视频后重试。")
             return
 
-        # 可选 ASR
+        # 可选 ASR：仅当配置了 asr_provider_id 时启用
         asr_text = None
-        if self._get_conf_bool(VIDEO_ASR_ENABLE_KEY, DEFAULT_VIDEO_ASR_ENABLE):
+        raw_asr_pid = ""
+        try:
+            raw_asr_pid = self._get_conf_str(ASR_PROVIDER_ID_KEY, "")
+        except Exception:
+            raw_asr_pid = ""
+        if isinstance(raw_asr_pid, str):
+            raw_asr_pid = raw_asr_pid.strip()
+        if raw_asr_pid:
             try:
                 wav = await self._extract_audio_wav(ffmpeg_path, local_path)
                 if wav and os.path.exists(wav):
@@ -700,7 +707,10 @@ class ZssmExplain(Star):
                     if stt is not None:
                         try:
                             asr_text = await stt.get_text(wav)
-                            logger.info("zssm_explain: asr text length=%s", len(asr_text) if isinstance(asr_text, str) else 0)
+                            logger.info(
+                                "zssm_explain: asr text length=%s",
+                                len(asr_text) if isinstance(asr_text, str) else 0,
+                            )
                         except Exception:
                             asr_text = None
                     try:
@@ -719,7 +729,7 @@ class ZssmExplain(Star):
         if not provider:
             yield self._reply_text_result(event, "未检测到可用的大语言模型提供商，请先在 AstrBot 配置中启用。")
             return
-        system_prompt = self._build_system_prompt()
+        system_prompt = await self._build_system_prompt(event)
         meta = {
             "name": os.path.basename(local_path),
             "duration": dur if isinstance(dur, (int, float)) else None,
@@ -1087,15 +1097,53 @@ class ZssmExplain(Star):
             h = 720
         return w, h
 
-    def _build_system_prompt(self) -> str:
-        """根据配置构造系统提示词，可选附加“保持原始人格设定回复”指示。"""
+    async def _build_system_prompt(self, event: AstrMessageEvent) -> str:
+        """根据配置与当前会话人格构造系统提示词。
+
+        当 keep_original_persona 启用时：
+        - 从 AstrBot persona_manager 获取当前会话应使用的人格（v3 格式）；
+        - 使用人格的 prompt 替换 DEFAULT_SYSTEM_PROMPT 的首行描述部分，
+          保留原有的 Markdown 结构与输出约束说明。
+        未启用或获取人格失败时，回退为默认系统提示词。
+        """
         sp = build_system_prompt()
+
+        # 未启用开关时，直接使用默认提示词
         try:
-            if self._get_conf_bool(KEEP_ORIGINAL_PERSONA_KEY, DEFAULT_KEEP_ORIGINAL_PERSONA):
-                sp = sp + "\n保持原始人格设定回复。"
+            if not self._get_conf_bool(KEEP_ORIGINAL_PERSONA_KEY, DEFAULT_KEEP_ORIGINAL_PERSONA):
+                return sp
         except Exception:
-            pass
-        return sp
+            return sp
+
+        # 仅在存在 persona_manager 时尝试获取当前会话人格
+        try:
+            persona_mgr = getattr(self.context, "persona_manager", None)
+        except Exception:
+            persona_mgr = None
+        if persona_mgr is None:
+            return sp
+
+        persona_prompt: Optional[str] = None
+        try:
+            # get_default_persona_v3 会综合会话配置与 persona 绑定，返回 Personality（含 prompt）
+            personality = await persona_mgr.get_default_persona_v3(event.unified_msg_origin)
+            if isinstance(personality, dict):
+                persona_prompt = personality.get("prompt")
+            else:
+                persona_prompt = getattr(personality, "prompt", None)
+        except Exception as e:
+            logger.warning(f"zssm_explain: get_default_persona_v3 failed: {e}")
+            persona_prompt = None
+
+        if not isinstance(persona_prompt, str) or not persona_prompt.strip():
+            return sp
+
+        # 使用人格 prompt 替换默认系统提示词的首行，保留其余结构化输出要求
+        base_lines = sp.splitlines()
+        rest_lines = base_lines[1:] if len(base_lines) > 1 else []
+        merged_lines: List[str] = [persona_prompt.strip()]
+        merged_lines.extend(rest_lines)
+        return "\n".join(merged_lines)
 
 
     async def _fetch_pdf_bytes(self, url: str, timeout_sec: int, max_bytes: int) -> Optional[bytes]:
@@ -1608,7 +1656,7 @@ class ZssmExplain(Star):
             yield self._reply_text_result(event, "未检测到可用的大语言模型提供商，请先在 AstrBot 配置中启用。")
             return
 
-        system_prompt = self._build_system_prompt()
+        system_prompt = await self._build_system_prompt(event)
         image_urls = self._filter_supported_images(images)
 
         try:

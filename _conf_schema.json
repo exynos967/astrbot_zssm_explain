@@ -13,18 +13,6 @@
     "default": [],
     "hint": "仅在 whitelist/blacklist 下生效；留空等效于无限制"
   },
-  "enable_video_explain": {
-    "description": "是否启用视频解释",
-    "type": "bool",
-    "default": true,
-    "hint": "启用后识别视频并进行解释，需 ffmpeg 支持"
-  },
-  "video_asr_enable": {
-    "description": "是否启用音频转写",
-    "type": "bool",
-    "default": false,
-    "hint": "调用 AstrBot 已配置的语音识别提供商"
-  },
   "enable_url_detect": {
     "description": "是否识别 URL 并输出网页简版摘要（2-8句）",
     "type": "bool",
