@@ -258,6 +258,102 @@ def extract_from_onebot_message_payload(payload: Any) -> Tuple[str, List[str]]:
     return ("", images)
 
 
+def _extract_forward_nodes_recursively(
+    message_nodes: List[Any],
+    texts: List[str],
+    images: List[str],
+    depth: int = 0,
+) -> None:
+    """递归解析 Napcat/OneBot get_forward_msg 返回的 messages 列表，支持嵌套合并转发。
+
+    设计目标：
+    - 复用 forward_reader 插件中的核心递归思路，但以纯函数方式实现，便于在工具函数中复用；
+    - 只负责结构展开与文本/图片提取，不做任何网络调用。
+    """
+    if not isinstance(message_nodes, list):
+        return
+
+    indent = "  " * depth
+
+    for message_node in message_nodes:
+        try:
+            if not isinstance(message_node, dict):
+                continue
+
+            sender = message_node.get("sender") or {}
+            sender_name = (
+                sender.get("nickname")
+                or sender.get("card")
+                or sender.get("user_id")
+                or "未知用户"
+            )
+
+            raw_content = message_node.get("message") or message_node.get("content", [])
+
+            content_chain: List[Any] = []
+            if isinstance(raw_content, str):
+                try:
+                    parsed_content = json.loads(raw_content)
+                    if isinstance(parsed_content, list):
+                        content_chain = parsed_content
+                except (json.JSONDecodeError, TypeError):
+                    # 无法解析为 JSON 的字符串，当作纯文本处理
+                    content_chain = [
+                        {
+                            "type": "text",
+                            "data": {"text": raw_content},
+                        }
+                    ]
+            elif isinstance(raw_content, list):
+                content_chain = raw_content
+
+            node_text_parts: List[str] = []
+            has_only_forward = False
+
+            if isinstance(content_chain, list):
+                first_seg = (
+                    content_chain[0]
+                    if len(content_chain) == 1 and isinstance(content_chain[0], dict)
+                    else None
+                )
+                if first_seg and first_seg.get("type") == "forward":
+                    has_only_forward = True
+
+                for seg in content_chain:
+                    if not isinstance(seg, dict):
+                        continue
+                    seg_type = seg.get("type")
+                    seg_data = (
+                        seg.get("data", {})
+                        if isinstance(seg.get("data"), dict)
+                        else {}
+                    )
+
+                    if seg_type in ("text", "plain"):
+                        text = seg_data.get("text", "")
+                        if isinstance(text, str) and text:
+                            node_text_parts.append(text)
+                    elif seg_type == "image":
+                        url = seg_data.get("url") or seg_data.get("file")
+                        if isinstance(url, str) and url:
+                            images.append(url)
+                            node_text_parts.append("[图片]")
+                    elif seg_type == "forward":
+                        nested_content = seg_data.get("content")
+                        if isinstance(nested_content, list):
+                            _extract_forward_nodes_recursively(
+                                nested_content, texts, images, depth + 1
+                            )
+                        else:
+                            node_text_parts.append("[转发消息内容缺失或格式错误]")
+
+            full_node_text = "".join(node_text_parts).strip()
+            if full_node_text and not has_only_forward:
+                texts.append(f"{indent}{sender_name}: {full_node_text}")
+        except Exception as e:
+            logger.warning(f"zssm_explain: parse forward node failed: {e}")
+
+
 def extract_from_onebot_forward_payload(payload: Any) -> Tuple[str, List[str]]:
     """解析 OneBot get_forward_msg 返回的 messages/nodes 列表，汇总文本与图片。"""
     texts: List[str] = []
@@ -271,18 +367,10 @@ def extract_from_onebot_forward_payload(payload: Any) -> Tuple[str, List[str]]:
             or data.get("nodeList")
         )
         if isinstance(msgs, list):
-            for node in msgs:
-                try:
-                    content = None
-                    if isinstance(node, dict):
-                        content = node.get("content") or node.get("message")
-                    if isinstance(content, list):
-                        t, i = extract_from_onebot_message_payload({"message": content})
-                        if t:
-                            texts.append(t)
-                        images.extend(i)
-                except Exception:
-                    continue
+            try:
+                _extract_forward_nodes_recursively(msgs, texts, images, depth=0)
+            except Exception as e:
+                logger.warning(f"zssm_explain: parse forward payload failed: {e}")
     return ("\n".join([x for x in texts if x]).strip(), images)
 
 
@@ -337,7 +425,8 @@ async def extract_quoted_payload(event: AstrMessageEvent) -> Tuple[Optional[str]
                     for seg in msg_list:
                         if not isinstance(seg, dict):
                             continue
-                        if seg.get("type") in ("forward", "forward_msg", "nodes"):
+                        seg_type = seg.get("type")
+                        if seg_type in ("forward", "forward_msg", "nodes"):
                             from_forward_ob = True
                             d = seg.get("data", {}) if isinstance(seg.get("data"), dict) else {}
                             fid = d.get("id")
@@ -351,6 +440,38 @@ async def extract_quoted_payload(event: AstrMessageEvent) -> Tuple[Optional[str]
                                         agg_imgs.extend(fi)
                                 except Exception as fe:
                                     logger.warning(f"zssm_explain: get_forward_msg failed: {fe}")
+                        elif seg_type == "json":
+                            try:
+                                d = (
+                                    seg.get("data", {})
+                                    if isinstance(seg.get("data"), dict)
+                                    else {}
+                                )
+                                inner_data_str = d.get("data")
+                                if isinstance(inner_data_str, str) and inner_data_str.strip():
+                                    inner_data_str = inner_data_str.replace("&#44;", ",")
+                                    inner_json = json.loads(inner_data_str)
+                                    if inner_json.get("app") == "com.tencent.multimsg" and inner_json.get(
+                                        "config", {}
+                                    ).get("forward") == 1:
+                                        detail = inner_json.get("meta", {}).get("detail", {}) or {}
+                                        news_items = detail.get("news", []) or []
+                                        for item in news_items:
+                                            if not isinstance(item, dict):
+                                                continue
+                                            text_content = item.get("text")
+                                            if isinstance(text_content, str):
+                                                clean_text = (
+                                                    text_content.strip().replace("[图片]", "").strip()
+                                                )
+                                                if clean_text:
+                                                    agg_texts.append(clean_text)
+                                        if news_items:
+                                            from_forward_ob = True
+                            except (json.JSONDecodeError, TypeError, KeyError) as je:
+                                logger.debug(
+                                    f"zssm_explain: parse multimsg json in get_msg failed: {je}"
+                                )
             except Exception:
                 pass
             if agg_texts or agg_imgs:
