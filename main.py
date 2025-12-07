@@ -32,6 +32,7 @@ from .url_utils import (
     wait_cf_screenshot_ready,
     download_image_to_temp,
     resolve_liveshot_image_url,
+    extract_urls_from_text,
 )
 from .message_utils import extract_quoted_payload
 from .video_utils import (
@@ -42,6 +43,9 @@ from .video_utils import (
     napcat_resolve_file_url,
     extract_videos_from_onebot_message_payload,
     probe_duration_sec,
+    resolve_ffmpeg,
+    resolve_ffprobe,
+    download_video_to_temp,
 )
 from .prompt_utils import (
     DEFAULT_URL_USER_PROMPT,
@@ -101,10 +105,10 @@ DEFAULT_FILE_PREVIEW_MAX_SIZE_KB = 8192
 
 
 @register(
-    "zssm_explain",
+    "astrbot_zssm_explain",
     "薄暝",
     "zssm，支持关键词“zssm”（忽略前缀）与“zssm + 内容”直接解释；引用消息（含@）正常处理；支持 QQ 合并转发；未回复仅发 zssm 时提示；默认提示词可在 main.py 顶部修改。",
-    "3.6.0",
+    "v3.7.0",
     "https://github.com/xiaoxi68/astrbot_zssm_explain",
 )
 class ZssmExplain(Star):
@@ -265,133 +269,14 @@ class ZssmExplain(Star):
         return extract_videos_from_onebot_message_payload(payload)
 
     def _resolve_ffmpeg(self) -> Optional[str]:
-        # 配置优先
-        path = self._get_conf_str(FFMPEG_PATH_KEY, DEFAULT_FFMPEG_PATH)
-        if path and shutil.which(path):
-            return shutil.which(path)
-        # 尝试系统 ffmpeg
-        sys_ffmpeg = shutil.which("ffmpeg")
-        if sys_ffmpeg:
-            return sys_ffmpeg
-        # 尝试 imageio-ffmpeg
-        try:
-            import imageio_ffmpeg
-            p = imageio_ffmpeg.get_ffmpeg_exe()
-            if p and os.path.exists(p):
-                return p
-        except Exception:
-            pass
-        return None
+        """根据插件配置解析 ffmpeg 路径，委托 video_utils.resolve_ffmpeg。"""
+        cfg_path = self._get_conf_str(FFMPEG_PATH_KEY, DEFAULT_FFMPEG_PATH)
+        return resolve_ffmpeg(cfg_path, DEFAULT_FFMPEG_PATH)
 
     def _resolve_ffprobe(self) -> Optional[str]:
-        # 同目录的 ffprobe（若 imageio-ffmpeg 提供）或系统 ffprobe
-        sys_ffprobe = shutil.which("ffprobe")
-        if sys_ffprobe:
-            return sys_ffprobe
-        # 粗略尝试：若 ffmpeg 同目录存在 ffprobe
+        """根据已解析的 ffmpeg 路径解析 ffprobe，委托 video_utils.resolve_ffprobe。"""
         ff = self._resolve_ffmpeg()
-        if ff:
-            cand = os.path.join(os.path.dirname(ff), "ffprobe")
-            if os.path.exists(cand):
-                return cand
-        return None
-
-    async def _download_to_temp(self, url: str, size_mb_limit: int) -> Optional[str]:
-        # 为 URL 提取安全的短扩展名，避免把查询串当后缀导致路径过长
-        def _safe_ext_from_url(u: str) -> str:
-            try:
-                path = urlparse(u).path
-                base = os.path.basename(unquote(path))
-                ext = os.path.splitext(base)[1]
-                # 限制扩展名长度并校验字符
-                if isinstance(ext, str):
-                    ext = ext[:8]
-                if not ext or not re.match(r"^\.[A-Za-z0-9]{1,6}$", ext):
-                    # 尝试常见视频后缀匹配
-                    lower = base.lower()
-                    for cand in (".mp4", ".mov", ".m4v", ".avi", ".webm", ".mkv", ".flv", ".wmv"):
-                        if lower.endswith(cand):
-                            return cand
-                    return ".bin"
-                return ext
-            except Exception:
-                return ".bin"
-
-        ext = _safe_ext_from_url(url)
-        tmp = tempfile.NamedTemporaryFile(prefix="zssm_video_", suffix=ext, delete=False)
-        tmp_path = tmp.name
-        tmp.close()
-        max_bytes = size_mb_limit * 1024 * 1024
-        if aiohttp is not None:
-            try:
-                async with aiohttp.ClientSession() as sess:
-                    async with sess.get(url, timeout=20) as resp:
-                        if resp.status != 200:
-                            try:
-                                os.remove(tmp_path)
-                            except Exception:
-                                pass
-                            return None
-                        # 内容长度预判
-                        cl = resp.headers.get("Content-Length")
-                        if cl and cl.isdigit() and int(cl) > max_bytes:
-                            try:
-                                os.remove(tmp_path)
-                            except Exception:
-                                pass
-                            return None
-                        total = 0
-                        with open(tmp_path, "wb") as f:
-                            async for chunk in resp.content.iter_chunked(8192):
-                                if not chunk:
-                                    break
-                                total += len(chunk)
-                                if total > max_bytes:
-                                    try:
-                                        f.close()
-                                    except Exception:
-                                        pass
-                                    try:
-                                        os.remove(tmp_path)
-                                    except Exception:
-                                        pass
-                                    return None
-                                f.write(chunk)
-                return tmp_path if os.path.exists(tmp_path) else None
-            except Exception:
-                try:
-                    os.remove(tmp_path)
-                except Exception:
-                    pass
-                return None
-        # urllib 回退
-        try:
-            import urllib.request
-            with urllib.request.urlopen(url, timeout=20) as r, open(tmp_path, "wb") as f:
-                total = 0
-                while True:
-                    chunk = r.read(8192)
-                    if not chunk:
-                        break
-                    total += len(chunk)
-                    if total > max_bytes:
-                        try:
-                            f.close()
-                        except Exception:
-                            pass
-                        try:
-                            os.remove(tmp_path)
-                        except Exception:
-                            pass
-                        return None
-                    f.write(chunk)
-            return tmp_path if os.path.exists(tmp_path) else None
-        except Exception:
-            try:
-                os.remove(tmp_path)
-            except Exception:
-                pass
-            return None
+        return resolve_ffprobe(ff)
 
     def _probe_duration_sec(self, ffprobe_path: Optional[str], video_path: str) -> Optional[float]:
         """兼容旧接口，委托 video_utils.probe_duration_sec。"""
@@ -602,7 +487,10 @@ class ZssmExplain(Star):
             return
         ffmpeg_path = self._resolve_ffmpeg()
         if not ffmpeg_path:
-            yield self._reply_text_result(event, "未检测到 ffmpeg，请安装系统 ffmpeg 或 Python 包 imageio-ffmpeg，并在插件配置中设置 ffmpeg_path。")
+            yield self._reply_text_result(
+                event,
+                "未检测到 ffmpeg，请安装系统 ffmpeg 或 Python 包 imageio-ffmpeg，并在插件配置中设置 ffmpeg_path。",
+            )
             return
         logger.info("zssm_explain: video start src=%s ffmpeg=%s", (str(video_src)[:128] if video_src else ""), ffmpeg_path)
 
@@ -619,7 +507,7 @@ class ZssmExplain(Star):
             if isinstance(resolved, str) and resolved:
                 src = resolved
         if isinstance(src, str) and self._is_http_url(src):
-            local_path = await self._download_to_temp(src, max_mb)
+            local_path = await download_video_to_temp(src, max_mb)
             if not local_path:
                 yield self._reply_text_result(event, f"视频下载失败或超过大小限制（>{max_mb}MB）。")
                 return
@@ -640,7 +528,7 @@ class ZssmExplain(Star):
 
         # 时长检查（可选，缺少 ffprobe 时跳过）
         max_sec = self._get_conf_int(VIDEO_MAX_DURATION_SEC_KEY, DEFAULT_VIDEO_MAX_DURATION_SEC, 10, 3600)
-        dur = self._probe_duration_sec(self._resolve_ffprobe(), local_path)
+        dur = self._probe_duration_sec(resolve_ffprobe(ffmpeg_path), local_path)
         logger.info("zssm_explain: probed duration=%s (max=%s)", dur if dur is not None else "unknown", max_sec)
         if isinstance(dur, (int, float)) and dur > max_sec:
             yield self._reply_text_result(event, f"视频时长超过限制（>{max_sec}s），请截取片段后重试。")
@@ -1213,76 +1101,10 @@ class ZssmExplain(Star):
         return await loop.run_in_executor(None, _do)
 
 
-    async def _download_image_to_temp(self, url: str, timeout_sec: int = 15) -> Optional[str]:
-        """下载图片到临时文件并返回路径。"""
-        if not url:
-            return None
-        headers = {
-            "User-Agent": "AstrBot-zssm/1.0 (+https://github.com/xiaoxi68/astrbot_zssm_explain)",
-            "Accept": "image/avif,image/webp,image/*,*/*;q=0.8",
-        }
-
-        async def _fetch() -> Tuple[Optional[bytes], Optional[str]]:
-            if aiohttp is not None:
-                try:
-                    async with aiohttp.ClientSession(headers=headers) as session:
-                        async with session.get(url, timeout=timeout_sec, allow_redirects=True) as resp:
-                            if 200 <= int(resp.status) < 400:
-                                data = await resp.read()
-                                return data, resp.headers.get("Content-Type")
-                except Exception:
-                    pass
-            import urllib.request
-            import urllib.error
-
-            def _do() -> Tuple[Optional[bytes], Optional[str]]:
-                try:
-                    req = urllib.request.Request(url, headers=headers)
-                    with urllib.request.urlopen(req, timeout=timeout_sec) as resp:
-                        status = getattr(resp, "status", 200)
-                        if 200 <= int(status) < 400:
-                            data = resp.read()
-                            return data, resp.headers.get("Content-Type")
-                except Exception:
-                    return (None, None)
-                return (None, None)
-
-            loop = asyncio.get_running_loop()
-            return await loop.run_in_executor(None, _do)
-
-        data, content_type = await _fetch()
-        if not data:
-            return None
-        suffix = ".png"
-        if isinstance(content_type, str):
-            if "jpeg" in content_type.lower():
-                suffix = ".jpg"
-            elif "webp" in content_type.lower():
-                suffix = ".webp"
-        try:
-            fd, path = tempfile.mkstemp(prefix="zssm_cf_", suffix=suffix)
-            with os.fdopen(fd, "wb") as f:
-                f.write(data)
-            return path
-        except Exception as e:
-            logger.warning(f"zssm_explain: failed to save screenshot temp file: {e}")
-            return None
-
     @staticmethod
     def _extract_urls_from_text(text: Optional[str]) -> List[str]:
-        if not isinstance(text, str) or not text:
-            return []
-        # 基本 URL 正则：匹配 http/https 及常见顶级域名
-        url_pattern = re.compile(r"(https?://[\w\-._~:/?#\[\]@!$&'()*+,;=%]+)", re.IGNORECASE)
-        urls = [m.group(1) for m in url_pattern.finditer(text)]
-        # 去重并保持顺序
-        seen = set()
-        uniq = []
-        for u in urls:
-            if u not in seen:
-                uniq.append(u)
-                seen.add(u)
-        return uniq
+        """兼容旧接口，委托 url_utils.extract_urls_from_text。"""
+        return extract_urls_from_text(text)
 
     def _build_url_user_prompt(self, url: str, html: str) -> Tuple[str, str]:
         title = extract_title(html)
