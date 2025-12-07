@@ -7,7 +7,7 @@ import re
 import shutil
 import tempfile
 import subprocess
-from urllib.parse import urlparse, unquote
+from urllib.parse import urlparse
 import math
 import time
 
@@ -47,6 +47,7 @@ from .video_utils import (
     resolve_ffprobe,
     download_video_to_temp,
 )
+from .bilibili_utils import is_bilibili_url, download_bilibili_video_to_temp
 from .prompt_utils import (
     DEFAULT_URL_USER_PROMPT,
     DEFAULT_VIDEO_USER_PROMPT,
@@ -108,7 +109,7 @@ DEFAULT_FILE_PREVIEW_MAX_SIZE_KB = 8192
     "astrbot_zssm_explain",
     "薄暝",
     "zssm，支持关键词“zssm”（忽略前缀）与“zssm + 内容”直接解释；引用消息（含@）正常处理；支持 QQ 合并转发；未回复仅发 zssm 时提示；默认提示词可在 main.py 顶部修改。",
-    "v3.7.0",
+    "v3.8.0",
     "https://github.com/xiaoxi68/astrbot_zssm_explain",
 )
 class ZssmExplain(Star):
@@ -498,33 +499,52 @@ class ZssmExplain(Star):
         max_mb = self._get_conf_int(VIDEO_MAX_SIZE_MB_KEY, DEFAULT_VIDEO_MAX_SIZE_MB, 1, 512)
         local_path = None
         src = video_src
-        # 若不是 URL/绝对路径，尝试通过 Napcat file_id 获取直链
-        if isinstance(src, str) and (not self._is_http_url(src)) and (not self._is_abs_file(src)):
+        # 优先特判 B 站视频链接：通过 video_utils 解析并下载到临时文件
+        if isinstance(src, str) and self._is_http_url(src) and is_bilibili_url(src):
             try:
-                resolved = await self._napcat_resolve_file_url(event, src)
-            except Exception:
-                resolved = None
-            if isinstance(resolved, str) and resolved:
-                src = resolved
-        if isinstance(src, str) and self._is_http_url(src):
-            local_path = await download_video_to_temp(src, max_mb)
-            if not local_path:
-                yield self._reply_text_result(event, f"视频下载失败或超过大小限制（>{max_mb}MB）。")
+                bili_local = await download_bilibili_video_to_temp(src, max_mb)
+            except Exception as e:
+                logger.warning("zssm_explain: bilibili download failed: %s", e)
+                bili_local = None
+            if bili_local:
+                local_path = bili_local
+            else:
+                # B 站链接解析失败时直接给出友好提示，避免误将网页当作视频文件处理
+                yield self._reply_text_result(
+                    event,
+                    "暂时无法解析该 B 站视频链接，请确认视频为公开可访问状态，或改为发送视频文件/截图后再试。",
+                )
                 return
-        else:
-            # 假定为本地路径
-            if not (isinstance(src, str) and os.path.isabs(src) and os.path.exists(src)):
-                yield self._reply_text_result(event, "无法读取该视频源，请确认路径或链接有效。")
-                return
-            # 大小检查
-            try:
-                sz = os.path.getsize(src)
-                if sz > max_mb * 1024 * 1024:
-                    yield self._reply_text_result(event, f"视频大小超过限制（>{max_mb}MB），请压缩或截取片段后重试。")
+
+        # 若尚未得到本地路径，再按通用逻辑处理 Napcat/file_id 与普通 http 链接/本地路径
+        if local_path is None:
+            # 若不是 URL/绝对路径，尝试通过 Napcat file_id 获取直链
+            if isinstance(src, str) and (not self._is_http_url(src)) and (not self._is_abs_file(src)):
+                try:
+                    resolved = await self._napcat_resolve_file_url(event, src)
+                except Exception:
+                    resolved = None
+                if isinstance(resolved, str) and resolved:
+                    src = resolved
+            if isinstance(src, str) and self._is_http_url(src):
+                local_path = await download_video_to_temp(src, max_mb)
+                if not local_path:
+                    yield self._reply_text_result(event, f"视频下载失败或超过大小限制（>{max_mb}MB）。")
                     return
-            except Exception:
-                pass
-            local_path = src
+            else:
+                # 假定为本地路径
+                if not (isinstance(src, str) and os.path.isabs(src) and os.path.exists(src)):
+                    yield self._reply_text_result(event, "无法读取该视频源，请确认路径或链接有效。")
+                    return
+                # 大小检查
+                try:
+                    sz = os.path.getsize(src)
+                    if sz > max_mb * 1024 * 1024:
+                        yield self._reply_text_result(event, f"视频大小超过限制（>{max_mb}MB），请压缩或截取片段后重试。")
+                        return
+                except Exception:
+                    pass
+                local_path = src
 
         # 时长检查（可选，缺少 ffprobe 时跳过）
         max_sec = self._get_conf_int(VIDEO_MAX_DURATION_SEC_KEY, DEFAULT_VIDEO_MAX_DURATION_SEC, 10, 3600)
@@ -1377,10 +1397,18 @@ class ZssmExplain(Star):
 
         # 1) 先解析内联内容
         if inline:
-            # 若内联包含 URL，优先走“网页摘要”流程
+            # 若内联包含 URL，优先检测是否为 B 站视频链接，其次才走“网页摘要”流程
             urls = self._extract_urls_from_text(inline) if enable_url else []
             if urls:
                 target_url = urls[0]
+                # B 站视频链接优先走视频解释流程
+                if is_bilibili_url(target_url):
+                    try:
+                        async for r in self._explain_video(event, target_url):
+                            yield r
+                        return
+                    except Exception as e:
+                        logger.warning("zssm_explain: inline bilibili handle failed: %s", e)
                 timeout_sec = self._get_conf_int(URL_FETCH_TIMEOUT_KEY, DEFAULT_URL_FETCH_TIMEOUT, 2, 60)
                 url_ctx = await self._prepare_url_prompt(target_url, timeout_sec)
                 if not url_ctx:
@@ -1436,6 +1464,14 @@ class ZssmExplain(Star):
             if urls and not from_forward:
                 # 非合并转发场景，沿用原有“网页摘要优先”的行为
                 target_url = urls[0]
+                # 若为 B 站视频链接，则优先走视频解释流程
+                if is_bilibili_url(target_url):
+                    try:
+                        async for r in self._explain_video(event, target_url):
+                            yield r
+                        return
+                    except Exception as e:
+                        logger.warning("zssm_explain: reply bilibili handle failed: %s", e)
                 timeout_sec = self._get_conf_int(URL_FETCH_TIMEOUT_KEY, DEFAULT_URL_FETCH_TIMEOUT, 2, 60)
                 url_ctx = await self._prepare_url_prompt(target_url, timeout_sec)
                 if not url_ctx:

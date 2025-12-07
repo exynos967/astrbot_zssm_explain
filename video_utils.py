@@ -350,8 +350,11 @@ def resolve_ffprobe(ffmpeg_path: Optional[str]) -> Optional[str]:
     return None
 
 
-async def download_video_to_temp(url: str, size_mb_limit: int) -> Optional[str]:
-    """下载视频到临时文件，做大小限制校验。"""
+async def download_video_to_temp(url: str, size_mb_limit: int, headers: Optional[Dict[str, str]] = None) -> Optional[str]:
+    """下载视频到临时文件，做大小限制校验。
+
+    headers 可选，用于为特定站点（如 B 站）附加 UA/Referer 等。
+    """
 
     def _safe_ext_from_url(u: str) -> str:
         try:
@@ -378,7 +381,7 @@ async def download_video_to_temp(url: str, size_mb_limit: int) -> Optional[str]:
     if aiohttp is not None:
         try:
             async with aiohttp.ClientSession() as sess:
-                async with sess.get(url, timeout=20) as resp:
+                async with sess.get(url, timeout=20, headers=headers or {}) as resp:
                     if resp.status != 200:
                         try:
                             os.remove(tmp_path)
@@ -419,7 +422,8 @@ async def download_video_to_temp(url: str, size_mb_limit: int) -> Optional[str]:
     try:
         import urllib.request
 
-        with urllib.request.urlopen(url, timeout=20) as r, open(tmp_path, "wb") as f:
+        req = urllib.request.Request(url, headers=headers or {})
+        with urllib.request.urlopen(req, timeout=20) as r, open(tmp_path, "wb") as f:
             total = 0
             while True:
                 chunk = r.read(8192)
