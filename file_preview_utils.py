@@ -24,7 +24,7 @@ from astrbot.api import logger
 from astrbot.api.event import AstrMessageEvent
 import astrbot.api.message_components as Comp
 
-from .message_utils import get_reply_message_id, ob_data
+from .message_utils import get_reply_message_id, ob_data, call_get_forward_msg
 
 
 def build_text_exts_from_config(raw: str, default_exts: Iterable[str]) -> Set[str]:
@@ -263,7 +263,7 @@ async def extract_file_preview_from_reply(
                 if not isinstance(fid, str) or not fid:
                     continue
                 try:
-                    fwd = await event.bot.api.call_action("get_forward_msg", id=fid)
+                    fwd = await call_get_forward_msg(event, str(fid))
                 except Exception as fe:
                     logger.warning(f"zssm_explain: get_forward_msg for file preview failed: {fe}")
                     continue
@@ -294,129 +294,6 @@ async def extract_file_preview_from_reply(
         text_exts=text_exts,
         max_size_bytes=max_size_bytes,
     )
-
-
-async def extract_group_file_video_url_from_reply(
-    event: AstrMessageEvent,
-    video_exts: Optional[Set[str]] = None,
-) -> Optional[str]:
-    """尝试从被回复的 Napcat 文件消息中获取“视频文件”的直链 URL。
-
-    仅在 OneBot/Napcat 平台 (aiocqhttp) 且存在 Reply 组件时生效。
-    video_exts 为需要按“视频”处理的扩展名集合（包含点，如 '.mp4'），为空则使用内置默认列表。
-    """
-    try:
-        platform = event.get_platform_name()
-    except Exception:
-        platform = None
-    if platform != "aiocqhttp" or not hasattr(event, "bot"):
-        return None
-
-    # 定位 Reply 组件
-    try:
-        chain = event.get_messages()
-    except Exception:
-        chain = getattr(event.message_obj, "message", []) if hasattr(event, "message_obj") else []
-    reply_comp = None
-    for seg in chain:
-        try:
-            if isinstance(seg, Comp.Reply):
-                reply_comp = seg
-                break
-        except Exception:
-            continue
-    if not reply_comp:
-        return None
-
-    reply_id = get_reply_message_id(reply_comp)
-    if not reply_id:
-        return None
-
-    # 调用 get_msg 获取原始消息，查找其中的 file 段
-    try:
-        ret: Dict[str, Any] = await event.bot.api.call_action("get_msg", message_id=reply_id)
-    except Exception:
-        return None
-    data = ob_data(ret) if isinstance(ret, dict) else {}
-    if not isinstance(data, dict):
-        return None
-    msg_list = data.get("message") or data.get("messages")
-    if not isinstance(msg_list, list):
-        return None
-
-    file_seg = None
-    for seg in msg_list:
-        try:
-            if not isinstance(seg, dict):
-                continue
-            if seg.get("type") == "file":
-                file_seg = seg
-                break
-        except Exception:
-            continue
-    if not file_seg:
-        return None
-
-    d = file_seg.get("data") or {}
-    if not isinstance(d, dict):
-        return None
-    file_id = d.get("file")
-    file_name = d.get("name") or d.get("file") or "未命名文件"
-    if not isinstance(file_id, str) or not file_id:
-        return None
-
-    # 判断扩展名是否为视频后缀
-    name_lower = str(file_name).lower()
-    _, ext = os.path.splitext(name_lower)
-    default_video_exts: Set[str] = {
-        ".mp4",
-        ".mkv",
-        ".flv",
-        ".wmv",
-        ".mpeg",
-    }
-    v_exts = video_exts or default_video_exts
-    if ext not in v_exts:
-        return None
-
-    # 仅支持群聊场景，私聊暂不处理
-    try:
-        gid = event.get_group_id()
-    except Exception:
-        gid = None
-    url: Optional[str] = None
-
-    # 群聊：使用 get_group_file_url
-    if gid:
-        try:
-            group_id = int(gid)
-        except Exception:
-            group_id = None
-        if group_id is not None:
-            try:
-                url_result = await event.bot.api.call_action(
-                    "get_group_file_url",
-                    group_id=group_id,
-                    file_id=file_id,
-                )
-                url = url_result.get("url") if isinstance(url_result, dict) else None
-            except Exception as e:
-                logger.warning(f"zssm_explain: get_group_file_url for video file failed: {e}")
-
-    # 私聊：使用 get_private_file_url
-    if not url:
-        try:
-            url_result = await event.bot.api.call_action(
-                "get_private_file_url",
-                file_id=file_id,
-            )
-            data = url_result.get("data") if isinstance(url_result, dict) else None
-            if isinstance(data, dict):
-                url = data.get("url")
-        except Exception as e:
-            logger.warning(f"zssm_explain: get_private_file_url for video file failed: {e}")
-
-    return url or None
 
 
 async def build_group_file_preview(

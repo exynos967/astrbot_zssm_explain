@@ -19,7 +19,7 @@ from astrbot.api import logger
 from astrbot.api.event import AstrMessageEvent
 import astrbot.api.message_components as Comp
 
-from .message_utils import get_reply_message_id, ob_data
+from .message_utils import ob_data
 
 
 def extract_videos_from_chain(chain: List[object]) -> List[str]:
@@ -97,85 +97,6 @@ def extract_videos_from_chain(chain: List[object]) -> List[str]:
     return videos
 
 
-async def extract_videos_from_event(event: AstrMessageEvent) -> List[str]:
-    """从当前事件中提取视频 URL/路径，优先从 Reply 引用中获取。"""
-    try:
-        chain = event.get_messages()
-    except Exception:
-        chain = getattr(event.message_obj, "message", []) or []
-
-    reply_comp = None
-    for seg in chain:
-        try:
-            if isinstance(seg, Comp.Reply):
-                reply_comp = seg
-                break
-        except Exception:
-            pass
-
-    if reply_comp:
-        for attr in ("message", "origin", "content"):
-            payload = getattr(reply_comp, attr, None)
-            if isinstance(payload, list):
-                vids = extract_videos_from_chain(payload)
-                if vids:
-                    return vids
-        # 无内嵌内容时，尝试通过平台能力（OneBot/Napcat）用 message_id 拉取原消息
-        reply_id = get_reply_message_id(reply_comp)
-        platform_name = None
-        try:
-            platform_name = event.get_platform_name()
-        except Exception:
-            platform_name = None
-        if reply_id and platform_name == "aiocqhttp" and hasattr(event, "bot"):
-            try:
-                vids: List[str] = []
-                # Napcat/OneBot 分支：优先使用底层 api.call_action 以获得完整 payload
-                if is_napcat(event) and hasattr(event.bot, "api"):
-                    ret: Dict[str, Any] = await event.bot.api.call_action("get_msg", message_id=reply_id)
-                    data = ob_data(ret)
-                    # 1) 直接从原消息中提取视频
-                    vids.extend(extract_videos_from_onebot_message_payload(data))
-                    # 2) 检测其中是否包含 forward/nodes，并拉取合并转发节点中的视频
-                    try:
-                        msg_list = data.get("message") if isinstance(data, dict) else None
-                        if isinstance(msg_list, list):
-                            for seg in msg_list:
-                                if not isinstance(seg, dict):
-                                    continue
-                                if seg.get("type") in ("forward", "forward_msg", "nodes"):
-                                    d = seg.get("data", {}) if isinstance(seg.get("data"), dict) else {}
-                                    fid = d.get("id")
-                                    if isinstance(fid, str) and fid:
-                                        try:
-                                            fwd = await event.bot.api.call_action("get_forward_msg", id=fid)
-                                            from_forward = extract_videos_from_onebot_forward_payload(fwd)
-                                            if from_forward:
-                                                vids.extend(from_forward)
-                                        except Exception as fe:
-                                            logger.warning("zssm_explain: get_forward_msg for video failed: %s", fe)
-                    except Exception:
-                        pass
-                else:
-                    # 其他 OneBot 实现，沿用通用 get_msg 接口
-                    data = await event.bot.get_msg(message_id=int(reply_id))
-                    vids.extend(extract_videos_from_onebot_message_payload(data))
-
-                if vids:
-                    # 去重保持顺序
-                    uniq: List[str] = []
-                    seen = set()
-                    for v in vids:
-                        if isinstance(v, str) and v and v not in seen:
-                            seen.add(v)
-                            uniq.append(v)
-                    if uniq:
-                        return uniq
-            except Exception:
-                pass
-    return extract_videos_from_chain(chain)
-
-
 def is_http_url(s: Optional[str]) -> bool:
     return isinstance(s, str) and s.lower().startswith(("http://", "https://"))
 
@@ -192,7 +113,13 @@ def is_napcat(event: AstrMessageEvent) -> bool:
 
 
 async def napcat_resolve_file_url(event: AstrMessageEvent, file_id: str) -> Optional[str]:
-    """使用 Napcat 接口将文件/视频的 file_id 解析为可下载 URL。"""
+    """使用 Napcat 接口将文件/视频的 file_id 解析为可下载 URL 或本地路径。
+
+    说明：
+    - 群文件：通常可用 get_group_file_url / get_private_file_url
+    - 媒体（如视频/图片/语音）在部分场景下需要使用 get_file/get_image/get_record 等接口
+      才能解析出 url/file，本函数目前以 get_file 作为兜底（兼容合并转发里的 video fileUUID）。
+    """
     if not (isinstance(file_id, str) and file_id):
         return None
     if not is_napcat(event):
@@ -204,12 +131,43 @@ async def napcat_resolve_file_url(event: AstrMessageEvent, file_id: str) -> Opti
     except Exception:
         gid = None
 
+    group_id_param: Any = gid
+    try:
+        if isinstance(gid, str) and gid.isdigit():
+            group_id_param = int(gid)
+        elif isinstance(gid, int):
+            group_id_param = gid
+    except Exception:
+        group_id_param = gid
+
+    def _stem_if_needed(s: str) -> Optional[str]:
+        try:
+            base, ext = os.path.splitext(s)
+            if ext and ext.lower() in (".mp4", ".mov", ".m4v", ".avi", ".webm", ".mkv", ".flv", ".wmv", ".ts", ".mpeg", ".mpg", ".3gp", ".gif"):
+                if base and base != s:
+                    return base
+        except Exception:
+            pass
+        return None
+
+    # 一些 Napcat 场景下 file 值会携带扩展名（形如 hash.mp4），但接口实际需要 hash 本体。
+    candidates: List[str] = [file_id]
+    stem = _stem_if_needed(file_id)
+    if isinstance(stem, str) and stem and stem not in candidates:
+        candidates.append(stem)
+
     actions: List[Dict[str, Any]] = []
-    if gid:
-        actions.append({"action": "get_group_file_url", "params": {"group_id": gid, "file_id": file_id}})
-        actions.append({"action": "get_private_file_url", "params": {"file_id": file_id}})
-    else:
-        actions.append({"action": "get_private_file_url", "params": {"file_id": file_id}})
+    # 兜底：Napcat 通用文件解析接口（可用于 message 视频/图片等的 file_id/fileUUID）
+    for fid in candidates:
+        actions.append({"action": "get_file", "params": {"file_id": fid}})
+        actions.append({"action": "get_file", "params": {"file": fid}})
+
+    # 群文件接口：仅在能拿到群号时尝试
+    if group_id_param:
+        for fid in candidates:
+            actions.append({"action": "get_group_file_url", "params": {"group_id": group_id_param, "file_id": fid}})
+    for fid in candidates:
+        actions.append({"action": "get_private_file_url", "params": {"file_id": fid}})
 
     for item in actions:
         action = item["action"]
@@ -221,9 +179,27 @@ async def napcat_resolve_file_url(event: AstrMessageEvent, file_id: str) -> Opti
             if isinstance(url, str) and url:
                 logger.info("zssm_explain: napcat %s ok, url=%s", action, url[:80])
                 return url
-            logger.warning("zssm_explain: napcat %s returned no url", action)
+            # get_file/get_image/get_record 等可能返回本地路径 file
+            f = data.get("file") if isinstance(data, dict) else None
+            if isinstance(f, str) and f and os.path.isabs(f) and os.path.exists(f):
+                logger.info("zssm_explain: napcat %s ok, file=%s", action, f[:80])
+                return f
+            logger.debug(
+                "zssm_explain: napcat %s returned no url/file (file_id=%s params=%s)",
+                action,
+                str(file_id)[:64],
+                {k: str(v)[:64] for k, v in (params.items() if isinstance(params, dict) else [])},
+            )
         except Exception as e:
-            logger.warning("zssm_explain: napcat %s failed: %s", action, e)
+            logger.debug(
+                "zssm_explain: napcat %s failed (file_id=%s params=%s): %s",
+                action,
+                str(file_id)[:64],
+                {k: str(v)[:64] for k, v in (params.items() if isinstance(params, dict) else [])},
+                e,
+            )
+            continue
+    logger.warning("zssm_explain: napcat resolve video/file failed (file_id=%s)", str(file_id)[:64])
     return None
 
 

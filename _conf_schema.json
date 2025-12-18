@@ -61,6 +61,18 @@
     "default": 50,
     "hint": "超过则拒绝并提示"
   },
+  "forward_video_keyframe_enable": {
+    "description": "合并转发：视频关键帧参与聊天记录解释",
+    "type": "bool",
+    "default": true,
+    "hint": "开启后，若合并转发聊天记录中包含视频，将尝试抽取少量关键帧作为图片输入参与同一次解释；失败则回退为仅标记[视频]"
+  },
+  "forward_video_max_count": {
+    "description": "合并转发：最多处理的视频数量",
+    "type": "int",
+    "default": 2,
+    "hint": "仅对合并转发聊天记录生效；每个视频默认仅抽 1 张关键帧，避免图片过多导致模型调用失败"
+  },
   "ffmpeg_path": {
     "description": "ffmpeg 可执行文件路径",
     "type": "string",
@@ -78,6 +90,12 @@
     "type": "int",
     "default": 6000,
     "hint": "限制输入规模，避免过长上下文"
+  },
+  "llm_timeout_sec": {
+    "description": "LLM 调用超时（秒）",
+    "type": "int",
+    "default": 90,
+    "hint": "用于防止模型调用卡死导致无回复；范围建议 5-600"
   },
   "cf_screenshot_size": {
     "description": "Cloudflare 截图尺寸（宽x高，px）",
