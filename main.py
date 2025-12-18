@@ -5,16 +5,8 @@ import os
 import asyncio
 import re
 import shutil
-import tempfile
-import subprocess
-from urllib.parse import urlparse
 import math
 import time
-
-try:
-    import aiohttp  # 优先使用异步 HTTP 客户端
-except Exception:  # pragma: no cover
-    aiohttp = None  # 运行环境若无 aiohttp，将回退到线程内 urllib
 
 from astrbot.api.event import filter, AstrMessageEvent
 from astrbot.api.star import Context, Star, register
@@ -24,15 +16,11 @@ from astrbot.core.star.star_handler import EventType
 from astrbot.core.pipeline.context_utils import call_event_hook
 
 from .url_utils import (
-    strip_html,
-    extract_title,
-    extract_meta_desc,
-    build_cf_screenshot_url,
     fetch_html,
-    wait_cf_screenshot_ready,
-    download_image_to_temp,
-    resolve_liveshot_image_url,
     extract_urls_from_text,
+    prepare_url_prompt,
+    build_url_failure_message,
+    build_url_brief_for_forward,
 )
 from .message_utils import extract_quoted_payload_with_videos
 from .video_utils import (
@@ -44,6 +32,9 @@ from .video_utils import (
     resolve_ffmpeg,
     resolve_ffprobe,
     download_video_to_temp,
+    sample_frames_equidistant,
+    sample_frames_with_ffmpeg,
+    extract_audio_wav,
 )
 from .bilibili_utils import is_bilibili_url, download_bilibili_video_to_temp
 from .prompt_utils import (
@@ -56,7 +47,6 @@ from .prompt_utils import (
 from .file_preview_utils import (
     build_text_exts_from_config,
     extract_file_preview_from_reply,
-    pdf_bytes_to_markdown,
 )
 
 """
@@ -112,7 +102,7 @@ DEFAULT_FORWARD_VIDEO_MAX_COUNT = 2
     "astrbot_zssm_explain",
     "薄暝",
     "zssm，支持关键词“zssm”（忽略前缀）与“zssm + 内容”直接解释；引用消息（含@）正常处理；支持 QQ 合并转发；未回复仅发 zssm 时提示；默认提示词可在 main.py 顶部修改。",
-    "v3.9.7",
+    "v3.9.8",
     "https://github.com/xiaoxi68/astrbot_zssm_explain",
 )
 class ZssmExplain(Star):
@@ -272,103 +262,6 @@ class ZssmExplain(Star):
     def _probe_duration_sec(self, ffprobe_path: Optional[str], video_path: str) -> Optional[float]:
         """兼容旧接口，委托 video_utils.probe_duration_sec。"""
         return probe_duration_sec(ffprobe_path, video_path)
-
-    async def _sample_frames_with_ffmpeg(self, ffmpeg_path: str, video_path: str, interval_sec: int, count_limit: int) -> List[str]:
-        out_dir = tempfile.mkdtemp(prefix="zssm_frames_")
-        out_tpl = os.path.join(out_dir, "frame_%03d.jpg")
-        cmd = [
-            ffmpeg_path, "-y", "-i", video_path,
-            "-vf", f"fps=1/{max(1, interval_sec)}",
-            "-frames:v", str(max(1, count_limit)),
-            "-qscale:v", "2",
-            out_tpl,
-        ]
-        loop = asyncio.get_running_loop()
-        def _run():
-            return subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
-        res = await loop.run_in_executor(None, _run)
-        if res.returncode != 0:
-            # 失败时删除目录
-            try:
-                shutil.rmtree(out_dir, ignore_errors=True)
-            except Exception:
-                pass
-            logger.error("zssm_explain: ffmpeg fps-sampler failed (code=%s)", res.returncode)
-            raise RuntimeError("ffmpeg sample frames failed")
-        frames = []
-        try:
-            for name in sorted(os.listdir(out_dir)):
-                if name.lower().endswith('.jpg'):
-                    frames.append(os.path.join(out_dir, name))
-        except Exception:
-            pass
-        if not frames:
-            try:
-                shutil.rmtree(out_dir, ignore_errors=True)
-            except Exception:
-                pass
-            raise RuntimeError("no frames generated")
-        return frames
-
-    async def _sample_frames_equidistant(self, ffmpeg_path: str, video_path: str, duration_sec: float, count_limit: int) -> List[str]:
-        """按等距时间点抽帧，覆盖全片。选择 N 个时间点：t_i = (i/(N+1))*duration。"""
-        N = max(1, int(count_limit))
-        out_dir = tempfile.mkdtemp(prefix="zssm_frames_")
-        loop = asyncio.get_running_loop()
-        frames: List[str] = []
-        times: List[float] = []
-        try:
-            total = max(0.0, float(duration_sec))
-            for i in range(1, N + 1):
-                t = (i / (N + 1.0)) * total
-                times.append(t)
-            logger.info("zssm_explain: equidistant times=%s", [round(x, 2) for x in times])
-            for idx, t in enumerate(times, start=1):
-                out_path = os.path.join(out_dir, f"frame_{idx:03d}.jpg")
-                cmd = [
-                    ffmpeg_path, "-y",
-                    "-ss", f"{max(0.0, t):.3f}",
-                    "-i", video_path,
-                    "-frames:v", "1",
-                    "-qscale:v", "2",
-                    out_path,
-                ]
-                def _run_one():
-                    return subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
-                res = await loop.run_in_executor(None, _run_one)
-                if res.returncode == 0 and os.path.exists(out_path):
-                    frames.append(out_path)
-                else:
-                    logger.warning("zssm_explain: ffmpeg sample at %.3fs failed (code=%s)", t, res.returncode)
-        except Exception as e:
-            logger.error("zssm_explain: equidistant sampler error: %s", e)
-        if not frames:
-            try:
-                shutil.rmtree(out_dir, ignore_errors=True)
-            except Exception:
-                pass
-            raise RuntimeError("no frames generated by equidistant sampler")
-        return frames
-
-    async def _extract_audio_wav(self, ffmpeg_path: str, video_path: str) -> Optional[str]:
-        out_fd, out_path = tempfile.mkstemp(prefix="zssm_audio_", suffix=".wav")
-        os.close(out_fd)
-        cmd = [
-            ffmpeg_path, "-y", "-i", video_path,
-            "-vn", "-ac", "1", "-ar", "16000", "-f", "wav",
-            out_path,
-        ]
-        loop = asyncio.get_running_loop()
-        def _run():
-            return subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
-        res = await loop.run_in_executor(None, _run)
-        if res.returncode != 0:
-            try:
-                os.remove(out_path)
-            except Exception:
-                pass
-            return None
-        return out_path if os.path.exists(out_path) else None
 
     def _build_video_user_prompt(self, meta: Dict[str, Any], asr_text: Optional[str]) -> str:
         # 始终使用代码常量模板，不从配置读取
@@ -564,7 +457,7 @@ class ZssmExplain(Star):
                     "zssm_explain: sampling plan: duration=%.2fs interval=%ss => target_frames=%s",
                     float(dur), interval, n_frames,
                 )
-                frames = await self._sample_frames_equidistant(ffmpeg_path, local_path, float(dur), n_frames)
+                frames = await sample_frames_equidistant(ffmpeg_path, local_path, float(dur), n_frames)
             else:
                 # 未获知时长时，以最大允许时长作为上界推导帧数；GIF 固定抽 1 帧
                 if is_gif:
@@ -575,7 +468,7 @@ class ZssmExplain(Star):
                     "zssm_explain: sampling plan: unknown duration, use max_sec=%ss interval=%ss => target_frames=%s",
                     max_sec, interval, n_frames,
                 )
-                frames = await self._sample_frames_with_ffmpeg(ffmpeg_path, local_path, interval, n_frames)
+                frames = await sample_frames_with_ffmpeg(ffmpeg_path, local_path, interval, n_frames)
         except Exception as e:
             yield self._reply_text_result(event, f"抽帧失败：{e}")
             return
@@ -594,7 +487,7 @@ class ZssmExplain(Star):
             asr_enabled = DEFAULT_VIDEO_ASR_ENABLE
         if asr_enabled:
             try:
-                wav = await self._extract_audio_wav(ffmpeg_path, local_path)
+                wav = await extract_audio_wav(ffmpeg_path, local_path)
                 if wav and os.path.exists(wav):
                     stt = self._choose_stt_provider(event)
                     try:
@@ -796,9 +689,9 @@ class ZssmExplain(Star):
                 # 仅抽 1 张关键帧：优先等距抽帧（有时长时取中间帧），否则从开头抽 1 帧
                 try:
                     if isinstance(dur, (int, float)) and dur > 0:
-                        sampled = await self._sample_frames_equidistant(ffmpeg_path, local_path, float(dur), 1)
+                        sampled = await sample_frames_equidistant(ffmpeg_path, local_path, float(dur), 1)
                     else:
-                        sampled = await self._sample_frames_with_ffmpeg(ffmpeg_path, local_path, max(1, max_sec), 1)
+                        sampled = await sample_frames_with_ffmpeg(ffmpeg_path, local_path, max(1, max_sec), 1)
                 except Exception:
                     sampled = []
 
@@ -1162,193 +1055,10 @@ class ZssmExplain(Star):
         return "\n".join(merged_lines)
 
 
-    async def _fetch_pdf_bytes(self, url: str, timeout_sec: int, max_bytes: int) -> Optional[bytes]:
-        """拉取 PDF 二进制内容，限制最大体积，避免将二进制内容按文本处理。
-
-        返回值为不超过 max_bytes 的二进制数据，超出或失败时返回 None。
-        """
-        if not url or not isinstance(max_bytes, int) or max_bytes <= 0:
-            return None
-        headers = {
-            "User-Agent": "AstrBot-zssm/1.0 (+https://github.com/xiaoxi68/astrbot_zssm_explain)",
-            "Accept": "application/pdf,*/*;q=0.8",
-        }
-
-        async def _aiohttp_fetch() -> Optional[bytes]:
-            if aiohttp is None:
-                return None
-            try:
-                async with aiohttp.ClientSession(headers=headers) as session:
-                    async with session.get(url, timeout=timeout_sec, allow_redirects=True) as resp:
-                        status = int(resp.status)
-                        if 200 <= status < 400:
-                            data = await resp.content.read(max_bytes + 1)
-                            if len(data) > max_bytes:
-                                logger.warning("zssm_explain: pdf over size limit when fetching url=%s", url)
-                                return None
-                            return data
-            except Exception as e:
-                logger.warning(f"zssm_explain: aiohttp fetch pdf failed: {e}")
-                return None
-            return None
-
-        data = await _aiohttp_fetch()
-        if data is not None:
-            return data
-
-        import urllib.request
-        import urllib.error
-
-        def _do() -> Optional[bytes]:
-            try:
-                req = urllib.request.Request(url, headers=headers)
-                with urllib.request.urlopen(req, timeout=timeout_sec) as resp:
-                    status = getattr(resp, "status", 200)
-                    if not (200 <= int(status) < 400):
-                        return None
-                    chunks: List[bytes] = []
-                    remaining = max_bytes + 1
-                    while remaining > 0:
-                        chunk = resp.read(min(8192, remaining))
-                        if not chunk:
-                            break
-                        chunks.append(chunk)
-                        remaining -= len(chunk)
-                        if remaining <= 0:
-                            logger.warning("zssm_explain: pdf over size limit in urllib fetch url=%s", url)
-                            return None
-                    return b"".join(chunks)
-            except urllib.error.HTTPError as e:
-                logger.warning(f"zssm_explain: urllib fetch pdf failed: {e}")
-                return None
-            except Exception as e:
-                logger.warning(f"zssm_explain: urllib fetch pdf failed: {e}")
-                return None
-
-        loop = asyncio.get_running_loop()
-        return await loop.run_in_executor(None, _do)
-
-
     @staticmethod
     def _extract_urls_from_text(text: Optional[str]) -> List[str]:
         """兼容旧接口，委托 url_utils.extract_urls_from_text。"""
         return extract_urls_from_text(text)
-
-    def _build_url_user_prompt(self, url: str, html: str) -> Tuple[str, str]:
-        title = extract_title(html)
-        desc = extract_meta_desc(html)
-        plain = strip_html(html)
-        max_chars = self._get_conf_int(URL_MAX_CHARS_KEY, DEFAULT_URL_MAX_CHARS, min_v=1000, max_v=50000)
-        snippet = plain[:max_chars]
-        user_prompt = DEFAULT_URL_USER_PROMPT.format(url=url, title=title or "(无)", desc=desc or "(无)", snippet=snippet)
-        return user_prompt, title or ""
-
-    def _build_url_brief_for_forward(self, url: str, html: str) -> Tuple[str, str, str]:
-        """为合并转发场景构造网址的精简信息摘要（标题/描述/正文片段）。"""
-        title = extract_title(html)
-        desc = extract_meta_desc(html)
-        plain = strip_html(html)
-        max_chars = self._get_conf_int(URL_MAX_CHARS_KEY, DEFAULT_URL_MAX_CHARS, min_v=1000, max_v=50000)
-        snippet = plain[:max_chars]
-        return title or "", desc or "", snippet
-
-    async def _prepare_url_prompt(self, url: str, timeout_sec: int) -> Optional[Tuple[str, Optional[str], List[str]]]:
-        """统一处理网页抓取：成功返回 HTML/Markdown 摘要提示词；若因 Cloudflare 被拦截则回退到截图模式。
-
-        对于以 .pdf 结尾的链接，优先尝试按 PDF 文档处理，使用 PyPDF2 提取 Markdown 文本，
-        避免将二进制内容误当作 HTML 文本导致 LLM 看到乱码。
-        """
-        # 1) 特判 PDF 链接：直接按 PDF 处理并生成 Markdown 片段
-        try:
-            path = urlparse(url).path
-            _, ext = os.path.splitext(str(path).lower())
-        except Exception:
-            ext = ""
-        if ext == ".pdf":
-            max_bytes = self._get_file_preview_max_bytes()
-            if not isinstance(max_bytes, int) or max_bytes <= 0:
-                max_bytes = 2 * 1024 * 1024
-            pdf_bytes = await self._fetch_pdf_bytes(url, timeout_sec, max_bytes)
-            if pdf_bytes:
-                text = pdf_bytes_to_markdown(pdf_bytes)
-                if text:
-                    max_chars = self._get_conf_int(
-                        URL_MAX_CHARS_KEY,
-                        DEFAULT_URL_MAX_CHARS,
-                        min_v=1000,
-                        max_v=50000,
-                    )
-                    snippet = text[:max_chars]
-                    user_prompt = DEFAULT_URL_USER_PROMPT.format(
-                        url=url,
-                        title="(PDF 文档)",
-                        desc="从 PDF 正文中提取的文本内容。",
-                        snippet=snippet,
-                    )
-                    return (user_prompt, None, [])
-
-        # 2) 常规 HTML 场景
-        html = await fetch_html(url, timeout_sec, self._last_fetch_info)
-        if html:
-            user_prompt, _ = self._build_url_user_prompt(url, html)
-            return (user_prompt, None, [])
-
-        info = getattr(self, "_last_fetch_info", {}) or {}
-        is_cf = bool(info.get("cloudflare"))
-        if is_cf and self._get_conf_bool(CF_SCREENSHOT_ENABLE_KEY, DEFAULT_CF_SCREENSHOT_ENABLE):
-            width, height = self._get_cf_screenshot_size()
-            screenshot_url = build_cf_screenshot_url(
-                url,
-                width,
-                height,
-            )
-            if screenshot_url:
-                logger.warning(
-                    "zssm_explain: Cloudflare detected for %s (status=%s, via=%s); fallback to urlscan screenshot",
-                    url,
-                    info.get("status"),
-                    info.get("via"),
-                )
-                ready = await wait_cf_screenshot_ready(screenshot_url, self._last_fetch_info)
-                if not ready:
-                    try:
-                        if isinstance(self._last_fetch_info, dict):
-                            self._last_fetch_info["cf_screenshot_ready"] = False
-                    except Exception:
-                        pass
-                    logger.warning("zssm_explain: urlscan screenshot still unavailable, aborting image fallback")
-                    return None
-                try:
-                    if isinstance(self._last_fetch_info, dict):
-                        self._last_fetch_info["used_cf_screenshot"] = True
-                        self._last_fetch_info["cf_screenshot_ready"] = True
-                except Exception:
-                    pass
-                final_image_url = await resolve_liveshot_image_url(screenshot_url)
-                if not final_image_url:
-                    logger.warning("zssm_explain: failed to resolve liveshot image from html response")
-                    return None
-                local_image_path = await download_image_to_temp(final_image_url)
-                if not local_image_path:
-                    logger.warning("zssm_explain: failed to download liveshot image to temp file")
-                    return None
-                cf_prompt = DEFAULT_URL_USER_PROMPT.format(
-                    url=url,
-                    title="(Cloudflare 截图)",
-                    desc="目标站点启用 Cloudflare，已改用 urlscan 截图作为依据。",
-                    snippet="由于无法直接抓取 HTML，请结合截图内容输出网页摘要。"
-                )
-                return (cf_prompt, None, [local_image_path])
-
-        return None
-
-    def _build_url_failure_message(self) -> str:
-        info = getattr(self, "_last_fetch_info", {}) or {}
-        if info.get("cloudflare"):
-            if self._get_conf_bool(CF_SCREENSHOT_ENABLE_KEY, DEFAULT_CF_SCREENSHOT_ENABLE):
-                return "目标站点启用 Cloudflare 防护，截图降级失败，请稍后重试或改为发送手动截图/摘录内容。"
-            return "目标站点启用 Cloudflare 防护，因未启用截图降级无法抓取，请开启 cf_screenshot_enable 或稍后再试。"
-        return "网页获取失败或不受支持，请稍后重试并确认链接可访问。"
 
     def _pick_llm_text(self, llm_resp: object) -> str:
         # 1) 优先解析 AstrBot 的结果链（MessageChain）
@@ -1519,10 +1229,40 @@ class ZssmExplain(Star):
                             return
                         except Exception as e:
                             logger.warning("zssm_explain: inline bilibili handle failed: %s", e)
-                    timeout_sec = self._get_conf_int(URL_FETCH_TIMEOUT_KEY, DEFAULT_URL_FETCH_TIMEOUT, 2, 60)
-                    url_ctx = await self._prepare_url_prompt(target_url, timeout_sec)
+
+                    timeout_sec = self._get_conf_int(
+                        URL_FETCH_TIMEOUT_KEY,
+                        DEFAULT_URL_FETCH_TIMEOUT,
+                        2,
+                        60,
+                    )
+                    max_chars = self._get_conf_int(
+                        URL_MAX_CHARS_KEY,
+                        DEFAULT_URL_MAX_CHARS,
+                        min_v=1000,
+                        max_v=50000,
+                    )
+                    cf_enable = self._get_conf_bool(
+                        CF_SCREENSHOT_ENABLE_KEY,
+                        DEFAULT_CF_SCREENSHOT_ENABLE,
+                    )
+                    width, height = self._get_cf_screenshot_size()
+                    url_ctx = await prepare_url_prompt(
+                        target_url,
+                        timeout_sec,
+                        self._last_fetch_info,
+                        max_chars=max_chars,
+                        cf_screenshot_enable=cf_enable,
+                        cf_screenshot_width=width,
+                        cf_screenshot_height=height,
+                        file_preview_max_bytes=self._get_file_preview_max_bytes(),
+                        user_prompt_template=DEFAULT_URL_USER_PROMPT,
+                    )
                     if not url_ctx:
-                        yield self._reply_text_result(event, self._build_url_failure_message())
+                        yield self._reply_text_result(
+                            event,
+                            build_url_failure_message(self._last_fetch_info, cf_enable),
+                        )
                         event.stop_event()
                         return
                     user_prompt, text, images = url_ctx
@@ -1600,10 +1340,40 @@ class ZssmExplain(Star):
                             return
                         except Exception as e:
                             logger.warning("zssm_explain: reply bilibili handle failed: %s", e)
-                    timeout_sec = self._get_conf_int(URL_FETCH_TIMEOUT_KEY, DEFAULT_URL_FETCH_TIMEOUT, 2, 60)
-                    url_ctx = await self._prepare_url_prompt(target_url, timeout_sec)
+
+                    timeout_sec = self._get_conf_int(
+                        URL_FETCH_TIMEOUT_KEY,
+                        DEFAULT_URL_FETCH_TIMEOUT,
+                        2,
+                        60,
+                    )
+                    max_chars = self._get_conf_int(
+                        URL_MAX_CHARS_KEY,
+                        DEFAULT_URL_MAX_CHARS,
+                        min_v=1000,
+                        max_v=50000,
+                    )
+                    cf_enable = self._get_conf_bool(
+                        CF_SCREENSHOT_ENABLE_KEY,
+                        DEFAULT_CF_SCREENSHOT_ENABLE,
+                    )
+                    width, height = self._get_cf_screenshot_size()
+                    url_ctx = await prepare_url_prompt(
+                        target_url,
+                        timeout_sec,
+                        self._last_fetch_info,
+                        max_chars=max_chars,
+                        cf_screenshot_enable=cf_enable,
+                        cf_screenshot_width=width,
+                        cf_screenshot_height=height,
+                        file_preview_max_bytes=self._get_file_preview_max_bytes(),
+                        user_prompt_template=DEFAULT_URL_USER_PROMPT,
+                    )
                     if not url_ctx:
-                        yield self._reply_text_result(event, self._build_url_failure_message())
+                        yield self._reply_text_result(
+                            event,
+                            build_url_failure_message(self._last_fetch_info, cf_enable),
+                        )
                         event.stop_event()
                         return
                     user_prompt, text, images = url_ctx
@@ -1611,14 +1381,25 @@ class ZssmExplain(Star):
                     # 合并转发 + 含网址：以聊天记录解释为主，并在可能的情况下附加网页摘要信息
                     base_prompt = build_user_prompt(text, images)
                     target_url = urls[0]
-                    timeout_sec = self._get_conf_int(URL_FETCH_TIMEOUT_KEY, DEFAULT_URL_FETCH_TIMEOUT, 2, 60)
+                    timeout_sec = self._get_conf_int(
+                        URL_FETCH_TIMEOUT_KEY,
+                        DEFAULT_URL_FETCH_TIMEOUT,
+                        2,
+                        60,
+                    )
                     extra_block = ""
                     try:
                         html = await fetch_html(target_url, timeout_sec, self._last_fetch_info)
                     except Exception:
                         html = None
                     if isinstance(html, str) and html.strip():
-                        title, desc, snippet = self._build_url_brief_for_forward(target_url, html)
+                        max_chars = self._get_conf_int(
+                            URL_MAX_CHARS_KEY,
+                            DEFAULT_URL_MAX_CHARS,
+                            min_v=1000,
+                            max_v=50000,
+                        )
+                        title, desc, snippet = build_url_brief_for_forward(html, max_chars)
                         extra_block = (
                             "\n\n此外，这段聊天记录中包含一个网页链接，请结合下面的网页关键信息一起解释整段对话：\n"
                             f"网址: {target_url}\n"
