@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import List, Optional, Any, Dict
+from typing import List, Optional, Any, Dict, Tuple
 
 import asyncio
 import json
@@ -658,3 +658,110 @@ def probe_duration_sec(ffprobe_path: Optional[str], video_path: str) -> Optional
     chosen = c_sorted[mid]
     logger.info("zssm_explain: ffprobe chosen duration=%.3f", chosen)
     return chosen
+
+
+async def extract_forward_video_keyframes(
+    event: AstrMessageEvent,
+    video_sources: List[str],
+    *,
+    enabled: bool,
+    max_count: int,
+    ffmpeg_path: Optional[str],
+    ffprobe_path: Optional[str],
+    max_mb: int,
+    max_sec: int,
+    timeout_sec: int,
+) -> Tuple[List[str], List[str]]:
+    """将合并转发中的视频源转换为少量关键帧图片（默认每个视频 1 张），用于“聊天记录解释”场景。
+
+    返回:
+    - frames: 本地关键帧图片路径列表（均位于临时目录）
+    - cleanup_paths: 需要清理的临时路径（文件或目录）
+    """
+    if not enabled:
+        return ([], [])
+    if not video_sources:
+        return ([], [])
+    if not ffmpeg_path:
+        return ([], [])
+    try:
+        max_count = int(max_count)
+    except Exception:
+        max_count = 0
+    if max_count <= 0:
+        return ([], [])
+
+    uniq_sources: List[str] = []
+    seen = set()
+    for s in video_sources:
+        if isinstance(s, str) and s and s not in seen:
+            seen.add(s)
+            uniq_sources.append(s)
+
+    frames: List[str] = []
+    cleanup: List[str] = []
+
+    for src in uniq_sources[:max_count]:
+        local_path = None
+        downloaded_tmp = False
+        try:
+            resolved_src = src
+            if isinstance(resolved_src, str) and (not is_http_url(resolved_src)) and (not is_abs_file(resolved_src)):
+                try:
+                    resolved = await napcat_resolve_file_url(event, resolved_src)
+                except Exception:
+                    resolved = None
+                if isinstance(resolved, str) and resolved:
+                    resolved_src = resolved
+
+            if isinstance(resolved_src, str) and is_http_url(resolved_src):
+                try:
+                    local_path = await asyncio.wait_for(
+                        download_video_to_temp(resolved_src, max_mb),
+                        timeout=max(2, int(timeout_sec)),
+                    )
+                except Exception as e:
+                    logger.warning("zssm_explain: forward video download timeout/failed: %s", e)
+                if local_path:
+                    downloaded_tmp = True
+            elif isinstance(resolved_src, str) and is_abs_file(resolved_src) and os.path.exists(resolved_src):
+                local_path = resolved_src
+
+            if not local_path:
+                continue
+
+            dur = probe_duration_sec(ffprobe_path, local_path) if ffprobe_path else None
+            if isinstance(dur, (int, float)) and dur > max_sec:
+                continue
+
+            try:
+                if isinstance(dur, (int, float)) and dur > 0:
+                    sampled = await sample_frames_equidistant(ffmpeg_path, local_path, float(dur), 1)
+                else:
+                    sampled = await sample_frames_with_ffmpeg(ffmpeg_path, local_path, max(1, max_sec), 1)
+            except Exception:
+                sampled = []
+
+            if sampled:
+                frames.append(sampled[0])
+                try:
+                    cleanup.append(os.path.dirname(sampled[0]))
+                except Exception:
+                    pass
+        finally:
+            if downloaded_tmp and isinstance(local_path, str) and local_path:
+                cleanup.append(local_path)
+                try:
+                    if os.path.exists(local_path):
+                        os.remove(local_path)
+                except Exception:
+                    pass
+
+    uniq_cleanup: List[str] = []
+    seen2 = set()
+    for p in cleanup:
+        if isinstance(p, str) and p and p not in seen2:
+            seen2.add(p)
+            uniq_cleanup.append(p)
+
+    return (frames, uniq_cleanup)

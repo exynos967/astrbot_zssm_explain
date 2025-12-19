@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from typing import List, Tuple, Optional, Any, Dict, Set
+from dataclasses import dataclass, field
+from typing import List, Tuple, Optional, Any, Dict, Set, Union
 import os
 import asyncio
 import re
@@ -28,6 +29,7 @@ from .video_utils import (
     is_http_url,
     is_abs_file,
     napcat_resolve_file_url,
+    extract_forward_video_keyframes,
     probe_duration_sec,
     resolve_ffmpeg,
     resolve_ffprobe,
@@ -42,8 +44,9 @@ from .prompt_utils import (
     DEFAULT_VIDEO_USER_PROMPT,
     DEFAULT_FRAME_CAPTION_PROMPT,
     build_user_prompt,
-    build_system_prompt,
+    build_system_prompt_for_event,
 )
+from .llm_client import LLMClient
 from .file_preview_utils import (
     build_text_exts_from_config,
     extract_file_preview_from_reply,
@@ -59,7 +62,6 @@ from .file_preview_utils import (
 URL_DETECT_ENABLE_KEY = "enable_url_detect"
 URL_FETCH_TIMEOUT_KEY = "url_timeout_sec"
 URL_MAX_CHARS_KEY = "url_max_chars"
-LLM_TIMEOUT_SEC_KEY = "llm_timeout_sec"
 KEYWORD_ZSSM_ENABLE_KEY = "enable_keyword_zssm"
 GROUP_LIST_MODE_KEY = "group_list_mode"
 GROUP_LIST_KEY = "group_list"
@@ -79,9 +81,8 @@ FORWARD_VIDEO_KEYFRAME_ENABLE_KEY = "forward_video_keyframe_enable"
 FORWARD_VIDEO_MAX_COUNT_KEY = "forward_video_max_count"
 
 DEFAULT_URL_DETECT_ENABLE = True
-DEFAULT_URL_FETCH_TIMEOUT = 8
+DEFAULT_URL_FETCH_TIMEOUT = 20
 DEFAULT_URL_MAX_CHARS = 6000
-DEFAULT_LLM_TIMEOUT_SEC = 90
 DEFAULT_VIDEO_FRAME_INTERVAL_SEC = 6
 DEFAULT_VIDEO_ASR_ENABLE = False
 DEFAULT_VIDEO_MAX_DURATION_SEC = 120
@@ -89,9 +90,9 @@ DEFAULT_VIDEO_MAX_SIZE_MB = 50
 DEFAULT_FFMPEG_PATH = "ffmpeg"
 DEFAULT_CF_SCREENSHOT_ENABLE = True
 DEFAULT_CF_SCREENSHOT_SIZE = "1280x720"
-DEFAULT_KEEP_ORIGINAL_PERSONA = False
+DEFAULT_KEEP_ORIGINAL_PERSONA = True
 DEFAULT_FILE_PREVIEW_EXTS = "txt,md,log,json,csv,ini,cfg,yml,yaml,py"
-DEFAULT_FILE_PREVIEW_MAX_SIZE_KB = 8192
+DEFAULT_FILE_PREVIEW_MAX_SIZE_KB = 100
 DEFAULT_FORWARD_VIDEO_KEYFRAME_ENABLE = True
 DEFAULT_FORWARD_VIDEO_MAX_COUNT = 2
 
@@ -102,7 +103,7 @@ DEFAULT_FORWARD_VIDEO_MAX_COUNT = 2
     "astrbot_zssm_explain",
     "薄暝",
     "zssm，支持关键词“zssm”（忽略前缀）与“zssm + 内容”直接解释；引用消息（含@）正常处理；支持 QQ 合并转发；未回复仅发 zssm 时提示；默认提示词可在 main.py 顶部修改。",
-    "v3.9.8",
+    "v3.9.10",
     "https://github.com/xiaoxi68/astrbot_zssm_explain",
 )
 class ZssmExplain(Star):
@@ -110,6 +111,12 @@ class ZssmExplain(Star):
         super().__init__(context)
         self.config: Dict[str, Any] = config or {}
         self._last_fetch_info: Dict[str, Any] = {}
+        self._llm = LLMClient(
+            context=self.context,
+            get_conf_int=self._get_conf_int,
+            get_config_provider=self._get_config_provider,
+            logger=logger,
+        )
 
     async def initialize(self):
         """可选：插件初始化。"""
@@ -224,31 +231,6 @@ class ZssmExplain(Star):
             return str(gid).strip() not in glist if glist else True
         return True
 
-    # ===== 视频相关工具 =====
-    @staticmethod
-    def _extract_videos_from_chain(chain: List[object]) -> List[str]:
-        """兼容旧接口，委托 video_utils.extract_videos_from_chain。"""
-        return extract_videos_from_chain(chain)
-
-    # ===== Napcat (aiocqhttp) 文件直链解析 =====
-    @staticmethod
-    def _is_http_url(s: Optional[str]) -> bool:
-        return is_http_url(s)
-
-    @staticmethod
-    def _is_abs_file(s: Optional[str]) -> bool:
-        return is_abs_file(s)
-
-    def _is_napcat(self, event: AstrMessageEvent) -> bool:
-        try:
-            return event.get_platform_name() == "aiocqhttp" and hasattr(event, "bot") and hasattr(event.bot, "api")
-        except Exception:
-            return False
-
-    async def _napcat_resolve_file_url(self, event: AstrMessageEvent, file_id: str) -> Optional[str]:
-        """兼容旧接口，委托 video_utils.napcat_resolve_file_url。"""
-        return await napcat_resolve_file_url(event, file_id)
-
     def _resolve_ffmpeg(self) -> Optional[str]:
         """根据插件配置解析 ffmpeg 路径，委托 video_utils.resolve_ffmpeg。"""
         cfg_path = self._get_conf_str(FFMPEG_PATH_KEY, DEFAULT_FFMPEG_PATH)
@@ -258,10 +240,6 @@ class ZssmExplain(Star):
         """根据已解析的 ffmpeg 路径解析 ffprobe，委托 video_utils.resolve_ffprobe。"""
         ff = self._resolve_ffmpeg()
         return resolve_ffprobe(ff)
-
-    def _probe_duration_sec(self, ffprobe_path: Optional[str], video_path: str) -> Optional[float]:
-        """兼容旧接口，委托 video_utils.probe_duration_sec。"""
-        return probe_duration_sec(ffprobe_path, video_path)
 
     def _build_video_user_prompt(self, meta: Dict[str, Any], asr_text: Optional[str]) -> str:
         # 始终使用代码常量模板，不从配置读取
@@ -341,25 +319,6 @@ class ZssmExplain(Star):
         except Exception:
             return None
 
-    def _select_video_provider(self, session_provider: Any, image_urls: List[str]) -> Any:
-        """用于视频解释的 Provider 选择：
-        1) 优先使用配置的 video_provider_id；
-        2) 否则使用当前会话 Provider（需支持图片能力）；
-        3) 否则在所有 Provider 中选择首个支持图片的；
-        4) 否则回退为当前会话 Provider。
-        """
-        cfg_vid = self._get_config_provider(VIDEO_PROVIDER_ID_KEY)
-        if cfg_vid is not None:
-            return cfg_vid
-        if session_provider and self._provider_supports_image(session_provider):
-            return session_provider
-        for p in self.context.get_all_providers():
-            if p is session_provider:
-                continue
-            if self._provider_supports_image(p):
-                return p
-        return session_provider
-
     async def _explain_video(self, event: AstrMessageEvent, video_src: str):
         # 配置检查：未配置 video_provider_id 时视为未启用视频解释
         cfg_video_provider = self._get_config_provider(VIDEO_PROVIDER_ID_KEY)
@@ -383,7 +342,7 @@ class ZssmExplain(Star):
         local_path = None
         src = video_src
         # 优先特判 B 站视频链接：通过 video_utils 解析并下载到临时文件
-        if isinstance(src, str) and self._is_http_url(src) and is_bilibili_url(src):
+        if isinstance(src, str) and is_http_url(src) and is_bilibili_url(src):
             try:
                 bili_local = await download_bilibili_video_to_temp(src, max_mb)
             except Exception as e:
@@ -402,14 +361,14 @@ class ZssmExplain(Star):
         # 若尚未得到本地路径，再按通用逻辑处理 Napcat/file_id 与普通 http 链接/本地路径
         if local_path is None:
             # 若不是 URL/绝对路径，尝试通过 Napcat file_id 获取直链
-            if isinstance(src, str) and (not self._is_http_url(src)) and (not self._is_abs_file(src)):
+            if isinstance(src, str) and (not is_http_url(src)) and (not is_abs_file(src)):
                 try:
-                    resolved = await self._napcat_resolve_file_url(event, src)
+                    resolved = await napcat_resolve_file_url(event, src)
                 except Exception:
                     resolved = None
                 if isinstance(resolved, str) and resolved:
                     src = resolved
-            if isinstance(src, str) and self._is_http_url(src):
+            if isinstance(src, str) and is_http_url(src):
                 local_path = await download_video_to_temp(src, max_mb)
                 if not local_path:
                     yield self._reply_text_result(event, f"视频下载失败或超过大小限制（>{max_mb}MB）。")
@@ -431,7 +390,7 @@ class ZssmExplain(Star):
 
         # 时长检查（可选，缺少 ffprobe 时跳过）
         max_sec = self._get_conf_int(VIDEO_MAX_DURATION_SEC_KEY, DEFAULT_VIDEO_MAX_DURATION_SEC, 10, 3600)
-        dur = self._probe_duration_sec(resolve_ffprobe(ffmpeg_path), local_path)
+        dur = probe_duration_sec(self._resolve_ffprobe(), local_path)
         logger.info("zssm_explain: probed duration=%s (max=%s)", dur if dur is not None else "unknown", max_sec)
         if isinstance(dur, (int, float)) and dur > max_sec:
             yield self._reply_text_result(event, f"视频时长超过限制（>{max_sec}s），请截取片段后重试。")
@@ -473,7 +432,7 @@ class ZssmExplain(Star):
             yield self._reply_text_result(event, f"抽帧失败：{e}")
             return
         logger.info("zssm_explain: sampled %d frames", len(frames))
-        image_urls = self._filter_supported_images(frames)
+        image_urls = self._llm.filter_supported_images(frames)
         if not image_urls:
             yield self._reply_text_result(event, "未能生成可用关键帧，请检查 ffmpeg 或更换视频后重试。")
             return
@@ -528,7 +487,10 @@ class ZssmExplain(Star):
         }
         try:
             start_ts = time.perf_counter()
-            call_provider = self._select_video_provider(provider, image_urls)
+            call_provider = self._llm.select_vision_provider(
+                session_provider=provider,
+                preferred_provider=cfg_video_provider,
+            )
             try:
                 pid = getattr(call_provider, "id", None) or getattr(call_provider, "provider_id", None) or call_provider.__class__.__name__
             except Exception:
@@ -542,15 +504,15 @@ class ZssmExplain(Star):
                     prompt_cap = DEFAULT_FRAME_CAPTION_PROMPT
                     try:
                         logger.info("zssm_explain: caption frame %d/%d", idx, len(image_urls)-1)
-                        resp = await self._call_llm_with_fallback(
+                        resp = await self._llm.call_with_fallback(
                             primary=call_provider,
                             session_provider=provider,
                             user_prompt=prompt_cap,
                             system_prompt=system_prompt,
                             image_urls=[img],
                         )
-                        cap = self._pick_llm_text(resp)
-                        cap = self._sanitize_model_output(cap)
+                        cap = self._llm.pick_llm_text(resp)
+                        cap = self._llm.sanitize_model_output(cap)
                         if not cap:
                             cap = "未识别"
                         captions.append(cap)
@@ -562,7 +524,7 @@ class ZssmExplain(Star):
             # 2) 最后一帧 + 汇总提示（总调用次数 = 帧数）
             final_prompt = self._build_video_final_prompt(meta, asr_text, captions)
             try:
-                resp_final = await self._call_llm_with_fallback(
+                resp_final = await self._llm.call_with_fallback(
                     primary=call_provider,
                     session_provider=provider,
                     user_prompt=final_prompt,
@@ -579,7 +541,7 @@ class ZssmExplain(Star):
             except Exception:
                 pass
 
-            reply_text = self._pick_llm_text(resp_final)
+            reply_text = self._llm.pick_llm_text(resp_final)
             show_reasoning = False
             try:
                 cfg = self.context.get_config(umo=event.unified_msg_origin) or {}
@@ -588,7 +550,7 @@ class ZssmExplain(Star):
             except Exception:
                 show_reasoning = False
             if not show_reasoning:
-                reply_text = self._sanitize_model_output(reply_text)
+                reply_text = self._llm.sanitize_model_output(reply_text)
 
             elapsed = None
             try:
@@ -610,251 +572,7 @@ class ZssmExplain(Star):
             except Exception:
                 pass
 
-    async def _extract_forward_video_keyframes(
-        self,
-        event: AstrMessageEvent,
-        video_sources: List[str],
-    ) -> Tuple[List[str], List[str]]:
-        """将合并转发中的视频源转换为少量关键帧图片，用于“聊天记录解释”场景。
-
-        返回:
-        - frames: 关键帧图片路径/URL（当前仅返回本地抽帧图片路径）
-        - cleanup_paths: 需要清理的临时路径（文件或目录）
-        """
-        if not video_sources:
-            return ([], [])
-        if not self._get_conf_bool(FORWARD_VIDEO_KEYFRAME_ENABLE_KEY, DEFAULT_FORWARD_VIDEO_KEYFRAME_ENABLE):
-            return ([], [])
-
-        ffmpeg_path = self._resolve_ffmpeg()
-        if not ffmpeg_path:
-            return ([], [])
-
-        max_count = self._get_conf_int(FORWARD_VIDEO_MAX_COUNT_KEY, DEFAULT_FORWARD_VIDEO_MAX_COUNT, 0, 10)
-        if max_count <= 0:
-            return ([], [])
-
-        # 去重保持顺序
-        uniq_sources: List[str] = []
-        seen = set()
-        for s in video_sources:
-            if isinstance(s, str) and s and s not in seen:
-                seen.add(s)
-                uniq_sources.append(s)
-
-        max_mb = self._get_conf_int(VIDEO_MAX_SIZE_MB_KEY, DEFAULT_VIDEO_MAX_SIZE_MB, 1, 512)
-        max_sec = self._get_conf_int(VIDEO_MAX_DURATION_SEC_KEY, DEFAULT_VIDEO_MAX_DURATION_SEC, 10, 3600)
-        ffprobe_path = self._resolve_ffprobe()
-
-        frames: List[str] = []
-        cleanup: List[str] = []
-
-        timeout_sec = self._get_conf_int(URL_FETCH_TIMEOUT_KEY, DEFAULT_URL_FETCH_TIMEOUT, 2, 60)
-
-        for src in uniq_sources[:max_count]:
-            local_path = None
-            downloaded_tmp = False
-            try:
-                resolved_src = src
-                # Napcat file_id -> 直链
-                if isinstance(resolved_src, str) and (not self._is_http_url(resolved_src)) and (not self._is_abs_file(resolved_src)):
-                    try:
-                        resolved = await self._napcat_resolve_file_url(event, resolved_src)
-                    except Exception:
-                        resolved = None
-                    if isinstance(resolved, str) and resolved:
-                        resolved_src = resolved
-
-                if isinstance(resolved_src, str) and self._is_http_url(resolved_src):
-                    try:
-                        local_path = await asyncio.wait_for(
-                            download_video_to_temp(resolved_src, max_mb),
-                            timeout=max(2, int(timeout_sec)),
-                        )
-                    except Exception as e:
-                        logger.warning("zssm_explain: forward video download timeout/failed: %s", e)
-                    if local_path:
-                        downloaded_tmp = True
-                elif isinstance(resolved_src, str) and self._is_abs_file(resolved_src) and os.path.exists(resolved_src):
-                    local_path = resolved_src
-
-                if not local_path:
-                    continue
-
-                # 时长限制（缺少 ffprobe 时跳过）
-                dur = self._probe_duration_sec(ffprobe_path, local_path) if ffprobe_path else None
-                if isinstance(dur, (int, float)) and dur > max_sec:
-                    continue
-
-                # 仅抽 1 张关键帧：优先等距抽帧（有时长时取中间帧），否则从开头抽 1 帧
-                try:
-                    if isinstance(dur, (int, float)) and dur > 0:
-                        sampled = await sample_frames_equidistant(ffmpeg_path, local_path, float(dur), 1)
-                    else:
-                        sampled = await sample_frames_with_ffmpeg(ffmpeg_path, local_path, max(1, max_sec), 1)
-                except Exception:
-                    sampled = []
-
-                if sampled:
-                    frames.append(sampled[0])
-                    # sample_* 返回的都是同一目录内的图片，清理目录即可
-                    try:
-                        cleanup.append(os.path.dirname(sampled[0]))
-                    except Exception:
-                        pass
-            finally:
-                # 下载到临时目录的视频文件在此处优先清理（抽帧完成后不再需要）
-                if downloaded_tmp and isinstance(local_path, str) and local_path:
-                    cleanup.append(local_path)
-                    try:
-                        if os.path.exists(local_path):
-                            os.remove(local_path)
-                    except Exception:
-                        pass
-
-        # 去重清理列表，避免重复删除同一路径
-        uniq_cleanup: List[str] = []
-        seen2 = set()
-        for p in cleanup:
-            if isinstance(p, str) and p and p not in seen2:
-                seen2.add(p)
-                uniq_cleanup.append(p)
-
-        return (frames, uniq_cleanup)
-
-    # 文本与图片解析等通用工具已迁移至 message_utils 模块
-
-    @staticmethod
-    def _filter_supported_images(images: List[str]) -> List[str]:
-        """只保留看起来可被 LLM 读取的图片：以 http(s) 开头或本地存在的绝对路径。"""
-        ok: List[str] = []
-        for x in images:
-            try:
-                if isinstance(x, str) and x:
-                    lx = x.lower()
-                    if lx.startswith("http://") or lx.startswith("https://"):
-                        ok.append(x)
-                    elif os.path.isabs(x) and os.path.exists(x):
-                        ok.append(x)
-            except Exception:
-                pass
-        return ok
-
-    def _provider_supports_image(self, provider: Any) -> bool:
-        """尽力判断 Provider 是否支持图片/多模态。"""
-        try:
-            mods = getattr(provider, "modalities", None)
-            if isinstance(mods, (list, tuple)):
-                ml = [str(m).lower() for m in mods]
-                if any(k in ml for k in ["image", "vision", "multimodal", "vl", "picture"]):
-                    return True
-        except (AttributeError, TypeError):
-            pass
-        # 一些 Provider 将信息挂在 config/model_config
-        for attr in ("config", "model_config", "model"):
-            try:
-                val = getattr(provider, attr, None)
-                text = str(val)
-                lt = text.lower()
-                if any(k in lt for k in ["image", "vision", "multimodal", "vl", "gpt-4o", "gemini", "minicpm-v"]):
-                    return True
-            except (AttributeError, TypeError, ValueError):
-                pass
-        return False
-
-    def _select_primary_provider(self, session_provider: Any, image_urls: List[str]) -> Any:
-        """根据是否包含图片选择首选 Provider。
-        - 图片：优先配置 image_provider_id；否则首选会话 Provider（需具备图片能力）；否则从全部 Provider 中挑首个具备图片能力的；否则回退会话 Provider。
-        - 文本：优先配置 text_provider_id；否则采用会话 Provider。
-        """
-        images_present = bool(image_urls)
-        if images_present:
-            cfg_img = self._get_config_provider("image_provider_id")
-            if cfg_img is not None:
-                return cfg_img
-            if session_provider and self._provider_supports_image(session_provider):
-                return session_provider
-            for p in self.context.get_all_providers():
-                if p is session_provider:
-                    continue
-                if self._provider_supports_image(p):
-                    return p
-            return session_provider
-        else:
-            cfg_txt = self._get_config_provider("text_provider_id")
-            if cfg_txt is not None:
-                return cfg_txt
-            return session_provider
-
-    async def _call_llm_with_fallback(
-        self,
-        primary: Any,
-        session_provider: Any,
-        user_prompt: str,
-        system_prompt: str,
-        image_urls: List[str],
-    ) -> Any:
-        """执行 LLM 调用与统一回退：
-        - 先 primary，再 session_provider（若不同），然后遍历全部 Provider。
-        - 图片场景仅尝试具备图片能力的 Provider；文本场景尝试所有 Provider。
-        """
-        tried = set()
-        images_present = bool(image_urls)
-        timeout_sec = self._get_conf_int(LLM_TIMEOUT_SEC_KEY, DEFAULT_LLM_TIMEOUT_SEC, 5, 600)
-
-        async def _try_call(p: Any) -> Optional[Any]:
-            return await asyncio.wait_for(
-                p.text_chat(
-                    prompt=user_prompt,
-                    context=[],
-                    system_prompt=system_prompt,
-                    image_urls=image_urls,
-                ),
-                timeout=max(5, int(timeout_sec)),
-            )
-
-        # 1) primary
-        if primary is not None:
-            tried.add(id(primary))
-            try:
-                return await _try_call(primary)
-            except Exception:
-                pass
-
-        # 2) session provider
-        if session_provider is not None and id(session_provider) not in tried:
-            tried.add(id(session_provider))
-            try:
-                # 图片时校验能力
-                if not images_present or self._provider_supports_image(session_provider):
-                    return await _try_call(session_provider)
-            except Exception:
-                pass
-
-        # 3) enumerate others
-        for p in self.context.get_all_providers():
-            if id(p) in tried:
-                continue
-            if images_present and not self._provider_supports_image(p):
-                continue
-            tried.add(id(p))
-            try:
-                resp = await _try_call(p)
-                logger.info(
-                    "zssm_explain: fallback %s provider succeeded",
-                    "vision" if images_present else "text",
-                )
-                return resp
-            except Exception:
-                continue
-
-        raise RuntimeError("all providers failed for current request")
-
-    async def _extract_quoted_payload_with_videos(
-        self, event: AstrMessageEvent
-    ) -> Tuple[Optional[str], List[str], List[str], bool]:
-        """扩展接口：提取被回复的文本/图片/视频，并标记是否为合并转发。"""
-        return await extract_quoted_payload_with_videos(event)
+    # 文本与图片解析等通用工具已迁移至 message_utils / llm_client / video_utils 模块
 
     @staticmethod
     def _is_zssm_trigger(text: str) -> bool:
@@ -1007,160 +725,15 @@ class ZssmExplain(Star):
         return w, h
 
     async def _build_system_prompt(self, event: AstrMessageEvent) -> str:
-        """根据配置与当前会话人格构造系统提示词。
-
-        当 keep_original_persona 启用时：
-        - 从 AstrBot persona_manager 获取当前会话应使用的人格（v3 格式）；
-        - 使用人格的 prompt 替换 DEFAULT_SYSTEM_PROMPT 的首行描述部分，
-          保留原有的 Markdown 结构与输出约束说明。
-        未启用或获取人格失败时，回退为默认系统提示词。
-        """
-        sp = build_system_prompt()
-
-        # 未启用开关时，直接使用默认提示词
-        try:
-            if not self._get_conf_bool(KEEP_ORIGINAL_PERSONA_KEY, DEFAULT_KEEP_ORIGINAL_PERSONA):
-                return sp
-        except Exception:
-            return sp
-
-        # 仅在存在 persona_manager 时尝试获取当前会话人格
-        try:
-            persona_mgr = getattr(self.context, "persona_manager", None)
-        except Exception:
-            persona_mgr = None
-        if persona_mgr is None:
-            return sp
-
-        persona_prompt: Optional[str] = None
-        try:
-            # get_default_persona_v3 会综合会话配置与 persona 绑定，返回 Personality（含 prompt）
-            personality = await persona_mgr.get_default_persona_v3(event.unified_msg_origin)
-            if isinstance(personality, dict):
-                persona_prompt = personality.get("prompt")
-            else:
-                persona_prompt = getattr(personality, "prompt", None)
-        except Exception as e:
-            logger.warning(f"zssm_explain: get_default_persona_v3 failed: {e}")
-            persona_prompt = None
-
-        if not isinstance(persona_prompt, str) or not persona_prompt.strip():
-            return sp
-
-        # 使用人格 prompt 替换默认系统提示词的首行，保留其余结构化输出要求
-        base_lines = sp.splitlines()
-        rest_lines = base_lines[1:] if len(base_lines) > 1 else []
-        merged_lines: List[str] = [persona_prompt.strip()]
-        merged_lines.extend(rest_lines)
-        return "\n".join(merged_lines)
+        keep = self._get_conf_bool(KEEP_ORIGINAL_PERSONA_KEY, DEFAULT_KEEP_ORIGINAL_PERSONA)
+        return await build_system_prompt_for_event(
+            self.context,
+            event.unified_msg_origin,
+            keep_original_persona=keep,
+        )
 
 
-    @staticmethod
-    def _extract_urls_from_text(text: Optional[str]) -> List[str]:
-        """兼容旧接口，委托 url_utils.extract_urls_from_text。"""
-        return extract_urls_from_text(text)
-
-    def _pick_llm_text(self, llm_resp: object) -> str:
-        # 1) 优先解析 AstrBot 的结果链（MessageChain）
-        try:
-            rc = getattr(llm_resp, "result_chain", None)
-            chain = getattr(rc, "chain", None)
-            if isinstance(chain, list) and chain:
-                parts: List[str] = []
-                for seg in chain:
-                    try:
-                        txt = getattr(seg, "text", None)
-                        if isinstance(txt, str) and txt.strip():
-                            parts.append(txt.strip())
-                    except Exception:
-                        pass
-                if parts:
-                    return "\n".join(parts).strip()
-        except Exception:
-            pass
-
-        # 2) 常见直接字段
-        for attr in ("completion_text", "text", "content", "message"):
-            try:
-                val = getattr(llm_resp, attr, None)
-                if isinstance(val, str) and val.strip():
-                    return val.strip()
-            except Exception:
-                pass
-
-        # 3) 原始补全（OpenAI 风格）
-        try:
-            rawc = getattr(llm_resp, "raw_completion", None)
-            if rawc is not None:
-                choices = getattr(rawc, "choices", None)
-                if choices is None and isinstance(rawc, dict):
-                    choices = rawc.get("choices")
-                if isinstance(choices, list) and choices:
-                    first = choices[0]
-                    if isinstance(first, dict):
-                        msg = first.get("message") or {}
-                        if isinstance(msg, dict):
-                            content = msg.get("content")
-                            if isinstance(content, str) and content.strip():
-                                return content.strip()
-                    else:
-                        text = getattr(first, "text", None)
-                        if isinstance(text, str) and text.strip():
-                            return text.strip()
-        except Exception:
-            pass
-
-        # 4) 顶层 choices 兜底
-        try:
-            choices = getattr(llm_resp, "choices", None)
-            if isinstance(choices, list) and choices:
-                first = choices[0]
-                if isinstance(first, dict):
-                    msg = first.get("message", {})
-                    if isinstance(msg, dict):
-                        content = msg.get("content")
-                        if isinstance(content, str) and content.strip():
-                            return content.strip()
-                else:
-                    text = getattr(first, "text", None)
-                    if isinstance(text, str) and text.strip():
-                        return text.strip()
-        except Exception:
-            pass
-
-        # 最终兜底：避免打印对象 repr
-        return "（未解析到可读内容）"
-
-    # ===== 输出清洗：去除思考/推理内容，仅保留结论性文本 =====
-    @staticmethod
-    def _sanitize_model_output(text: str) -> str:
-        if not isinstance(text, str):
-            return ""
-        s = text.strip()
-        if not s:
-            return s
-        # 1) 去除常见 CoT 包裹：<think>…</think>、```think``` 块
-        s = re.sub(r"(?is)<\s*think\s*>[\s\S]*?<\s*/\s*think\s*>", "", s)
-        s = re.sub(r"(?is)```\s*(think|thinking|reasoning|cot|chain[-_ ]?of[-_ ]?thought)[\s\S]*?```", "", s)
-        # 2) 若存在“答案/结论/回答/总结/Result/Final Answer”等标记，优先保留其后的内容
-        markers = [
-            r"答案[:：]", r"结论[:：]", r"回答[:：]", r"总结[:：]",
-            r"最终答案[:：]?", r"Final Answer[:：]?", r"Result[:：]?",
-        ]
-        for mk in markers:
-            m = re.search(rf"(?is){mk}\s*(.+)$", s)
-            if m:
-                s = m.group(1).strip()
-                break
-        # 3) 去除常见前缀段落：以“思考/推理/分析/计划/步骤/原因/链式推理/思维/思路/推导/内心独白/Reasoning/Thinking/Analysis/Plan/Steps/Rationale/Chain of Thought”开头
-        s = re.sub(r"(?im)^(思考|推理|分析|计划|步骤|原因|链式推理|思维|思路|推导|内心独白)[:：].*(\n\s*\n|$)", "", s)
-        s = re.sub(r"(?im)^(Reasoning|Thinking|Analysis|Plan|Steps|Rationale|Chain[-_ ]?of[-_ ]?Thought)[:：].*(\n\s*\n|$)", "", s)
-        # 同时移除中文括注头如【思考】/【分析】等
-        s = re.sub(r"(?im)^【(思考|分析|推理|思维|计划|步骤)】.*(\n\s*\n|$)", "", s)
-        # 4) 去除开头冗余标记符与多余空白
-        s = re.sub(r"^[#>*\-\s]+", "", s).strip()
-        # 5) 若清洗后为空，则回退原文（避免误删全部内容）
-        return s or text.strip()
+    # 解释输出格式化仍保留在 main.py（与事件/输出策略紧耦合）
 
     def _format_explain_output(
         self,
@@ -1199,12 +772,316 @@ class ZssmExplain(Star):
             pass
         return None
 
+    @dataclass
+    class _LLMPlan:
+        user_prompt: str
+        images: List[str] = field(default_factory=list)
+        cleanup_paths: List[str] = field(default_factory=list)
+
+    @dataclass
+    class _VideoPlan:
+        video_src: str
+        cleanup_paths: List[str] = field(default_factory=list)
+
+    @dataclass
+    class _ReplyPlan:
+        message: str
+        stop_event: bool = True
+        cleanup_paths: List[str] = field(default_factory=list)
+
+    _ExplainPlan = Union[_LLMPlan, _VideoPlan, _ReplyPlan]
+
+    async def _build_explain_plan(
+        self,
+        event: AstrMessageEvent,
+        *,
+        inline: str,
+        enable_url: bool,
+    ) -> _ExplainPlan:
+        """将输入解析/拼装为一个可执行的解释计划（builder 阶段）。"""
+        cleanup_paths: List[str] = []
+
+        if inline:
+            urls = extract_urls_from_text(inline) if enable_url else []
+            if urls:
+                target_url = urls[0]
+                if is_bilibili_url(target_url):
+                    return self._VideoPlan(video_src=target_url, cleanup_paths=cleanup_paths)
+
+                timeout_sec = self._get_conf_int(URL_FETCH_TIMEOUT_KEY, DEFAULT_URL_FETCH_TIMEOUT, 2, 60)
+                max_chars = self._get_conf_int(
+                    URL_MAX_CHARS_KEY,
+                    DEFAULT_URL_MAX_CHARS,
+                    min_v=1000,
+                    max_v=50000,
+                )
+                cf_enable = self._get_conf_bool(CF_SCREENSHOT_ENABLE_KEY, DEFAULT_CF_SCREENSHOT_ENABLE)
+                width, height = self._get_cf_screenshot_size()
+                url_ctx = await prepare_url_prompt(
+                    target_url,
+                    timeout_sec,
+                    self._last_fetch_info,
+                    max_chars=max_chars,
+                    cf_screenshot_enable=cf_enable,
+                    cf_screenshot_width=width,
+                    cf_screenshot_height=height,
+                    file_preview_max_bytes=self._get_file_preview_max_bytes(),
+                    user_prompt_template=DEFAULT_URL_USER_PROMPT,
+                )
+                if not url_ctx:
+                    return self._ReplyPlan(
+                        message=build_url_failure_message(self._last_fetch_info, cf_enable),
+                        stop_event=True,
+                        cleanup_paths=cleanup_paths,
+                    )
+                user_prompt, _text, images = url_ctx
+                return self._LLMPlan(user_prompt=user_prompt, images=images, cleanup_paths=cleanup_paths)
+
+            user_prompt = build_user_prompt(inline, [])
+            return self._LLMPlan(user_prompt=user_prompt, images=[], cleanup_paths=cleanup_paths)
+
+        text, images, vids, from_forward = await extract_quoted_payload_with_videos(event)
+
+        if vids and not from_forward:
+            return self._VideoPlan(video_src=vids[0], cleanup_paths=cleanup_paths)
+
+        if from_forward and vids:
+            try:
+                enabled = self._get_conf_bool(
+                    FORWARD_VIDEO_KEYFRAME_ENABLE_KEY,
+                    DEFAULT_FORWARD_VIDEO_KEYFRAME_ENABLE,
+                )
+                ffmpeg_path = self._resolve_ffmpeg()
+                ffprobe_path = self._resolve_ffprobe()
+                max_count = self._get_conf_int(
+                    FORWARD_VIDEO_MAX_COUNT_KEY,
+                    DEFAULT_FORWARD_VIDEO_MAX_COUNT,
+                    0,
+                    10,
+                )
+                max_mb = self._get_conf_int(VIDEO_MAX_SIZE_MB_KEY, DEFAULT_VIDEO_MAX_SIZE_MB, 1, 512)
+                max_sec = self._get_conf_int(
+                    VIDEO_MAX_DURATION_SEC_KEY,
+                    DEFAULT_VIDEO_MAX_DURATION_SEC,
+                    10,
+                    3600,
+                )
+                timeout_sec = self._get_conf_int(URL_FETCH_TIMEOUT_KEY, DEFAULT_URL_FETCH_TIMEOUT, 2, 60)
+                f_frames, f_cleanup = await extract_forward_video_keyframes(
+                    event,
+                    vids,
+                    enabled=enabled,
+                    max_count=max_count,
+                    ffmpeg_path=ffmpeg_path,
+                    ffprobe_path=ffprobe_path,
+                    max_mb=max_mb,
+                    max_sec=max_sec,
+                    timeout_sec=timeout_sec,
+                )
+                if f_frames:
+                    images.extend(f_frames)
+                    cleanup_paths.extend(f_cleanup)
+                    note = f"（聊天记录包含 {len(vids)} 个视频，已抽取部分关键帧辅助解释）"
+                    if isinstance(text, str) and text.strip():
+                        text = f"{text}\n\n{note}"
+                    else:
+                        text = note
+            except Exception as e:
+                logger.warning("zssm_explain: forward video keyframe failed: %s", e)
+
+        if (not vids) and (not from_forward) and (not text) and (not images):
+            try:
+                chain_now = event.get_messages()
+            except Exception:
+                chain_now = getattr(event.message_obj, "message", []) or []
+            try:
+                vids_now = extract_videos_from_chain(chain_now)
+            except Exception:
+                vids_now = []
+            if vids_now:
+                return self._VideoPlan(video_src=vids_now[0], cleanup_paths=cleanup_paths)
+
+        try:
+            file_preview = await extract_file_preview_from_reply(
+                event,
+                text_exts=self._get_file_preview_exts(),
+                max_size_bytes=self._get_file_preview_max_bytes(),
+            )
+        except Exception:
+            file_preview = None
+        if file_preview:
+            if text:
+                text = f"{file_preview}\n\n{text}"
+            else:
+                text = file_preview
+
+        if not text and not images:
+            return self._ReplyPlan(message="请输入要解释的内容。", stop_event=True, cleanup_paths=cleanup_paths)
+
+        urls = extract_urls_from_text(text) if (enable_url and text) else []
+        if urls and not from_forward:
+            target_url = urls[0]
+            if is_bilibili_url(target_url):
+                return self._VideoPlan(video_src=target_url, cleanup_paths=cleanup_paths)
+
+            timeout_sec = self._get_conf_int(URL_FETCH_TIMEOUT_KEY, DEFAULT_URL_FETCH_TIMEOUT, 2, 60)
+            max_chars = self._get_conf_int(
+                URL_MAX_CHARS_KEY,
+                DEFAULT_URL_MAX_CHARS,
+                min_v=1000,
+                max_v=50000,
+            )
+            cf_enable = self._get_conf_bool(CF_SCREENSHOT_ENABLE_KEY, DEFAULT_CF_SCREENSHOT_ENABLE)
+            width, height = self._get_cf_screenshot_size()
+            url_ctx = await prepare_url_prompt(
+                target_url,
+                timeout_sec,
+                self._last_fetch_info,
+                max_chars=max_chars,
+                cf_screenshot_enable=cf_enable,
+                cf_screenshot_width=width,
+                cf_screenshot_height=height,
+                file_preview_max_bytes=self._get_file_preview_max_bytes(),
+                user_prompt_template=DEFAULT_URL_USER_PROMPT,
+            )
+            if not url_ctx:
+                return self._ReplyPlan(
+                    message=build_url_failure_message(self._last_fetch_info, cf_enable),
+                    stop_event=True,
+                    cleanup_paths=cleanup_paths,
+                )
+            user_prompt, _text, images = url_ctx
+            return self._LLMPlan(user_prompt=user_prompt, images=images, cleanup_paths=cleanup_paths)
+
+        if urls and from_forward:
+            base_prompt = build_user_prompt(text, images)
+            target_url = urls[0]
+            timeout_sec = self._get_conf_int(URL_FETCH_TIMEOUT_KEY, DEFAULT_URL_FETCH_TIMEOUT, 2, 60)
+            extra_block = ""
+            try:
+                html = await fetch_html(target_url, timeout_sec, self._last_fetch_info)
+            except Exception:
+                html = None
+            if isinstance(html, str) and html.strip():
+                max_chars = self._get_conf_int(
+                    URL_MAX_CHARS_KEY,
+                    DEFAULT_URL_MAX_CHARS,
+                    min_v=1000,
+                    max_v=50000,
+                )
+                title, desc, snippet = build_url_brief_for_forward(html, max_chars)
+                extra_block = (
+                    "\n\n此外，这段聊天记录中包含一个网页链接，请结合下面的网页关键信息一起解释整段对话：\n"
+                    f"网址: {target_url}\n"
+                    f"标题: {title or '(未获取)'}\n"
+                    f"描述: {desc or '(未获取)'}\n"
+                    "正文片段:\n"
+                    f"{snippet}"
+                )
+            user_prompt = base_prompt + extra_block
+            return self._LLMPlan(user_prompt=user_prompt, images=images, cleanup_paths=cleanup_paths)
+
+        user_prompt = build_user_prompt(text, images)
+        return self._LLMPlan(user_prompt=user_prompt, images=images, cleanup_paths=cleanup_paths)
+
+    async def _execute_explain_plan(self, event: AstrMessageEvent, plan: _ExplainPlan):
+        """执行解释计划（executor 阶段）。"""
+        if isinstance(plan, self._VideoPlan):
+            async for r in self._explain_video(event, plan.video_src):
+                yield r
+            return
+
+        if isinstance(plan, self._ReplyPlan):
+            yield self._reply_text_result(event, plan.message)
+            if plan.stop_event:
+                try:
+                    event.stop_event()
+                except Exception:
+                    pass
+            return
+
+        user_prompt = plan.user_prompt
+        images = plan.images
+
+        try:
+            provider = self.context.get_using_provider(umo=event.unified_msg_origin)
+        except Exception as e:
+            logger.error(f"zssm_explain: get provider failed: {e}")
+            provider = None
+
+        if not provider:
+            yield self._reply_text_result(event, "未检测到可用的大语言模型提供商，请先在 AstrBot 配置中启用。")
+            return
+
+        system_prompt = await self._build_system_prompt(event)
+        image_urls = self._llm.filter_supported_images(images)
+
+        try:
+            start_ts = time.perf_counter()
+            call_provider = self._llm.select_primary_provider(session_provider=provider, image_urls=image_urls)
+            llm_resp = await self._llm.call_with_fallback(
+                primary=call_provider,
+                session_provider=provider,
+                user_prompt=user_prompt,
+                system_prompt=system_prompt,
+                image_urls=image_urls,
+            )
+
+            try:
+                await call_event_hook(event, EventType.OnLLMResponseEvent, llm_resp)
+            except Exception:
+                pass
+
+            reply_text = None
+            try:
+                ct = getattr(llm_resp, "completion_text", None)
+                if isinstance(ct, str) and ct.strip():
+                    reply_text = ct.strip()
+            except Exception:
+                reply_text = None
+            if not reply_text:
+                reply_text = self._llm.pick_llm_text(llm_resp)
+
+            show_reasoning = False
+            try:
+                cfg = self.context.get_config(umo=event.unified_msg_origin) or {}
+                ps = cfg.get("provider_settings", {})
+                show_reasoning = bool(ps.get("display_reasoning_text", False))
+            except Exception:
+                show_reasoning = False
+            if not show_reasoning:
+                reply_text = self._llm.sanitize_model_output(reply_text)
+
+            elapsed = None
+            try:
+                elapsed = time.perf_counter() - start_ts
+            except Exception:
+                elapsed = None
+            reply_text = self._format_explain_output(reply_text, elapsed_sec=elapsed)
+            yield self._reply_text_result(event, reply_text)
+            try:
+                event.stop_event()
+            except Exception:
+                pass
+        except asyncio.TimeoutError:
+            yield self._reply_text_result(event, "解释超时，请稍后重试或换一个模型提供商。")
+            try:
+                event.stop_event()
+            except Exception:
+                pass
+        except Exception as e:
+            logger.error(f"zssm_explain: LLM 调用失败: {e}")
+            yield self._reply_text_result(event, "解释失败：LLM 或图片转述模型调用异常，请稍后再试或联系管理员。")
+            try:
+                event.stop_event()
+            except Exception:
+                pass
+
     @filter.command("zssm", alias={"知识说明", "解释"})
     async def zssm(self, event: AstrMessageEvent):
         """解释被回复消息：/zssm 或关键词触发；若携带内容则直接解释该内容，否则按回复消息逻辑。"""
         cleanup_paths: List[str] = []
         try:
-            # 群聊权限控制：不满足条件则直接忽略
             try:
                 if not self._is_group_allowed(event):
                     return
@@ -1212,285 +1089,18 @@ class ZssmExplain(Star):
                 pass
             if self._already_handled(event):
                 return
+
             inline = self._get_inline_content(event)
             enable_url = self._get_conf_bool(URL_DETECT_ENABLE_KEY, DEFAULT_URL_DETECT_ENABLE)
 
-            # 1) 先解析内联内容
-            if inline:
-                # 若内联包含 URL，优先检测是否为 B 站视频链接，其次才走“网页摘要”流程
-                urls = self._extract_urls_from_text(inline) if enable_url else []
-                if urls:
-                    target_url = urls[0]
-                    # B 站视频链接优先走视频解释流程
-                    if is_bilibili_url(target_url):
-                        try:
-                            async for r in self._explain_video(event, target_url):
-                                yield r
-                            return
-                        except Exception as e:
-                            logger.warning("zssm_explain: inline bilibili handle failed: %s", e)
-
-                    timeout_sec = self._get_conf_int(
-                        URL_FETCH_TIMEOUT_KEY,
-                        DEFAULT_URL_FETCH_TIMEOUT,
-                        2,
-                        60,
-                    )
-                    max_chars = self._get_conf_int(
-                        URL_MAX_CHARS_KEY,
-                        DEFAULT_URL_MAX_CHARS,
-                        min_v=1000,
-                        max_v=50000,
-                    )
-                    cf_enable = self._get_conf_bool(
-                        CF_SCREENSHOT_ENABLE_KEY,
-                        DEFAULT_CF_SCREENSHOT_ENABLE,
-                    )
-                    width, height = self._get_cf_screenshot_size()
-                    url_ctx = await prepare_url_prompt(
-                        target_url,
-                        timeout_sec,
-                        self._last_fetch_info,
-                        max_chars=max_chars,
-                        cf_screenshot_enable=cf_enable,
-                        cf_screenshot_width=width,
-                        cf_screenshot_height=height,
-                        file_preview_max_bytes=self._get_file_preview_max_bytes(),
-                        user_prompt_template=DEFAULT_URL_USER_PROMPT,
-                    )
-                    if not url_ctx:
-                        yield self._reply_text_result(
-                            event,
-                            build_url_failure_message(self._last_fetch_info, cf_enable),
-                        )
-                        event.stop_event()
-                        return
-                    user_prompt, text, images = url_ctx
-                else:
-                    text, images = inline, []
-                    user_prompt = build_user_prompt(text, images)
-            else:
-                # 2) 无内联时，先提取被回复消息的文本/图片/视频
-                text, images, vids, from_forward = await self._extract_quoted_payload_with_videos(event)
-
-                # 2.1) 非合并转发：视频优先走视频解释（保持原有行为）
-                if vids and not from_forward:
-                    async for r in self._explain_video(event, vids[0]):
-                        yield r
-                    return
-
-                # 2.3) 合并转发：将其中的视频以“关键帧图片”形式纳入同一次聊天记录解释（避免直接跳过）
-                if from_forward and vids:
-                    try:
-                        f_frames, f_cleanup = await self._extract_forward_video_keyframes(event, vids)
-                        if f_frames:
-                            images.extend(f_frames)
-                            cleanup_paths.extend(f_cleanup)
-                            note = f"（聊天记录包含 {len(vids)} 个视频，已抽取部分关键帧辅助解释）"
-                            if isinstance(text, str) and text.strip():
-                                text = f"{text}\n\n{note}"
-                            else:
-                                text = note
-                    except Exception as e:
-                        logger.warning("zssm_explain: forward video keyframe failed: %s", e)
-
-                # 2.4) 无 Reply 但当前消息携带视频：补充识别（保持旧行为）
-                if (not vids) and (not from_forward) and (not text) and (not images):
-                    try:
-                        chain_now = event.get_messages()
-                    except Exception:
-                        chain_now = getattr(event.message_obj, "message", []) or []
-                    try:
-                        vids_now = self._extract_videos_from_chain(chain_now)
-                    except Exception:
-                        vids_now = []
-                    if vids_now:
-                        async for r in self._explain_video(event, vids_now[0]):
-                            yield r
-                        return
-                # 若仍未提取到文本/图片，尝试从群文件构造内容预览
-                try:
-                    file_preview = await extract_file_preview_from_reply(
-                        event,
-                        text_exts=self._get_file_preview_exts(),
-                        max_size_bytes=self._get_file_preview_max_bytes(),
-                    )
-                except Exception:
-                    file_preview = None
-                if file_preview:
-                    if text:
-                        text = f"{file_preview}\n\n{text}"
-                    else:
-                        text = file_preview
-                if not text and not images:
-                    yield self._reply_text_result(event, "请输入要解释的内容。")
-                    event.stop_event()
-                    return
-                # 对于来源于“合并转发”的聊天记录：始终以“整段聊天记录”为主，
-                # 若其中包含网址，则在聊天记录解释的基础上，尝试附加网页摘要信息。
-                urls = self._extract_urls_from_text(text) if (enable_url and text) else []
-                if urls and not from_forward:
-                    # 非合并转发场景，沿用原有“网页摘要优先”的行为
-                    target_url = urls[0]
-                    # 若为 B 站视频链接，则优先走视频解释流程
-                    if is_bilibili_url(target_url):
-                        try:
-                            async for r in self._explain_video(event, target_url):
-                                yield r
-                            return
-                        except Exception as e:
-                            logger.warning("zssm_explain: reply bilibili handle failed: %s", e)
-
-                    timeout_sec = self._get_conf_int(
-                        URL_FETCH_TIMEOUT_KEY,
-                        DEFAULT_URL_FETCH_TIMEOUT,
-                        2,
-                        60,
-                    )
-                    max_chars = self._get_conf_int(
-                        URL_MAX_CHARS_KEY,
-                        DEFAULT_URL_MAX_CHARS,
-                        min_v=1000,
-                        max_v=50000,
-                    )
-                    cf_enable = self._get_conf_bool(
-                        CF_SCREENSHOT_ENABLE_KEY,
-                        DEFAULT_CF_SCREENSHOT_ENABLE,
-                    )
-                    width, height = self._get_cf_screenshot_size()
-                    url_ctx = await prepare_url_prompt(
-                        target_url,
-                        timeout_sec,
-                        self._last_fetch_info,
-                        max_chars=max_chars,
-                        cf_screenshot_enable=cf_enable,
-                        cf_screenshot_width=width,
-                        cf_screenshot_height=height,
-                        file_preview_max_bytes=self._get_file_preview_max_bytes(),
-                        user_prompt_template=DEFAULT_URL_USER_PROMPT,
-                    )
-                    if not url_ctx:
-                        yield self._reply_text_result(
-                            event,
-                            build_url_failure_message(self._last_fetch_info, cf_enable),
-                        )
-                        event.stop_event()
-                        return
-                    user_prompt, text, images = url_ctx
-                elif urls and from_forward:
-                    # 合并转发 + 含网址：以聊天记录解释为主，并在可能的情况下附加网页摘要信息
-                    base_prompt = build_user_prompt(text, images)
-                    target_url = urls[0]
-                    timeout_sec = self._get_conf_int(
-                        URL_FETCH_TIMEOUT_KEY,
-                        DEFAULT_URL_FETCH_TIMEOUT,
-                        2,
-                        60,
-                    )
-                    extra_block = ""
-                    try:
-                        html = await fetch_html(target_url, timeout_sec, self._last_fetch_info)
-                    except Exception:
-                        html = None
-                    if isinstance(html, str) and html.strip():
-                        max_chars = self._get_conf_int(
-                            URL_MAX_CHARS_KEY,
-                            DEFAULT_URL_MAX_CHARS,
-                            min_v=1000,
-                            max_v=50000,
-                        )
-                        title, desc, snippet = build_url_brief_for_forward(html, max_chars)
-                        extra_block = (
-                            "\n\n此外，这段聊天记录中包含一个网页链接，请结合下面的网页关键信息一起解释整段对话：\n"
-                            f"网址: {target_url}\n"
-                            f"标题: {title or '(未获取)'}\n"
-                            f"描述: {desc or '(未获取)'}\n"
-                            "正文片段:\n"
-                            f"{snippet}"
-                        )
-                    # 若网页抓取失败，则仅使用聊天记录解释（base_prompt）即可
-                    user_prompt = base_prompt + extra_block
-                else:
-                    user_prompt = build_user_prompt(text, images)
-
+            plan = await self._build_explain_plan(event, inline=inline, enable_url=enable_url)
             try:
-                provider = self.context.get_using_provider(umo=event.unified_msg_origin)
-            except Exception as e:
-                logger.error(f"zssm_explain: get provider failed: {e}")
-                provider = None
+                cleanup_paths = list(getattr(plan, "cleanup_paths", []) or [])
+            except Exception:
+                cleanup_paths = []
 
-            if not provider:
-                yield self._reply_text_result(event, "未检测到可用的大语言模型提供商，请先在 AstrBot 配置中启用。")
-                return
-
-            system_prompt = await self._build_system_prompt(event)
-            image_urls = self._filter_supported_images(images)
-
-            try:
-                # 统一选择与回退
-                start_ts = time.perf_counter()
-                call_provider = self._select_primary_provider(provider, image_urls)
-                llm_resp = await self._call_llm_with_fallback(
-                    primary=call_provider,
-                    session_provider=provider,
-                    user_prompt=user_prompt,
-                    system_prompt=system_prompt,
-                    image_urls=image_urls,
-                )
-
-                # 走标准事件钩子：触发 OnLLMResponseEvent，让 thinking_filter 根据配置统一过滤/展示思考
-                try:
-                    await call_event_hook(event, EventType.OnLLMResponseEvent, llm_resp)
-                except Exception:
-                    pass
-
-                # 优先使用经钩子可能更新过的 completion_text；否则回退原解析
-                reply_text = None
-                try:
-                    ct = getattr(llm_resp, "completion_text", None)
-                    if isinstance(ct, str) and ct.strip():
-                        reply_text = ct.strip()
-                except Exception:
-                    reply_text = None
-                if not reply_text:
-                    reply_text = self._pick_llm_text(llm_resp)
-
-                # 根据 AstrBot 配置是否展示思考，决定是否再做插件侧清洗
-                show_reasoning = False
-                try:
-                    cfg = self.context.get_config(umo=event.unified_msg_origin) or {}
-                    ps = cfg.get("provider_settings", {})
-                    show_reasoning = bool(ps.get("display_reasoning_text", False))
-                except Exception:
-                    show_reasoning = False
-                if not show_reasoning:
-                    reply_text = self._sanitize_model_output(reply_text)
-
-                elapsed = None
-                try:
-                    elapsed = time.perf_counter() - start_ts
-                except Exception:
-                    elapsed = None
-                reply_text = self._format_explain_output(reply_text, elapsed_sec=elapsed)
-                yield self._reply_text_result(event, reply_text)
-                # 防止后续流程重复处理当前事件
-                try:
-                    event.stop_event()
-                except Exception:
-                    pass
-            except asyncio.TimeoutError:
-                yield self._reply_text_result(event, "解释超时，请稍后重试或换一个模型提供商。")
-                try:
-                    event.stop_event()
-                except Exception:
-                    pass
-            except Exception as e:
-                logger.error(f"zssm_explain: LLM 调用失败: {e}")
-                yield self._reply_text_result(event, "解释失败：LLM 或图片转述模型调用异常，请稍后再试或联系管理员。")
-                try:
-                    event.stop_event()
-                except Exception:
-                    pass
+            async for r in self._execute_explain_plan(event, plan):
+                yield r
         except Exception as e:
             logger.error("zssm_explain: handler crashed: %s", e)
             yield self._reply_text_result(event, "解释失败：插件内部异常，请稍后再试或联系管理员。")
@@ -1499,7 +1109,6 @@ class ZssmExplain(Star):
             except Exception:
                 pass
         finally:
-            # 清理合并转发视频抽帧的临时文件/目录（不影响普通图片 URL）
             try:
                 for p in cleanup_paths:
                     try:

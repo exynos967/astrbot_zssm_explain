@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import List, Optional
+from typing import Any, List, Optional
 
 
 # === 默认提示词常量（集中管理，可供用户修改） ===
@@ -58,3 +58,43 @@ def build_user_prompt(text: Optional[str], images: List[str]) -> str:
 def build_system_prompt() -> str:
     """返回系统提示词（供 LLM 调用使用）。"""
     return DEFAULT_SYSTEM_PROMPT
+
+
+async def build_system_prompt_for_event(
+    context: Any,
+    umo: Any,
+    *,
+    keep_original_persona: bool,
+) -> str:
+    """根据会话人格（可选）构造系统提示词。
+
+    - keep_original_persona=False：直接返回默认系统提示词；
+    - keep_original_persona=True：若 context.persona_manager 存在，则尝试读取当前会话人格 prompt，
+      并替换默认系统提示词的首行（保留其余结构化输出约束）。
+    """
+    sp = build_system_prompt()
+    if not keep_original_persona:
+        return sp
+
+    persona_mgr = getattr(context, "persona_manager", None)
+    if persona_mgr is None:
+        return sp
+
+    persona_prompt: Optional[str] = None
+    try:
+        personality = await persona_mgr.get_default_persona_v3(umo)
+        if isinstance(personality, dict):
+            persona_prompt = personality.get("prompt")
+        else:
+            persona_prompt = getattr(personality, "prompt", None)
+    except Exception:
+        persona_prompt = None
+
+    if not isinstance(persona_prompt, str) or not persona_prompt.strip():
+        return sp
+
+    base_lines = sp.splitlines()
+    rest_lines = base_lines[1:] if len(base_lines) > 1 else []
+    merged_lines: List[str] = [persona_prompt.strip()]
+    merged_lines.extend(rest_lines)
+    return "\n".join(merged_lines)
