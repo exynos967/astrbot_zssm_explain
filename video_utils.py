@@ -108,7 +108,14 @@ def is_abs_file(s: Optional[str]) -> bool:
 
 def is_napcat(event: AstrMessageEvent) -> bool:
     try:
-        return event.get_platform_name() == "aiocqhttp" and hasattr(event, "bot") and hasattr(event.bot, "api")
+        # AstrBot 的 OneBot/Napcat 适配器在不同环境下 platform_name 可能不同（如 bridge/onebot_v11 等），
+        # 这里以是否具备 OneBot 风格的 call_action 能力作为主要判断依据。
+        if not (hasattr(event, "bot") and hasattr(event.bot, "api")):
+            return False
+        api = getattr(event.bot, "api", None)
+        if api is None or not hasattr(api, "call_action"):
+            return False
+        return True
     except Exception:
         return False
 
@@ -162,6 +169,11 @@ async def napcat_resolve_file_url(event: AstrMessageEvent, file_id: str) -> Opti
     for fid in candidates:
         actions.append({"action": "get_file", "params": {"file_id": fid}})
         actions.append({"action": "get_file", "params": {"file": fid}})
+        # 图片在部分实现中需要 get_image 才能拿到本地路径或可下载 URL（优先尝试，失败则忽略）
+        actions.append({"action": "get_image", "params": {"file": fid}})
+        actions.append({"action": "get_image", "params": {"file_id": fid}})
+        actions.append({"action": "get_image", "params": {"id": fid}})
+        actions.append({"action": "get_image", "params": {"image": fid}})
 
     # 群文件接口：仅在能拿到群号时尝试
     if group_id_param:

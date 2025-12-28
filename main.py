@@ -23,7 +23,7 @@ from .url_utils import (
     build_url_failure_message,
     build_url_brief_for_forward,
 )
-from .message_utils import extract_quoted_payload_with_videos
+from .message_utils import extract_quoted_payload_with_videos, extract_text_images_videos_from_chain
 from .video_utils import (
     extract_videos_from_chain,
     is_http_url,
@@ -657,6 +657,43 @@ class ZssmExplain(Star):
             s = getattr(event, "message_str", "") or ""
         return self._strip_trigger_and_get_content(s)
 
+    @staticmethod
+    def _safe_get_chain(event: AstrMessageEvent) -> List[object]:
+        try:
+            return event.get_messages()
+        except Exception:
+            return getattr(event.message_obj, "message", []) if hasattr(event, "message_obj") else []
+
+    def _extract_images_from_event(self, event: AstrMessageEvent) -> List[str]:
+        """从当前事件消息链中提取图片（用于“zssm + 图片”场景）。"""
+        chain = self._safe_get_chain(event)
+        try:
+            _t, images, _v = extract_text_images_videos_from_chain(chain)
+        except Exception:
+            images = []
+        return [x for x in images if isinstance(x, str) and x]
+
+    async def _resolve_images_for_llm(self, event: AstrMessageEvent, images: List[str]) -> List[str]:
+        """将可能是 file_id 的图片引用解析成可用 URL/本地绝对路径，并去重保持顺序。"""
+        resolved: List[str] = []
+        seen = set()
+        for img in images:
+            if not isinstance(img, str) or not img:
+                continue
+            cand = img
+            if not is_http_url(cand) and not (is_abs_file(cand) and os.path.exists(cand)):
+                try:
+                    r = await napcat_resolve_file_url(event, cand)
+                    if isinstance(r, str) and r:
+                        cand = r
+                except Exception:
+                    pass
+            if is_http_url(cand) or (is_abs_file(cand) and os.path.exists(cand)):
+                if cand not in seen:
+                    seen.add(cand)
+                    resolved.append(cand)
+        return resolved
+
     # ===== URL 相关：检测、抓取、提取与组装提示词 =====
     def _get_conf_bool(self, key: str, default: bool) -> bool:
         try:
@@ -837,11 +874,23 @@ class ZssmExplain(Star):
                 user_prompt, _text, images = url_ctx
                 return self._LLMPlan(user_prompt=user_prompt, images=images, cleanup_paths=cleanup_paths)
 
-            user_prompt = build_user_prompt(inline, [])
-            return self._LLMPlan(user_prompt=user_prompt, images=[], cleanup_paths=cleanup_paths)
+            inline_images_raw = self._extract_images_from_event(event)
+            inline_images = (
+                await self._resolve_images_for_llm(event, inline_images_raw) if inline_images_raw else []
+            )
+            user_prompt = build_user_prompt(inline, inline_images)
+            return self._LLMPlan(user_prompt=user_prompt, images=inline_images, cleanup_paths=cleanup_paths)
 
         text, images, vids, from_forward = await extract_quoted_payload_with_videos(event)
-
+        # 同时支持“zssm + 图片”（图片在当前消息里，而非被回复消息中）
+        try:
+            images.extend(self._extract_images_from_event(event))
+        except Exception:
+            pass
+        # 去重图片列表
+        if isinstance(images, list):
+            images = list(dict.fromkeys(images))
+        
         if vids and not from_forward:
             return self._VideoPlan(video_src=vids[0], cleanup_paths=cleanup_paths)
 
@@ -915,7 +964,22 @@ class ZssmExplain(Star):
             else:
                 text = file_preview
 
+        raw_images = list(images) if isinstance(images, list) else []
+        try:
+            images = await self._resolve_images_for_llm(event, images)
+        except Exception:
+            images = []
+        # Deduplicate resolved images
+        if isinstance(images, list):
+            images = list(dict.fromkeys(images))
+
         if not text and not images:
+            if raw_images:
+                return self._ReplyPlan(
+                    message="未能获取到图片（未拿到可访问的链接/本地路径），请尝试重新发送图片或检查 OneBot/Napcat 是否支持 get_image/get_file。",
+                    stop_event=True,
+                    cleanup_paths=cleanup_paths,
+                )
             return self._ReplyPlan(message="请输入要解释的内容。", stop_event=True, cleanup_paths=cleanup_paths)
 
         urls = extract_urls_from_text(text) if (enable_url and text) else []

@@ -271,6 +271,38 @@ def ob_data(obj: Any) -> Dict[str, Any]:
     return {}
 
 
+async def call_get_msg(event: AstrMessageEvent, message_id: str) -> Optional[Dict[str, Any]]:
+    """兼容 OneBot/Napcat 的 get_msg 参数差异。
+
+    - OneBot v11 常见参数名：message_id
+    - 部分实现可能使用：id
+    """
+    if not (isinstance(message_id, str) and message_id.strip()):
+        return None
+    if not hasattr(event, "bot") or not hasattr(event.bot, "api") or not hasattr(event.bot.api, "call_action"):
+        return None
+
+    mid = message_id.strip()
+    params_list: List[Dict[str, Any]] = [
+        {"message_id": mid},
+        {"id": mid},
+    ]
+    if mid.isdigit():
+        params_list.insert(1, {"message_id": int(mid)})
+        params_list.append({"id": int(mid)})
+
+    last_err: Optional[Exception] = None
+    for params in params_list:
+        try:
+            return await event.bot.api.call_action("get_msg", **params)
+        except Exception as e:
+            last_err = e
+            continue
+    if last_err:
+        logger.warning(f"zssm_explain: get_msg failed for {mid}: {last_err}")
+    return None
+
+
 async def call_get_forward_msg(event: AstrMessageEvent, forward_id: str) -> Optional[Dict[str, Any]]:
     """兼容 Napcat/OneBot 的 get_forward_msg 参数差异。
 
@@ -569,16 +601,10 @@ async def extract_quoted_payload_with_videos(
         return (text, images, videos, from_forward)
 
     reply_id = get_reply_message_id(reply_comp)
-    platform_name = None
-    try:
-        platform_name = event.get_platform_name()
-    except Exception:
-        platform_name = None
-
-    if reply_id and platform_name == "aiocqhttp" and hasattr(event, "bot"):
+    if reply_id:
         try:
-            ret: Dict[str, Any] = await event.bot.api.call_action("get_msg", message_id=reply_id)
-            data = ob_data(ret)
+            ret = await call_get_msg(event, reply_id)
+            data = ob_data(ret or {})
             t2, imgs2, vids2 = extract_from_onebot_message_payload_with_videos(data)
             agg_texts: List[str] = [t2] if t2 else []
             agg_imgs: List[str] = list(imgs2)
