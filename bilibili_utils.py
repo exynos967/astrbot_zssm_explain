@@ -40,11 +40,7 @@ def is_bilibili_url(url: Optional[str]) -> bool:
     host = (parsed.netloc or "").lower()
     if not host:
         return False
-    return (
-        "bilibili.com" in host
-        or "b23.tv" in host
-        or "bili2233.cn" in host
-    )
+    return "bilibili.com" in host or "b23.tv" in host or "bili2233.cn" in host
 
 
 def _bili_av2bv(av: str) -> Optional[str]:
@@ -58,7 +54,7 @@ def _bili_av2bv(av: str) -> Optional[str]:
         return None
     r = list("BV1 0 4 1 7  ")
     for i in range(6):
-        idx = (x // (58 ** i)) % 58
+        idx = (x // (58**i)) % 58
         r[_BILI_AV2BV_S[i]] = _BILI_AV2BV_TABLE[idx]
     return "".join(r).replace(" ", "0")
 
@@ -72,7 +68,9 @@ async def _bili_resolve_b23(url: str) -> Optional[str]:
         full = "https://" + full.lstrip("/")
     if aiohttp is not None:
         try:
-            async with aiohttp.ClientSession(headers={"User-Agent": _BILI_UA}) as session:
+            async with aiohttp.ClientSession(
+                headers={"User-Agent": _BILI_UA}
+            ) as session:
                 async with session.get(full, timeout=15, allow_redirects=True) as resp:
                     return str(resp.url)
         except Exception:
@@ -112,7 +110,9 @@ async def _bili_request_json(url: str) -> Optional[Dict[str, Any]]:
     if aiohttp is not None:
         try:
             timeout = aiohttp.ClientTimeout(total=20)
-            async with aiohttp.ClientSession(timeout=timeout, headers=headers) as session:
+            async with aiohttp.ClientSession(
+                timeout=timeout, headers=headers
+            ) as session:
                 async with session.get(url, allow_redirects=True) as resp:
                     if 200 <= int(resp.status) < 400:
                         try:
@@ -162,7 +162,11 @@ async def resolve_bilibili_video_url(url: str, quality: int = 80) -> Optional[st
 
     view_api = f"https://api.bilibili.com/x/web-interface/view?bvid={bvid}"
     view_data = await _bili_request_json(view_api)
-    if not (isinstance(view_data, dict) and view_data.get("code") == 0 and isinstance(view_data.get("data"), dict)):
+    if not (
+        isinstance(view_data, dict)
+        and view_data.get("code") == 0
+        and isinstance(view_data.get("data"), dict)
+    ):
         return None
     info = view_data["data"]
     aid = info.get("aid")
@@ -188,7 +192,9 @@ async def resolve_bilibili_video_url(url: str, quality: int = 80) -> Optional[st
     return None
 
 
-async def download_bilibili_video_to_temp(url: str, size_mb_limit: int, quality: int = 80) -> Optional[str]:
+async def download_bilibili_video_to_temp(
+    url: str, size_mb_limit: int, quality: int = 80
+) -> Optional[str]:
     """解析 B 站视频链接并下载到临时文件。
 
     - 先通过 resolve_bilibili_video_url 获取真实文件地址；

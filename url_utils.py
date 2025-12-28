@@ -21,7 +21,9 @@ def extract_urls_from_text(text: Optional[str]) -> List[str]:
     """从文本中提取 URL 列表，保持顺序去重。"""
     if not isinstance(text, str) or not text:
         return []
-    url_pattern = re.compile(r"(https?://[\w\-._~:/?#\[\]@!$&'()*+,;=%]+)", re.IGNORECASE)
+    url_pattern = re.compile(
+        r"(https?://[\w\-._~:/?#\[\]@!$&'()*+,;=%]+)", re.IGNORECASE
+    )
     urls = [m.group(1) for m in url_pattern.finditer(text)]
     seen = set()
     uniq: List[str] = []
@@ -91,7 +93,9 @@ def extract_first_img_src(html: str) -> Optional[str]:
     return None
 
 
-async def fetch_html(url: str, timeout_sec: int, last_fetch_info: Dict[str, Any]) -> Optional[str]:
+async def fetch_html(
+    url: str, timeout_sec: int, last_fetch_info: Dict[str, Any]
+) -> Optional[str]:
     """获取网页 HTML 文本并记录 Cloudflare 相关信息。"""
 
     def _mark(
@@ -103,11 +107,19 @@ async def fetch_html(url: str, timeout_sec: int, last_fetch_info: Dict[str, Any]
     ):
         headers = headers or {}
         server = str(headers.get("server", "")).lower()
-        cf_header = any(h.lower().startswith("cf-") for h in headers.keys()) if headers else False
+        cf_header = (
+            any(h.lower().startswith("cf-") for h in headers.keys())
+            if headers
+            else False
+        )
         text_has_cf = False
         if isinstance(text_hint, str):
             tl = text_hint.lower()
-            if "cloudflare" in tl or "attention required" in tl or "enable javascript and cookies" in tl:
+            if (
+                "cloudflare" in tl
+                or "attention required" in tl
+                or "enable javascript and cookies" in tl
+            ):
                 text_has_cf = True
         is_cf = ("cloudflare" in server) or cf_header or text_has_cf
         last_fetch_info.clear()
@@ -126,20 +138,31 @@ async def fetch_html(url: str, timeout_sec: int, last_fetch_info: Dict[str, Any]
             return None
         try:
             async with aiohttp.ClientSession(
-                headers={"User-Agent": "AstrBot-zssm/1.0 (+https://github.com/xiaoxi68/astrbot_zssm_explain)"}
+                headers={
+                    "User-Agent": "AstrBot-zssm/1.0 (+https://github.com/xiaoxi68/astrbot_zssm_explain)"
+                }
             ) as session:
-                async with session.get(url, timeout=timeout_sec, allow_redirects=True) as resp:
+                async with session.get(
+                    url, timeout=timeout_sec, allow_redirects=True
+                ) as resp:
                     status = int(resp.status)
                     hdrs = {k: v for k, v in resp.headers.items()}
                     if 200 <= status < 400:
                         text = await resp.text()
-                        _mark(status=status, headers=hdrs, text_hint=text[:512], via="aiohttp")
+                        _mark(
+                            status=status,
+                            headers=hdrs,
+                            text_hint=text[:512],
+                            via="aiohttp",
+                        )
                         return text
                     _mark(status=status, headers=hdrs, text_hint=None, via="aiohttp")
                     return None
         except Exception as e:  # pragma: no cover - 网络环境相关
             logger.warning(f"zssm_explain: aiohttp fetch failed: {e}")
-            _mark(status=None, headers=None, text_hint=None, via="aiohttp", error=str(e))
+            _mark(
+                status=None, headers=None, text_hint=None, via="aiohttp", error=str(e)
+            )
             return None
 
     async def _urllib_fetch() -> Optional[str]:
@@ -192,7 +215,13 @@ async def fetch_html(url: str, timeout_sec: int, last_fetch_info: Dict[str, Any]
                 logger.warning(f"zssm_explain: urllib fetch failed: {e}")
                 return None
             except Exception as e:  # pragma: no cover
-                _mark(status=None, headers=None, text_hint=None, via="urllib", error=str(e))
+                _mark(
+                    status=None,
+                    headers=None,
+                    text_hint=None,
+                    via="urllib",
+                    error=str(e),
+                )
                 logger.warning(f"zssm_explain: urllib fetch failed: {e}")
                 return None
 
@@ -205,30 +234,42 @@ async def fetch_html(url: str, timeout_sec: int, last_fetch_info: Dict[str, Any]
     return await _urllib_fetch()
 
 
-async def fetch_pdf_bytes(url: str, timeout_sec: int, max_bytes: int) -> Optional[bytes]:
+async def fetch_pdf_bytes(
+    url: str, timeout_sec: int, max_bytes: int
+) -> Optional[bytes]:
     """抓取 PDF 二进制内容（做体积限制），用于 URL 场景的 PDF 摘要。"""
     if not (isinstance(url, str) and url.strip()):
         return None
     timeout_sec = max(2, int(timeout_sec))
     max_bytes = max(1, int(max_bytes))
-    headers = {"User-Agent": "AstrBot-zssm/1.0 (+https://github.com/xiaoxi68/astrbot_zssm_explain)"}
+    headers = {
+        "User-Agent": "AstrBot-zssm/1.0 (+https://github.com/xiaoxi68/astrbot_zssm_explain)"
+    }
 
     async def _aiohttp_fetch() -> Optional[bytes]:
         if aiohttp is None:
             return None
         try:
             async with aiohttp.ClientSession(headers=headers) as session:
-                async with session.get(url, timeout=timeout_sec, allow_redirects=True) as resp:
+                async with session.get(
+                    url, timeout=timeout_sec, allow_redirects=True
+                ) as resp:
                     status = int(resp.status)
                     if not (200 <= status < 400):
                         return None
                     cl = resp.headers.get("Content-Length")
                     if cl and cl.isdigit() and int(cl) > max_bytes:
-                        logger.warning("zssm_explain: pdf over size limit when fetching url=%s", url)
+                        logger.warning(
+                            "zssm_explain: pdf over size limit when fetching url=%s",
+                            url,
+                        )
                         return None
                     data = await resp.content.read(max_bytes + 1)
                     if len(data) > max_bytes:
-                        logger.warning("zssm_explain: pdf over size limit when fetching url=%s", url)
+                        logger.warning(
+                            "zssm_explain: pdf over size limit when fetching url=%s",
+                            url,
+                        )
                         return None
                     return data
         except Exception as e:
@@ -258,7 +299,10 @@ async def fetch_pdf_bytes(url: str, timeout_sec: int, max_bytes: int) -> Optiona
                     chunks.append(chunk)
                     remaining -= len(chunk)
                     if remaining <= 0:
-                        logger.warning("zssm_explain: pdf over size limit in urllib fetch url=%s", url)
+                        logger.warning(
+                            "zssm_explain: pdf over size limit in urllib fetch url=%s",
+                            url,
+                        )
                         return None
                 return b"".join(chunks)
         except urllib.error.HTTPError as e:
@@ -327,7 +371,11 @@ async def prepare_url_prompt(
         ext = ""
 
     if ext == ".pdf":
-        max_bytes = int(file_preview_max_bytes) if isinstance(file_preview_max_bytes, int) and file_preview_max_bytes > 0 else 2 * 1024 * 1024
+        max_bytes = (
+            int(file_preview_max_bytes)
+            if isinstance(file_preview_max_bytes, int) and file_preview_max_bytes > 0
+            else 2 * 1024 * 1024
+        )
         pdf_bytes = await fetch_pdf_bytes(url, timeout_sec, max_bytes)
         if pdf_bytes:
             text = pdf_bytes_to_markdown(pdf_bytes)
@@ -344,14 +392,18 @@ async def prepare_url_prompt(
     # 2) 常规 HTML 场景
     html = await fetch_html(url, timeout_sec, last_fetch_info)
     if html:
-        user_prompt, _title = build_url_user_prompt(url, html, max_chars, user_prompt_template)
+        user_prompt, _title = build_url_user_prompt(
+            url, html, max_chars, user_prompt_template
+        )
         return (user_prompt, None, [])
 
     # 3) Cloudflare 截图降级
     info = last_fetch_info or {}
     is_cf = bool(info.get("cloudflare"))
     if is_cf and cf_screenshot_enable:
-        screenshot_url = build_cf_screenshot_url(url, int(cf_screenshot_width), int(cf_screenshot_height))
+        screenshot_url = build_cf_screenshot_url(
+            url, int(cf_screenshot_width), int(cf_screenshot_height)
+        )
         if screenshot_url:
             logger.warning(
                 "zssm_explain: Cloudflare detected for %s (status=%s, via=%s); fallback to urlscan screenshot",
@@ -365,7 +417,9 @@ async def prepare_url_prompt(
                     last_fetch_info["cf_screenshot_ready"] = False
                 except Exception:
                     pass
-                logger.warning("zssm_explain: urlscan screenshot still unavailable, aborting image fallback")
+                logger.warning(
+                    "zssm_explain: urlscan screenshot still unavailable, aborting image fallback"
+                )
                 return None
             try:
                 last_fetch_info["used_cf_screenshot"] = True
@@ -375,11 +429,15 @@ async def prepare_url_prompt(
 
             final_image_url = await resolve_liveshot_image_url(screenshot_url)
             if not final_image_url:
-                logger.warning("zssm_explain: failed to resolve liveshot image from html response")
+                logger.warning(
+                    "zssm_explain: failed to resolve liveshot image from html response"
+                )
                 return None
             local_image_path = await download_image_to_temp(final_image_url)
             if not local_image_path:
-                logger.warning("zssm_explain: failed to download liveshot image to temp file")
+                logger.warning(
+                    "zssm_explain: failed to download liveshot image to temp file"
+                )
                 return None
             cf_prompt = user_prompt_template.format(
                 url=url,
@@ -392,7 +450,9 @@ async def prepare_url_prompt(
     return None
 
 
-def build_url_failure_message(last_fetch_info: Dict[str, Any], cf_screenshot_enable: bool) -> str:
+def build_url_failure_message(
+    last_fetch_info: Dict[str, Any], cf_screenshot_enable: bool
+) -> str:
     info = last_fetch_info or {}
     if info.get("cloudflare"):
         if cf_screenshot_enable:
@@ -413,7 +473,9 @@ async def probe_screenshot_url(url: str, per_request_timeout: int = 6) -> bool:
     if aiohttp is not None:
         try:
             async with aiohttp.ClientSession(headers=headers) as session:
-                async with session.get(url, timeout=per_request_timeout, allow_redirects=True) as resp:
+                async with session.get(
+                    url, timeout=per_request_timeout, allow_redirects=True
+                ) as resp:
                     if 200 <= int(resp.status) < 400:
                         await resp.content.readexactly(1)
                         return True
@@ -459,7 +521,9 @@ async def wait_cf_screenshot_ready(
                 pass
             return True
         if loop.time() >= deadline:
-            logger.warning("zssm_explain: urlscan screenshot not ready after %s attempts", attempt)
+            logger.warning(
+                "zssm_explain: urlscan screenshot not ready after %s attempts", attempt
+            )
             break
         await asyncio.sleep(interval_sec)
     return False
@@ -478,7 +542,9 @@ async def download_image_to_temp(url: str, timeout_sec: int = 15) -> Optional[st
         if aiohttp is not None:
             try:
                 async with aiohttp.ClientSession(headers=headers) as session:
-                    async with session.get(url, timeout=timeout_sec, allow_redirects=True) as resp:
+                    async with session.get(
+                        url, timeout=timeout_sec, allow_redirects=True
+                    ) as resp:
                         if 200 <= int(resp.status) < 400:
                             data = await resp.read()
                             return data, resp.headers.get("Content-Type")
@@ -535,7 +601,9 @@ async def resolve_liveshot_image_url(url: str, timeout_sec: int = 15) -> Optiona
         if aiohttp is not None:
             try:
                 async with aiohttp.ClientSession(headers=headers) as session:
-                    async with session.get(url, timeout=timeout_sec, allow_redirects=True) as resp:
+                    async with session.get(
+                        url, timeout=timeout_sec, allow_redirects=True
+                    ) as resp:
                         if 200 <= int(resp.status) < 400:
                             data = await resp.read()
                             return data, resp.headers.get("Content-Type")

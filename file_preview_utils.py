@@ -218,7 +218,11 @@ async def extract_file_preview_from_reply(
     try:
         chain = event.get_messages()
     except Exception:
-        chain = getattr(event.message_obj, "message", []) if hasattr(event, "message_obj") else []
+        chain = (
+            getattr(event.message_obj, "message", [])
+            if hasattr(event, "message_obj")
+            else []
+        )
     reply_comp = None
     for seg in chain:
         try:
@@ -236,7 +240,9 @@ async def extract_file_preview_from_reply(
 
     # 调用 get_msg 获取原始消息，查找其中的 file 段
     try:
-        ret: Dict[str, Any] = await event.bot.api.call_action("get_msg", message_id=reply_id)
+        ret: Dict[str, Any] = await event.bot.api.call_action(
+            "get_msg", message_id=reply_id
+        )
     except Exception:
         return None
     data = ob_data(ret) if isinstance(ret, dict) else {}
@@ -265,7 +271,9 @@ async def extract_file_preview_from_reply(
                 try:
                     fwd = await call_get_forward_msg(event, str(fid))
                 except Exception as fe:
-                    logger.warning(f"zssm_explain: get_forward_msg for file preview failed: {fe}")
+                    logger.warning(
+                        f"zssm_explain: get_forward_msg for file preview failed: {fe}"
+                    )
                     continue
                 inner = _find_first_file_in_forward_payload(fwd)
                 if inner is not None:
@@ -385,9 +393,16 @@ async def build_group_file_preview(
                             else:
                                 size_hint = f"{sz / 1024 / 1024:.2f} MB"
                             # 若为非 PDF 文件且配置了最大文件大小，且当前文件超出阈值，则仅返回元信息
-                            if not is_pdf and isinstance(max_size_bytes, int) and max_size_bytes > 0 and sz > max_size_bytes:
+                            if (
+                                not is_pdf
+                                and isinstance(max_size_bytes, int)
+                                and max_size_bytes > 0
+                                and sz > max_size_bytes
+                            ):
                                 meta_lines.append(f"大小: {size_hint}")
-                                meta_lines.append("（文件体积较大，已跳过内容预览，仅展示元信息）")
+                                meta_lines.append(
+                                    "（文件体积较大，已跳过内容预览，仅展示元信息）"
+                                )
                                 return "\n".join(meta_lines)
                     # PDF：尝试使用 PyPDF2 将内容转换为 Markdown 文本
                     if is_pdf and PyPDF2 is not None:
@@ -406,21 +421,29 @@ async def build_group_file_preview(
                             pdf_bytes = buf.getvalue()
                             text = pdf_bytes_to_markdown(pdf_bytes)
                         except Exception as e:
-                            logger.warning(f"zssm_explain: pdf text extract failed: {e}")
+                            logger.warning(
+                                f"zssm_explain: pdf text extract failed: {e}"
+                            )
                             text = ""
                         if text:
                             # 对于 PDF，按提取出的 Markdown 文本大小进行限制，而非 PDF 文件体积
                             if isinstance(max_size_bytes, int) and max_size_bytes > 0:
                                 try:
-                                    txt_bytes = len(text.encode("utf-8", errors="ignore"))
+                                    txt_bytes = len(
+                                        text.encode("utf-8", errors="ignore")
+                                    )
                                 except Exception:
                                     txt_bytes = len(text)
                                 if txt_bytes > max_size_bytes:
                                     if size_hint:
                                         meta_lines.append(f"大小: {size_hint}")
-                                    meta_lines.append("（PDF 文本内容较长，已跳过内容预览，仅展示元信息）")
+                                    meta_lines.append(
+                                        "（PDF 文本内容较长，已跳过内容预览，仅展示元信息）"
+                                    )
                                     return "\n".join(meta_lines)
-                            snippet = text if len(text) <= 400 else (text[:400] + " ...")
+                            snippet = (
+                                text if len(text) <= 400 else (text[:400] + " ...")
+                            )
                     else:
                         # 纯文本类文件：读取前 4KB 作为预览
                         max_bytes = 4096
@@ -431,7 +454,9 @@ async def build_group_file_preview(
                             text = ""
                         text = text.strip()
                         if text:
-                            snippet = text if len(text) <= 400 else (text[:400] + " ...")
+                            snippet = (
+                                text if len(text) <= 400 else (text[:400] + " ...")
+                            )
     except Exception as e:
         logger.warning(f"zssm_explain: preview group file content failed: {e}")
 
