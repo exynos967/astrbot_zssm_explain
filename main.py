@@ -813,29 +813,39 @@ class ZssmExplain(Star):
             if cand and cand not in seen:
                 seen.add(cand)
                 resolved.append(cand)
-
-        unresolved: List[str] = []
-
+        
+        resolve_candidates: List[str] = []
         for img in images:
             if not isinstance(img, str) or not img:
                 continue
-
             direct = _norm(img)
             if direct:
                 _add(direct)
-                continue
+            else:
+                resolve_candidates.append(img)
 
-            # 尝试 Napcat/OneBot API 解析（file_id -> url/file/base64）
-            try:
-                r = await napcat_resolve_file_url(event, img)
-            except Exception:
-                r = None
-            rr = _norm(r) if r else None
-            if rr:
-                _add(rr)
-                continue
+        unresolved: List[str] = []
+        if resolve_candidates:
+            sem = asyncio.Semaphore(6)
 
-            unresolved.append(img)
+            async def _resolve_one(fid: str) -> Optional[str]:
+                async with sem:
+                    try:
+                        return await napcat_resolve_file_url(event, fid)
+                    except Exception:
+                        return None
+
+            tasks = [_resolve_one(fid) for fid in resolve_candidates]
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+            for fid, res in zip(resolve_candidates, results):
+                if isinstance(res, Exception) or not isinstance(res, str) or not res:
+                    unresolved.append(fid)
+                    continue
+                rr = _norm(res)
+                if rr:
+                    _add(rr)
+                else:
+                    unresolved.append(fid)
 
         # 兜底：部分 OneBot 实现 event.get_messages() 不带 url，尝试 get_msg 回查当前消息拿到 url
         if unresolved and hasattr(event, "message_obj"):

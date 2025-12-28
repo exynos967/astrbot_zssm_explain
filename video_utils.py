@@ -23,6 +23,26 @@ import astrbot.api.message_components as Comp
 from .message_utils import ob_data
 
 
+def _safe_subprocess_run(cmd: List[str]) -> subprocess.CompletedProcess:
+    """安全执行子进程调用。
+
+    - 强制使用参数列表（非 shell 字符串），并显式设置 shell=False
+    - 丢弃 stdin，避免外部程序等待交互输入导致阻塞
+    """
+    if not isinstance(cmd, list) or not cmd:
+        raise ValueError("cmd must be a non-empty list")
+    if not all(isinstance(x, str) for x in cmd):
+        raise TypeError("cmd items must be str")
+    return subprocess.run(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        stdin=subprocess.DEVNULL,
+        check=False,
+        shell=False,
+    )
+
+
 def extract_videos_from_chain(chain: List[object]) -> List[str]:
     """从消息链中递归提取视频相关 URL / 路径。"""
     videos: List[str] = []
@@ -464,9 +484,7 @@ async def sample_frames_with_ffmpeg(
     loop = asyncio.get_running_loop()
 
     def _run():
-        return subprocess.run(
-            cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False
-        )
+        return _safe_subprocess_run(cmd)
 
     res = await loop.run_in_executor(None, _run)
     if res.returncode != 0:
@@ -534,9 +552,7 @@ async def sample_frames_equidistant(
             ]
 
             def _run_one():
-                return subprocess.run(
-                    cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False
-                )
+                return _safe_subprocess_run(cmd)
 
             res = await loop.run_in_executor(None, _run_one)
             if res.returncode == 0 and os.path.exists(out_path):
@@ -579,9 +595,7 @@ async def extract_audio_wav(ffmpeg_path: str, video_path: str) -> Optional[str]:
     loop = asyncio.get_running_loop()
 
     def _run():
-        return subprocess.run(
-            cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False
-        )
+        return _safe_subprocess_run(cmd)
 
     res = await loop.run_in_executor(None, _run)
     if res.returncode != 0:
@@ -720,9 +734,7 @@ def probe_duration_sec(ffprobe_path: Optional[str], video_path: str) -> Optional
             "json",
             video_path,
         ]
-        res1 = subprocess.run(
-            cmd1, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False
-        )
+        res1 = _safe_subprocess_run(cmd1)
         if res1.returncode == 0:
             try:
                 data1 = json.loads(res1.stdout.decode("utf-8", errors="ignore") or "{}")
@@ -751,9 +763,7 @@ def probe_duration_sec(ffprobe_path: Optional[str], video_path: str) -> Optional
             "json",
             video_path,
         ]
-        res2 = subprocess.run(
-            cmd2, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False
-        )
+        res2 = _safe_subprocess_run(cmd2)
         if res2.returncode == 0:
             try:
                 data2 = json.loads(res2.stdout.decode("utf-8", errors="ignore") or "{}")

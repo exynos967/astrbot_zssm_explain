@@ -24,7 +24,12 @@ from astrbot.api import logger
 from astrbot.api.event import AstrMessageEvent
 import astrbot.api.message_components as Comp
 
-from .message_utils import get_reply_message_id, ob_data, call_get_forward_msg
+from .message_utils import (
+    get_reply_message_id,
+    ob_data,
+    call_get_forward_msg,
+    call_get_msg,
+)
 
 
 def build_text_exts_from_config(raw: str, default_exts: Iterable[str]) -> Set[str]:
@@ -240,12 +245,10 @@ async def extract_file_preview_from_reply(
 
     # 调用 get_msg 获取原始消息，查找其中的 file 段
     try:
-        ret: Dict[str, Any] = await event.bot.api.call_action(
-            "get_msg", message_id=reply_id
-        )
+        ret = await call_get_msg(event, reply_id)
     except Exception:
         return None
-    data = ob_data(ret) if isinstance(ret, dict) else {}
+    data = ob_data(ret or {}) if isinstance(ret, dict) else {}
     if not isinstance(data, dict):
         return None
     msg_list = data.get("message") or data.get("messages")
