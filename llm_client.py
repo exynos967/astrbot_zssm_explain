@@ -34,16 +34,37 @@ class LLMClient:
 
     @staticmethod
     def filter_supported_images(images: List[str]) -> List[str]:
-        """只保留看起来可被 LLM 读取的图片：以 http(s) 开头或本地存在的绝对路径。"""
+        """只保留看起来可被 LLM 读取的图片引用：
+
+        - http(s) 链接
+        - base64://... 或 data:image/...;base64,...
+        - file://...（转换为本地路径）
+        - 本地路径（绝对/相对，存在则通过）
+        """
         ok: List[str] = []
         for x in images:
             try:
                 if isinstance(x, str) and x:
                     lx = x.lower()
-                    if lx.startswith("http://") or lx.startswith("https://"):
+                    if lx.startswith(("http://", "https://")):
                         ok.append(x)
-                    elif os.path.isabs(x) and os.path.exists(x):
+                    # OneBot 常见：base64://... 或 data:image/...;base64,...
+                    elif lx.startswith("base64://") or lx.startswith("data:image/"):
                         ok.append(x)
+                    # OneBot 常见：file://...
+                    elif lx.startswith("file://"):
+                        try:
+                            fp = x[7:]
+                            # Windows: file:///C:/xxx
+                            if fp.startswith("/") and len(fp) > 3 and fp[2] == ":":
+                                fp = fp[1:]
+                            if fp and os.path.exists(fp):
+                                ok.append(os.path.abspath(fp))
+                        except Exception:
+                            pass
+                    # 本地路径：绝对/相对都接受（存在则通过）
+                    elif os.path.exists(x):
+                        ok.append(os.path.abspath(x))
             except Exception:
                 pass
         return ok
@@ -55,7 +76,9 @@ class LLMClient:
             mods = getattr(provider, "modalities", None)
             if isinstance(mods, (list, tuple)):
                 ml = [str(m).lower() for m in mods]
-                if any(k in ml for k in ["image", "vision", "multimodal", "vl", "picture"]):
+                if any(
+                    k in ml for k in ["image", "vision", "multimodal", "vl", "picture"]
+                ):
                     return True
         except (AttributeError, TypeError):
             pass
@@ -64,7 +87,18 @@ class LLMClient:
                 val = getattr(provider, attr, None)
                 text = str(val)
                 lt = text.lower()
-                if any(k in lt for k in ["image", "vision", "multimodal", "vl", "gpt-4o", "gemini", "minicpm-v"]):
+                if any(
+                    k in lt
+                    for k in [
+                        "image",
+                        "vision",
+                        "multimodal",
+                        "vl",
+                        "gpt-4o",
+                        "gemini",
+                        "minicpm-v",
+                    ]
+                ):
                     return True
             except (AttributeError, TypeError, ValueError):
                 pass
@@ -87,7 +121,9 @@ class LLMClient:
         images_present = bool(image_urls)
         if images_present:
             cfg_img = self._get_provider_from_config(image_provider_key)
-            return self.select_vision_provider(session_provider=session_provider, preferred_provider=cfg_img)
+            return self.select_vision_provider(
+                session_provider=session_provider, preferred_provider=cfg_img
+            )
 
         cfg_txt = self._get_provider_from_config(text_provider_key)
         return cfg_txt if cfg_txt is not None else session_provider
@@ -141,7 +177,9 @@ class LLMClient:
         """
         tried = set()
         images_present = bool(image_urls)
-        timeout_sec = self._get_conf_int(LLM_TIMEOUT_SEC_KEY, DEFAULT_LLM_TIMEOUT_SEC, 5, 600)
+        timeout_sec = self._get_conf_int(
+            LLM_TIMEOUT_SEC_KEY, DEFAULT_LLM_TIMEOUT_SEC, 5, 600
+        )
 
         async def _try_call(p: Any) -> Any:
             return await asyncio.wait_for(
@@ -272,7 +310,11 @@ class LLMClient:
         if not s:
             return s
         s = re.sub(r"(?is)<\s*think\s*>[\s\S]*?<\s*/\s*think\s*>", "", s)
-        s = re.sub(r"(?is)```\s*(think|thinking|reasoning|cot|chain[-_ ]?of[-_ ]?thought)[\s\S]*?```", "", s)
+        s = re.sub(
+            r"(?is)```\s*(think|thinking|reasoning|cot|chain[-_ ]?of[-_ ]?thought)[\s\S]*?```",
+            "",
+            s,
+        )
         markers = [
             r"答案[:：]",
             r"结论[:：]",
@@ -287,8 +329,16 @@ class LLMClient:
             if m:
                 s = m.group(1).strip()
                 break
-        s = re.sub(r"(?im)^(思考|推理|分析|计划|步骤|原因|链式推理|思维|思路|推导|内心独白)[:：].*(\n\s*\n|$)", "", s)
-        s = re.sub(r"(?im)^(Reasoning|Thinking|Analysis|Plan|Steps|Rationale|Chain[-_ ]?of[-_ ]?Thought)[:：].*(\n\s*\n|$)", "", s)
+        s = re.sub(
+            r"(?im)^(思考|推理|分析|计划|步骤|原因|链式推理|思维|思路|推导|内心独白)[:：].*(\n\s*\n|$)",
+            "",
+            s,
+        )
+        s = re.sub(
+            r"(?im)^(Reasoning|Thinking|Analysis|Plan|Steps|Rationale|Chain[-_ ]?of[-_ ]?Thought)[:：].*(\n\s*\n|$)",
+            "",
+            s,
+        )
         s = re.sub(r"(?im)^【(思考|分析|推理|思维|计划|步骤)】.*(\n\s*\n|$)", "", s)
         s = re.sub(r"^[#>*\-\s]+", "", s).strip()
         return s or text.strip()

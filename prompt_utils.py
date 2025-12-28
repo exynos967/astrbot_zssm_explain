@@ -43,9 +43,7 @@ DEFAULT_VIDEO_USER_PROMPT = (
 )
 
 # 单帧描述提示词（逐帧多次调用使用）
-DEFAULT_FRAME_CAPTION_PROMPT = (
-    "请根据这张关键帧图片，用一句中文描述画面要点；少于25字。若无法判断，请回答‘未识别’。禁止输出政治有关内容。"
-)
+DEFAULT_FRAME_CAPTION_PROMPT = "请根据这张关键帧图片，用一句中文描述画面要点；少于25字。若无法判断，请回答‘未识别’。禁止输出政治有关内容。"
 
 
 def build_user_prompt(text: Optional[str], images: List[str]) -> str:

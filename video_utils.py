@@ -69,9 +69,19 @@ def extract_videos_from_chain(chain: List[object]) -> List[str]:
                 cand = None
                 if isinstance(u, str) and u and _looks_like_video(u):
                     cand = u
-                elif isinstance(f, str) and f and (_looks_like_video(f) or os.path.isabs(f)):
+                elif (
+                    isinstance(f, str)
+                    and f
+                    and (_looks_like_video(f) or os.path.isabs(f))
+                ):
                     cand = f
-                elif isinstance(n, str) and n and _looks_like_video(n) and isinstance(f, str) and f:
+                elif (
+                    isinstance(n, str)
+                    and n
+                    and _looks_like_video(n)
+                    and isinstance(f, str)
+                    and f
+                ):
                     cand = f
                 if isinstance(cand, str) and cand:
                     videos.append(cand)
@@ -120,7 +130,9 @@ def is_napcat(event: AstrMessageEvent) -> bool:
         return False
 
 
-async def napcat_resolve_file_url(event: AstrMessageEvent, file_id: str) -> Optional[str]:
+async def napcat_resolve_file_url(
+    event: AstrMessageEvent, file_id: str
+) -> Optional[str]:
     """使用 Napcat 接口将文件/视频的 file_id 解析为可下载 URL 或本地路径。
 
     说明：
@@ -151,7 +163,21 @@ async def napcat_resolve_file_url(event: AstrMessageEvent, file_id: str) -> Opti
     def _stem_if_needed(s: str) -> Optional[str]:
         try:
             base, ext = os.path.splitext(s)
-            if ext and ext.lower() in (".mp4", ".mov", ".m4v", ".avi", ".webm", ".mkv", ".flv", ".wmv", ".ts", ".mpeg", ".mpg", ".3gp", ".gif"):
+            if ext and ext.lower() in (
+                ".mp4",
+                ".mov",
+                ".m4v",
+                ".avi",
+                ".webm",
+                ".mkv",
+                ".flv",
+                ".wmv",
+                ".ts",
+                ".mpeg",
+                ".mpg",
+                ".3gp",
+                ".gif",
+            ):
                 if base and base != s:
                     return base
         except Exception:
@@ -178,7 +204,12 @@ async def napcat_resolve_file_url(event: AstrMessageEvent, file_id: str) -> Opti
     # 群文件接口：仅在能拿到群号时尝试
     if group_id_param:
         for fid in candidates:
-            actions.append({"action": "get_group_file_url", "params": {"group_id": group_id_param, "file_id": fid}})
+            actions.append(
+                {
+                    "action": "get_group_file_url",
+                    "params": {"group_id": group_id_param, "file_id": fid},
+                }
+            )
     for fid in candidates:
         actions.append({"action": "get_private_file_url", "params": {"file_id": fid}})
 
@@ -194,29 +225,74 @@ async def napcat_resolve_file_url(event: AstrMessageEvent, file_id: str) -> Opti
                 return url
             # get_file/get_image/get_record 等可能返回本地路径 file
             f = data.get("file") if isinstance(data, dict) else None
-            if isinstance(f, str) and f and os.path.isabs(f) and os.path.exists(f):
-                logger.info("zssm_explain: napcat %s ok, file=%s", action, f[:80])
-                return f
+            if isinstance(f, str) and f:
+                lf = f.lower()
+                # OneBot 常见：base64://... 或 data:image/...;base64,...
+                if lf.startswith("base64://") or lf.startswith("data:image/"):
+                    logger.info(
+                        "zssm_explain: napcat %s ok, base64(%d)", action, len(f)
+                    )
+                    return f
+                # OneBot 常见：file://...
+                if lf.startswith("file://"):
+                    try:
+                        fp = f[7:]
+                        # Windows: file:///C:/xxx
+                        if fp.startswith("/") and len(fp) > 3 and fp[2] == ":":
+                            fp = fp[1:]
+                        if fp and os.path.exists(fp):
+                            fp = os.path.abspath(fp)
+                            logger.info(
+                                "zssm_explain: napcat %s ok, file=%s", action, fp[:80]
+                            )
+                            return fp
+                    except Exception:
+                        pass
+                # 绝对路径或相对路径（存在则提升为绝对路径）
+                try:
+                    if os.path.isabs(f) and os.path.exists(f):
+                        logger.info(
+                            "zssm_explain: napcat %s ok, file=%s", action, f[:80]
+                        )
+                        return f
+                    if os.path.exists(f):
+                        fp = os.path.abspath(f)
+                        logger.info(
+                            "zssm_explain: napcat %s ok, file=%s", action, fp[:80]
+                        )
+                        return fp
+                except Exception:
+                    pass
             logger.debug(
                 "zssm_explain: napcat %s returned no url/file (file_id=%s params=%s)",
                 action,
                 str(file_id)[:64],
-                {k: str(v)[:64] for k, v in (params.items() if isinstance(params, dict) else [])},
+                {
+                    k: str(v)[:64]
+                    for k, v in (params.items() if isinstance(params, dict) else [])
+                },
             )
         except Exception as e:
             logger.debug(
                 "zssm_explain: napcat %s failed (file_id=%s params=%s): %s",
                 action,
                 str(file_id)[:64],
-                {k: str(v)[:64] for k, v in (params.items() if isinstance(params, dict) else [])},
+                {
+                    k: str(v)[:64]
+                    for k, v in (params.items() if isinstance(params, dict) else [])
+                },
                 e,
             )
             continue
-    logger.warning("zssm_explain: napcat resolve video/file failed (file_id=%s)", str(file_id)[:64])
+    logger.warning(
+        "zssm_explain: napcat resolve video/file failed (file_id=%s)", str(file_id)[:64]
+    )
     return None
 
 
-def extract_videos_from_onebot_message_payload(payload: Any, prefer_file_id: bool = False) -> List[str]:
+def extract_videos_from_onebot_message_payload(
+    payload: Any, prefer_file_id: bool = False
+) -> List[str]:
     """从 OneBot/Napcat get_msg/get_forward_msg 返回的 payload 中提取视频 URL/路径。
 
     - 默认行为：优先使用 url 字段，回退 file 字段（兼容通用 OneBot 实现）。
@@ -226,7 +302,12 @@ def extract_videos_from_onebot_message_payload(payload: Any, prefer_file_id: boo
     videos: List[str] = []
     data = ob_data(payload) if isinstance(payload, dict) else {}
     if isinstance(data, dict):
-        candidates = data.get("message") or data.get("messages") or data.get("nodes") or data.get("nodeList")
+        candidates = (
+            data.get("message")
+            or data.get("messages")
+            or data.get("nodes")
+            or data.get("nodeList")
+        )
         if isinstance(candidates, list):
             for seg in candidates:
                 try:
@@ -246,7 +327,10 @@ def extract_videos_from_onebot_message_payload(payload: Any, prefer_file_id: boo
                                     name = d.get("name") or d.get("filename")
 
                                     def _looks_like_video(name_or_url: str) -> bool:
-                                        if not isinstance(name_or_url, str) or not name_or_url:
+                                        if (
+                                            not isinstance(name_or_url, str)
+                                            or not name_or_url
+                                        ):
                                             return False
                                         s = name_or_url.lower()
                                         return any(
@@ -268,14 +352,25 @@ def extract_videos_from_onebot_message_payload(payload: Any, prefer_file_id: boo
                                             )
                                         )
 
-                                    if isinstance(url, str) and url and _looks_like_video(url):
+                                    if (
+                                        isinstance(url, str)
+                                        and url
+                                        and _looks_like_video(url)
+                                    ):
                                         videos.append(url)
-                                    elif isinstance(name, str) and _looks_like_video(name) and isinstance(url, str) and url:
+                                    elif (
+                                        isinstance(name, str)
+                                        and _looks_like_video(name)
+                                        and isinstance(url, str)
+                                        and url
+                                    ):
                                         videos.append(url)
                         else:
                             content = seg.get("content") or seg.get("message")
                             if isinstance(content, list):
-                                inner = extract_videos_from_onebot_message_payload({"message": content}, prefer_file_id=prefer_file_id)
+                                inner = extract_videos_from_onebot_message_payload(
+                                    {"message": content}, prefer_file_id=prefer_file_id
+                                )
                                 videos.extend(inner)
                 except Exception:
                     continue
@@ -300,7 +395,9 @@ def extract_videos_from_onebot_forward_payload(payload: Any) -> List[str]:
                     if isinstance(node, dict):
                         content = node.get("content") or node.get("message")
                     if isinstance(content, list):
-                        inner = extract_videos_from_onebot_message_payload({"message": content})
+                        inner = extract_videos_from_onebot_message_payload(
+                            {"message": content}
+                        )
                         if inner:
                             videos.extend(inner)
                 except Exception:
@@ -367,7 +464,9 @@ async def sample_frames_with_ffmpeg(
     loop = asyncio.get_running_loop()
 
     def _run():
-        return subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
+        return subprocess.run(
+            cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False
+        )
 
     res = await loop.run_in_executor(None, _run)
     if res.returncode != 0:
@@ -375,7 +474,9 @@ async def sample_frames_with_ffmpeg(
             shutil.rmtree(out_dir, ignore_errors=True)
         except Exception:
             pass
-        logger.error("zssm_explain: ffmpeg fps-sampler failed (code=%s)", res.returncode)
+        logger.error(
+            "zssm_explain: ffmpeg fps-sampler failed (code=%s)", res.returncode
+        )
         raise RuntimeError("ffmpeg sample frames failed")
 
     frames: List[str] = []
@@ -433,7 +534,9 @@ async def sample_frames_equidistant(
             ]
 
             def _run_one():
-                return subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
+                return subprocess.run(
+                    cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False
+                )
 
             res = await loop.run_in_executor(None, _run_one)
             if res.returncode == 0 and os.path.exists(out_path):
@@ -476,7 +579,9 @@ async def extract_audio_wav(ffmpeg_path: str, video_path: str) -> Optional[str]:
     loop = asyncio.get_running_loop()
 
     def _run():
-        return subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
+        return subprocess.run(
+            cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False
+        )
 
     res = await loop.run_in_executor(None, _run)
     if res.returncode != 0:
@@ -488,7 +593,9 @@ async def extract_audio_wav(ffmpeg_path: str, video_path: str) -> Optional[str]:
     return out_path if os.path.exists(out_path) else None
 
 
-async def download_video_to_temp(url: str, size_mb_limit: int, headers: Optional[Dict[str, str]] = None) -> Optional[str]:
+async def download_video_to_temp(
+    url: str, size_mb_limit: int, headers: Optional[Dict[str, str]] = None
+) -> Optional[str]:
     """下载视频到临时文件，做大小限制校验。
 
     headers 可选，用于为特定站点（如 B 站）附加 UA/Referer 等。
@@ -503,7 +610,16 @@ async def download_video_to_temp(url: str, size_mb_limit: int, headers: Optional
                 ext = ext[:8]
             if not ext or not re.match(r"^\.[A-Za-z0-9]{1,6}$", ext):
                 lower = base.lower()
-                for cand in (".mp4", ".mov", ".m4v", ".avi", ".webm", ".mkv", ".flv", ".wmv"):
+                for cand in (
+                    ".mp4",
+                    ".mov",
+                    ".m4v",
+                    ".avi",
+                    ".webm",
+                    ".mkv",
+                    ".flv",
+                    ".wmv",
+                ):
                     if lower.endswith(cand):
                         return cand
                 return ".bin"
@@ -594,8 +710,19 @@ def probe_duration_sec(ffprobe_path: Optional[str], video_path: str) -> Optional
         return None
     candidates: List[float] = []
     try:
-        cmd1 = [ffprobe_path, "-v", "error", "-show_entries", "format=duration", "-of", "json", video_path]
-        res1 = subprocess.run(cmd1, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
+        cmd1 = [
+            ffprobe_path,
+            "-v",
+            "error",
+            "-show_entries",
+            "format=duration",
+            "-of",
+            "json",
+            video_path,
+        ]
+        res1 = subprocess.run(
+            cmd1, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False
+        )
         if res1.returncode == 0:
             try:
                 data1 = json.loads(res1.stdout.decode("utf-8", errors="ignore") or "{}")
@@ -624,7 +751,9 @@ def probe_duration_sec(ffprobe_path: Optional[str], video_path: str) -> Optional
             "json",
             video_path,
         ]
-        res2 = subprocess.run(cmd2, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
+        res2 = subprocess.run(
+            cmd2, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False
+        )
         if res2.returncode == 0:
             try:
                 data2 = json.loads(res2.stdout.decode("utf-8", errors="ignore") or "{}")
@@ -645,7 +774,9 @@ def probe_duration_sec(ffprobe_path: Optional[str], video_path: str) -> Optional
                         candidates.append(dur)
                 except Exception:
                     pass
-                fps_txt = stream.get("avg_frame_rate") or stream.get("r_frame_rate") or "0/1"
+                fps_txt = (
+                    stream.get("avg_frame_rate") or stream.get("r_frame_rate") or "0/1"
+                )
                 try:
                     num, den = fps_txt.split("/")
                     fps = float(num) / float(den) if float(den) != 0 else 0.0
@@ -653,7 +784,11 @@ def probe_duration_sec(ffprobe_path: Optional[str], video_path: str) -> Optional
                     fps = 0.0
                 try:
                     nb_frames = stream.get("nb_frames")
-                    nb = int(nb_frames) if nb_frames is not None and str(nb_frames).isdigit() else 0
+                    nb = (
+                        int(nb_frames)
+                        if nb_frames is not None and str(nb_frames).isdigit()
+                        else 0
+                    )
                 except Exception:
                     nb = 0
                 if fps > 0 and nb > 0:
@@ -665,7 +800,9 @@ def probe_duration_sec(ffprobe_path: Optional[str], video_path: str) -> Optional
     if not candidates:
         return None
     c_sorted = sorted(set(candidates))
-    logger.info("zssm_explain: ffprobe duration candidates=%s", [round(x, 3) for x in c_sorted])
+    logger.info(
+        "zssm_explain: ffprobe duration candidates=%s", [round(x, 3) for x in c_sorted]
+    )
     mid = len(c_sorted) // 2
     chosen = c_sorted[mid]
     logger.info("zssm_explain: ffprobe chosen duration=%.3f", chosen)
@@ -718,7 +855,11 @@ async def extract_forward_video_keyframes(
         downloaded_tmp = False
         try:
             resolved_src = src
-            if isinstance(resolved_src, str) and (not is_http_url(resolved_src)) and (not is_abs_file(resolved_src)):
+            if (
+                isinstance(resolved_src, str)
+                and (not is_http_url(resolved_src))
+                and (not is_abs_file(resolved_src))
+            ):
                 try:
                     resolved = await napcat_resolve_file_url(event, resolved_src)
                 except Exception:
@@ -733,10 +874,16 @@ async def extract_forward_video_keyframes(
                         timeout=max(2, int(timeout_sec)),
                     )
                 except Exception as e:
-                    logger.warning("zssm_explain: forward video download timeout/failed: %s", e)
+                    logger.warning(
+                        "zssm_explain: forward video download timeout/failed: %s", e
+                    )
                 if local_path:
                     downloaded_tmp = True
-            elif isinstance(resolved_src, str) and is_abs_file(resolved_src) and os.path.exists(resolved_src):
+            elif (
+                isinstance(resolved_src, str)
+                and is_abs_file(resolved_src)
+                and os.path.exists(resolved_src)
+            ):
                 local_path = resolved_src
 
             if not local_path:
@@ -748,9 +895,13 @@ async def extract_forward_video_keyframes(
 
             try:
                 if isinstance(dur, (int, float)) and dur > 0:
-                    sampled = await sample_frames_equidistant(ffmpeg_path, local_path, float(dur), 1)
+                    sampled = await sample_frames_equidistant(
+                        ffmpeg_path, local_path, float(dur), 1
+                    )
                 else:
-                    sampled = await sample_frames_with_ffmpeg(ffmpeg_path, local_path, max(1, max_sec), 1)
+                    sampled = await sample_frames_with_ffmpeg(
+                        ffmpeg_path, local_path, max(1, max_sec), 1
+                    )
             except Exception:
                 sampled = []
 

@@ -48,12 +48,29 @@ def extract_text_images_videos_from_chain(
                 txt = getattr(seg, "text", None)
                 texts.append(txt if isinstance(txt, str) else str(seg))
             elif isinstance(seg, Comp.Image):
-                f = getattr(seg, "file", None)
-                u = getattr(seg, "url", None)
-                if isinstance(f, str) and f:
-                    images.append(f)
-                elif isinstance(u, str) and u:
-                    images.append(u)
+                # 不同平台/适配器的字段可能不同：尽量收集多个候选（url 优先），后续再做可用性筛选与解析。
+                candidates: List[str] = []
+                for key in ("url", "file", "path", "src", "base64", "data"):
+                    try:
+                        v = getattr(seg, key, None)
+                    except Exception:
+                        v = None
+                    if isinstance(v, str) and v:
+                        candidates.append(v)
+                try:
+                    d = getattr(seg, "data", None)
+                except Exception:
+                    d = None
+                if isinstance(d, dict):
+                    for key in ("url", "file", "path", "src", "base64", "data"):
+                        v = d.get(key)
+                        if isinstance(v, str) and v:
+                            candidates.append(v)
+                seen_local = set()
+                for c in candidates:
+                    if c not in seen_local:
+                        seen_local.add(c)
+                        images.append(c)
             elif hasattr(Comp, "Video") and isinstance(seg, getattr(Comp, "Video")):
                 f = getattr(seg, "file", None)
                 u = getattr(seg, "url", None)
@@ -68,9 +85,19 @@ def extract_text_images_videos_from_chain(
                 cand = None
                 if isinstance(u, str) and u and _looks_like_video(u):
                     cand = u
-                elif isinstance(f, str) and f and (_looks_like_video(f) or os.path.isabs(f)):
+                elif (
+                    isinstance(f, str)
+                    and f
+                    and (_looks_like_video(f) or os.path.isabs(f))
+                ):
                     cand = f
-                elif isinstance(n, str) and n and _looks_like_video(n) and isinstance(f, str) and f:
+                elif (
+                    isinstance(n, str)
+                    and n
+                    and _looks_like_video(n)
+                    and isinstance(f, str)
+                    and f
+                ):
                     cand = f
                 if isinstance(cand, str) and cand:
                     videos.append(cand)
@@ -218,7 +245,9 @@ def _format_json_share(data: Dict[str, Any]) -> str:
     return str(prompt) if prompt else ""
 
 
-def try_extract_from_reply_component(reply_comp: object) -> Tuple[Optional[str], List[str], bool]:
+def try_extract_from_reply_component(
+    reply_comp: object,
+) -> Tuple[Optional[str], List[str], bool]:
     """尽量从 Reply 组件中得到被引用消息的文本与图片。
 
     返回值第三项标记是否检测到其中包含合并转发节点（Forward/Node/Nodes）。"""
@@ -271,7 +300,9 @@ def ob_data(obj: Any) -> Dict[str, Any]:
     return {}
 
 
-async def call_get_msg(event: AstrMessageEvent, message_id: str) -> Optional[Dict[str, Any]]:
+async def call_get_msg(
+    event: AstrMessageEvent, message_id: str
+) -> Optional[Dict[str, Any]]:
     """兼容 OneBot/Napcat 的 get_msg 参数差异。
 
     - OneBot v11 常见参数名：message_id
@@ -279,7 +310,11 @@ async def call_get_msg(event: AstrMessageEvent, message_id: str) -> Optional[Dic
     """
     if not (isinstance(message_id, str) and message_id.strip()):
         return None
-    if not hasattr(event, "bot") or not hasattr(event.bot, "api") or not hasattr(event.bot.api, "call_action"):
+    if (
+        not hasattr(event, "bot")
+        or not hasattr(event.bot, "api")
+        or not hasattr(event.bot.api, "call_action")
+    ):
         return None
 
     mid = message_id.strip()
@@ -303,7 +338,9 @@ async def call_get_msg(event: AstrMessageEvent, message_id: str) -> Optional[Dic
     return None
 
 
-async def call_get_forward_msg(event: AstrMessageEvent, forward_id: str) -> Optional[Dict[str, Any]]:
+async def call_get_forward_msg(
+    event: AstrMessageEvent, forward_id: str
+) -> Optional[Dict[str, Any]]:
     """兼容 Napcat/OneBot 的 get_forward_msg 参数差异。
 
     - Napcat 文档常见参数名：message_id
@@ -341,7 +378,9 @@ def extract_from_onebot_message_payload(payload: Any) -> Tuple[str, List[str]]:
     return (text, images)
 
 
-def extract_from_onebot_message_payload_with_videos(payload: Any) -> Tuple[str, List[str], List[str]]:
+def extract_from_onebot_message_payload_with_videos(
+    payload: Any,
+) -> Tuple[str, List[str], List[str]]:
     """从 OneBot/Napcat get_msg 返回的 payload 中提取文本、图片与视频；识别 forward/nodes 由上层处理。"""
     texts: List[str] = []
     images: List[str] = []
@@ -378,7 +417,9 @@ def extract_from_onebot_message_payload_with_videos(payload: Any) -> Tuple[str, 
                                 if summary:
                                     texts.append(summary)
                             except Exception as e:
-                                logger.warning(f"zssm_explain: parse json segment failed: {e}")
+                                logger.warning(
+                                    f"zssm_explain: parse json segment failed: {e}"
+                                )
                     elif t == "file":
                         # Napcat 文件消息：data.file 为标识，data.name/summary 为展示信息
                         name = d.get("name") or d.get("file") or "未命名文件"
@@ -392,7 +433,11 @@ def extract_from_onebot_message_payload_with_videos(payload: Any) -> Tuple[str, 
                         texts.append("\n".join(parts))
                         # 若文件看起来是视频，也纳入视频候选（用于后续视频解释）
                         if isinstance(file_id, str) and file_id:
-                            if _looks_like_video(str(name)) or _looks_like_video(str(file_id)) or _looks_like_video(str(d.get("url") or "")):
+                            if (
+                                _looks_like_video(str(name))
+                                or _looks_like_video(str(file_id))
+                                or _looks_like_video(str(d.get("url") or ""))
+                            ):
                                 videos.append(file_id)
                     # 对于 forward/nodes，不在此层解析，由上层触发 get_forward_msg 获取节点
                 except Exception as e:
@@ -405,7 +450,9 @@ def extract_from_onebot_message_payload_with_videos(payload: Any) -> Tuple[str, 
         if isinstance(raw, str) and raw:
             texts.append(raw)
             return ("\n".join(texts).strip(), images, videos)
-    logger.warning("zssm_explain: failed to extract text from OneBot payload; fallback to empty text")
+    logger.warning(
+        "zssm_explain: failed to extract text from OneBot payload; fallback to empty text"
+    )
     return ("", images, videos)
 
 
@@ -476,9 +523,7 @@ def _extract_forward_nodes_recursively(
                         continue
                     seg_type = seg.get("type")
                     seg_data = (
-                        seg.get("data", {})
-                        if isinstance(seg.get("data"), dict)
-                        else {}
+                        seg.get("data", {}) if isinstance(seg.get("data"), dict) else {}
                     )
 
                     if seg_type in ("text", "plain"):
@@ -503,7 +548,9 @@ def _extract_forward_nodes_recursively(
                         file_id = seg_data.get("file")
                         name = seg_data.get("name") or seg_data.get("filename") or ""
                         url = seg_data.get("url")
-                        if _looks_like_video(str(name)) or _looks_like_video(str(url or "")):
+                        if _looks_like_video(str(name)) or _looks_like_video(
+                            str(url or "")
+                        ):
                             if isinstance(url, str) and url:
                                 videos.append(url)
                                 node_text_parts.append("[视频]")
@@ -532,7 +579,9 @@ def extract_from_onebot_forward_payload(payload: Any) -> Tuple[str, List[str]]:
     return (text, images)
 
 
-def extract_from_onebot_forward_payload_with_videos(payload: Any) -> Tuple[str, List[str], List[str]]:
+def extract_from_onebot_forward_payload_with_videos(
+    payload: Any,
+) -> Tuple[str, List[str], List[str]]:
     """解析 OneBot get_forward_msg 返回的 messages/nodes 列表，汇总文本、图片与视频。"""
     texts: List[str] = []
     images: List[str] = []
@@ -553,7 +602,9 @@ def extract_from_onebot_forward_payload_with_videos(payload: Any) -> Tuple[str, 
     return ("\n".join([x for x in texts if x]).strip(), images, videos)
 
 
-async def extract_quoted_payload(event: AstrMessageEvent) -> Tuple[Optional[str], List[str], bool]:
+async def extract_quoted_payload(
+    event: AstrMessageEvent,
+) -> Tuple[Optional[str], List[str], bool]:
     """从当前事件中获取被回复消息的文本与图片。
     优先：Reply 携带嵌入消息；回退：OneBot get_msg；失败：(None, [], False)。
 
@@ -562,7 +613,9 @@ async def extract_quoted_payload(event: AstrMessageEvent) -> Tuple[Optional[str]
     - images: 提取到的图片列表
     - from_forward: 是否来源于“合并转发”结构（含 Forward/Node/Nodes 或 get_forward_msg）
     """
-    text, images, _videos, from_forward = await extract_quoted_payload_with_videos(event)
+    text, images, _videos, from_forward = await extract_quoted_payload_with_videos(
+        event
+    )
     return (text, images, from_forward)
 
 
@@ -596,7 +649,9 @@ async def extract_quoted_payload_with_videos(
     if not reply_comp:
         return (None, [], [], False)
 
-    text, images, videos, from_forward = try_extract_from_reply_component_with_videos(reply_comp)
+    text, images, videos, from_forward = try_extract_from_reply_component_with_videos(
+        reply_comp
+    )
     if text or images or videos:
         return (text, images, videos, from_forward)
 
@@ -619,12 +674,20 @@ async def extract_quoted_payload_with_videos(
                         seg_type = seg.get("type")
                         if seg_type in ("forward", "forward_msg", "nodes"):
                             from_forward_ob = True
-                            d = seg.get("data", {}) if isinstance(seg.get("data"), dict) else {}
+                            d = (
+                                seg.get("data", {})
+                                if isinstance(seg.get("data"), dict)
+                                else {}
+                            )
                             fid = d.get("id") or d.get("message_id")
                             if isinstance(fid, (str, int)) and str(fid):
                                 try:
                                     fwd = await call_get_forward_msg(event, str(fid))
-                                    ft, fi, fv = extract_from_onebot_forward_payload_with_videos(fwd or {})
+                                    ft, fi, fv = (
+                                        extract_from_onebot_forward_payload_with_videos(
+                                            fwd or {}
+                                        )
+                                    )
                                     if ft:
                                         agg_texts.append(ft)
                                     if fi:
@@ -632,7 +695,9 @@ async def extract_quoted_payload_with_videos(
                                     if fv:
                                         agg_vids.extend(fv)
                                 except Exception as fe:
-                                    logger.warning(f"zssm_explain: get_forward_msg failed: {fe}")
+                                    logger.warning(
+                                        f"zssm_explain: get_forward_msg failed: {fe}"
+                                    )
                         elif seg_type == "json":
                             try:
                                 d = (
@@ -641,13 +706,23 @@ async def extract_quoted_payload_with_videos(
                                     else {}
                                 )
                                 inner_data_str = d.get("data")
-                                if isinstance(inner_data_str, str) and inner_data_str.strip():
-                                    inner_data_str = inner_data_str.replace("&#44;", ",")
+                                if (
+                                    isinstance(inner_data_str, str)
+                                    and inner_data_str.strip()
+                                ):
+                                    inner_data_str = inner_data_str.replace(
+                                        "&#44;", ","
+                                    )
                                     inner_json = json.loads(inner_data_str)
-                                    if inner_json.get("app") == "com.tencent.multimsg" and inner_json.get(
-                                        "config", {}
-                                    ).get("forward") == 1:
-                                        detail = inner_json.get("meta", {}).get("detail", {}) or {}
+                                    if (
+                                        inner_json.get("app") == "com.tencent.multimsg"
+                                        and inner_json.get("config", {}).get("forward")
+                                        == 1
+                                    ):
+                                        detail = (
+                                            inner_json.get("meta", {}).get("detail", {})
+                                            or {}
+                                        )
                                         news_items = detail.get("news", []) or []
                                         for item in news_items:
                                             if not isinstance(item, dict):
@@ -655,7 +730,9 @@ async def extract_quoted_payload_with_videos(
                                             text_content = item.get("text")
                                             if isinstance(text_content, str):
                                                 clean_text = (
-                                                    text_content.strip().replace("[图片]", "").strip()
+                                                    text_content.strip()
+                                                    .replace("[图片]", "")
+                                                    .strip()
                                                 )
                                                 if clean_text:
                                                     agg_texts.append(clean_text)
@@ -669,6 +746,7 @@ async def extract_quoted_payload_with_videos(
                 pass
             if agg_texts or agg_imgs or agg_vids:
                 logger.info("zssm_explain: fetched origin via get_msg")
+
                 # 去重保持顺序
                 def _uniq(items: List[str]) -> List[str]:
                     uniq: List[str] = []
@@ -688,5 +766,7 @@ async def extract_quoted_payload_with_videos(
         except Exception as e:
             logger.warning(f"zssm_explain: get_msg failed: {e}")
 
-    logger.info("zssm_explain: reply component found but no embedded origin; consider platform API to fetch by id")
+    logger.info(
+        "zssm_explain: reply component found but no embedded origin; consider platform API to fetch by id"
+    )
     return (None, [], [], False)
