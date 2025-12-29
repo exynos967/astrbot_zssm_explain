@@ -317,7 +317,6 @@ async def napcat_resolve_file_url(
                 },
                 e,
             )
-        "zssm_explain: napcat resolve video/file failed (file_id=%s)", str(file_id)[:64]
     logger.warning(
         "zssm_explain: napcat resolve file/url failed (file_id=%s)", str(file_id)[:64]
     )
@@ -565,7 +564,7 @@ async def sample_frames_equidistant(
                 out_path,
             ]
 
-            def _run_one():
+            def _run_one(cmd=cmd):
                 return _safe_subprocess_run(cmd)
 
             res = await loop.run_in_executor(None, _run_one)

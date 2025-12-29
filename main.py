@@ -106,8 +106,8 @@ DEFAULT_FORWARD_VIDEO_MAX_COUNT = 2
 @register(
     "astrbot_zssm_explain",
     "薄暝",
-    "zssm，支持关键词“zssm”（忽略前缀）与“zssm + 内容”直接解释；引用消息（含@）正常处理；支持 QQ 合并转发；未回复仅发 zssm 时提示；默认提示词可在 main.py 顶部修改。",
-    "v3.9.10",
+    "zssm，支持关键词"zssm"（忽略前缀）与"zssm + 内容"直接解释；引用消息（含@）正常处理；支持 QQ 合并转发；未回复仅发 zssm 时提示；默认提示词可在 main.py 顶部修改。",
+    "v3.9.11",
     "https://github.com/xiaoxi68/astrbot_zssm_explain",
 )
 class ZssmExplain(Star):
