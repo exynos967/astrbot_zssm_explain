@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import asyncio
 import os
-import re
 from typing import Any, Callable, List, Optional
 
 
@@ -11,7 +10,7 @@ DEFAULT_LLM_TIMEOUT_SEC = 90
 
 
 class LLMClient:
-    """封装 LLM 调用与回退逻辑（Provider 选择 / 超时 / 输出清洗）。
+    """封装 LLM 调用与回退逻辑（Provider 选择 / 超时 / 输出解析）。
 
     设计目标：
     - main.py 只负责“业务流程编排”，LLM 细节在此模块收敛；
@@ -359,45 +358,3 @@ class LLMClient:
             pass
 
         return "（未解析到可读内容）"
-
-    @staticmethod
-    def sanitize_model_output(text: str) -> str:
-        """去除常见思考/推理内容，仅保留结论性文本（插件侧兜底）。"""
-        if not isinstance(text, str):
-            return ""
-        s = text.strip()
-        if not s:
-            return s
-        s = re.sub(r"(?is)<\s*think\s*>[\s\S]*?<\s*/\s*think\s*>", "", s)
-        s = re.sub(
-            r"(?is)```\s*(think|thinking|reasoning|cot|chain[-_ ]?of[-_ ]?thought)[\s\S]*?```",
-            "",
-            s,
-        )
-        markers = [
-            r"答案[:：]",
-            r"结论[:：]",
-            r"回答[:：]",
-            r"总结[:：]",
-            r"最终答案[:：]?",
-            r"Final Answer[:：]?",
-            r"Result[:：]?",
-        ]
-        for mk in markers:
-            m = re.search(rf"(?is){mk}\s*(.+)$", s)
-            if m:
-                s = m.group(1).strip()
-                break
-        s = re.sub(
-            r"(?im)^(思考|推理|分析|计划|步骤|原因|链式推理|思维|思路|推导|内心独白)[:：].*(\n\s*\n|$)",
-            "",
-            s,
-        )
-        s = re.sub(
-            r"(?im)^(Reasoning|Thinking|Analysis|Plan|Steps|Rationale|Chain[-_ ]?of[-_ ]?Thought)[:：].*(\n\s*\n|$)",
-            "",
-            s,
-        )
-        s = re.sub(r"(?im)^【(思考|分析|推理|思维|计划|步骤)】.*(\n\s*\n|$)", "", s)
-        s = re.sub(r"^[#>*\-\s]+", "", s).strip()
-        return s or text.strip()

@@ -106,8 +106,8 @@ DEFAULT_FORWARD_VIDEO_MAX_COUNT = 2
 @register(
     "astrbot_zssm_explain",
     "薄暝",
-    "zssm，支持关键词"zssm"（忽略前缀）与"zssm + 内容"直接解释；引用消息（含@）正常处理；支持 QQ 合并转发；未回复仅发 zssm 时提示；默认提示词可在 main.py 顶部修改。",
-    "v3.9.11",
+    'zssm，支持关键词"zssm"（忽略前缀）与"zssm + 内容"直接解释；引用消息（含@）正常处理；支持 QQ 合并转发；未回复仅发 zssm 时提示；默认提示词可在 main.py 顶部修改。',
+    "v3.9.12",
     "https://github.com/xiaoxi68/astrbot_zssm_explain",
 )
 class ZssmExplain(Star):
@@ -593,7 +593,6 @@ class ZssmExplain(Star):
                             image_urls=[img],
                         )
                         cap = self._llm.pick_llm_text(resp)
-                        cap = self._llm.sanitize_model_output(cap)
                         if not cap:
                             cap = "未识别"
                         captions.append(cap)
@@ -625,15 +624,6 @@ class ZssmExplain(Star):
                 pass
 
             reply_text = self._llm.pick_llm_text(resp_final)
-            show_reasoning = False
-            try:
-                cfg = self.context.get_config(umo=event.unified_msg_origin) or {}
-                ps = cfg.get("provider_settings", {})
-                show_reasoning = bool(ps.get("display_reasoning_text", False))
-            except Exception:
-                show_reasoning = False
-            if not show_reasoning:
-                reply_text = self._llm.sanitize_model_output(reply_text)
 
             elapsed = None
             try:
@@ -1402,16 +1392,6 @@ class ZssmExplain(Star):
                 reply_text = None
             if not reply_text:
                 reply_text = self._llm.pick_llm_text(llm_resp)
-
-            show_reasoning = False
-            try:
-                cfg = self.context.get_config(umo=event.unified_msg_origin) or {}
-                ps = cfg.get("provider_settings", {})
-                show_reasoning = bool(ps.get("display_reasoning_text", False))
-            except Exception:
-                show_reasoning = False
-            if not show_reasoning:
-                reply_text = self._llm.sanitize_model_output(reply_text)
 
             elapsed = None
             try:
