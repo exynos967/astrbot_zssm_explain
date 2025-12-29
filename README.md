@@ -90,8 +90,7 @@
   - `DEFAULT_SYSTEM_PROMPT`：约束 LLM 输出结构，如「关键词行 + 总结 + **详细阐述**」。  
   - `DEFAULT_TEXT_USER_PROMPT` / `DEFAULT_IMAGE_USER_PROMPT`：分别用于纯文本、图文场景。  
   - `DEFAULT_URL_USER_PROMPT` / `DEFAULT_VIDEO_USER_PROMPT`：用于网页摘要与视频解释。
-- 如需自定义输出格式（例如改为项目管理风格、问答风格），建议直接修改 `prompt_utils.py` 中的常量。
-- 模型「思考/推理」内容的展示/隐藏由 AstrBot 全局配置统一处理，本插件不再额外剔除。
+- 如需自定义输出格式（例如改为项目管理风格、问答风格），建议修改 `prompt_utils.py` 中的常量。
 
 ---
 
