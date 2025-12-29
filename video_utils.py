@@ -25,15 +25,18 @@ from .message_utils import ob_data
 
 def _safe_subprocess_run(cmd: List[str]) -> subprocess.CompletedProcess:
     """安全执行子进程调用。
-
-    - 强制使用参数列表（非 shell 字符串），并显式设置 shell=False
+    安全措施：
+    - 强制使用参数列表（非 shell 字符串），并显式设置 shell=False，避免 shell 注入
+    - 调用前验证 cmd 必须是非空字符串列表
     - 丢弃 stdin，避免外部程序等待交互输入导致阻塞
+    - cmd 参数仅由本插件内部构造，不接受外部用户输入
     """
     if not isinstance(cmd, list) or not cmd:
         raise ValueError("cmd must be a non-empty list")
     if not all(isinstance(x, str) for x in cmd):
         raise TypeError("cmd items must be str")
-    return subprocess.run(
+    # Security: shell=False with validated list args; cmd is constructed internally, not from user input
+    return subprocess.run(  # nosec B603
         cmd,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
