@@ -104,6 +104,23 @@ class LLMClient:
                 pass
         return False
 
+    @staticmethod
+    def _provider_label(provider: Any) -> str:
+        """尽量生成稳定可读的 Provider 标识，用于日志排查。"""
+        if provider is None:
+            return "None"
+        for key in ("provider_id", "id", "name"):
+            try:
+                v = getattr(provider, key, None)
+                if isinstance(v, str) and v.strip():
+                    return v.strip()
+            except Exception:
+                continue
+        try:
+            return provider.__class__.__name__
+        except Exception:
+            return "unknown_provider"
+
     def select_primary_provider(
         self,
         *,
@@ -180,6 +197,25 @@ class LLMClient:
         timeout_sec = self._get_conf_int(
             LLM_TIMEOUT_SEC_KEY, DEFAULT_LLM_TIMEOUT_SEC, 5, 600
         )
+        errors: List[str] = []
+        fail_count = 0
+
+        def _record(p: Any, e: Exception) -> None:
+            nonlocal fail_count
+            fail_count += 1
+            if len(errors) >= 8:
+                return
+            try:
+                label = self._provider_label(p)
+            except Exception:
+                label = "unknown_provider"
+            try:
+                msg = str(e).replace("\n", " ").strip()
+            except Exception:
+                msg = ""
+            if len(msg) > 240:
+                msg = msg[:240] + "..."
+            errors.append(f"{label}: {e.__class__.__name__}: {msg}")
 
         async def _try_call(p: Any) -> Any:
             return await asyncio.wait_for(
@@ -196,16 +232,16 @@ class LLMClient:
             tried.add(id(primary))
             try:
                 return await _try_call(primary)
-            except Exception:
-                pass
+            except Exception as e:
+                _record(primary, e)
 
         if session_provider is not None and id(session_provider) not in tried:
             tried.add(id(session_provider))
             try:
                 if not images_present or self.provider_supports_image(session_provider):
                     return await _try_call(session_provider)
-            except Exception:
-                pass
+            except Exception as e:
+                _record(session_provider, e)
 
         try:
             providers = self._context.get_all_providers()
@@ -225,10 +261,33 @@ class LLMClient:
                         "vision" if images_present else "text",
                     )
                 return resp
-            except Exception:
+            except Exception as e:
+                _record(p, e)
                 continue
 
-        raise RuntimeError("all providers failed for current request")
+        if self._logger is not None:
+            self._logger.error(
+                "zssm_explain: all providers failed (images_present=%s tried=%d fail=%d) errors=%s",
+                images_present,
+                len(tried),
+                fail_count,
+                errors,
+            )
+        sample_errors_str = ""
+        if errors:
+            # Only include a few sample errors in the exception message and truncate to avoid
+            # excessively long error strings.
+            max_samples = 3
+            sample_errors = errors[:max_samples]
+            sample_errors_str = "; ".join(sample_errors)
+            if len(sample_errors_str) > 500:
+                sample_errors_str = sample_errors_str[:500] + "..."
+            if len(errors) > max_samples:
+                sample_errors_str += f" (and {len(errors) - max_samples} more)"
+        raise RuntimeError(
+            "all providers failed for current request"
+            + (f" (sample errors: {sample_errors_str})" if sample_errors_str else "")
+        )
 
     @staticmethod
     def pick_llm_text(llm_resp: object) -> str:

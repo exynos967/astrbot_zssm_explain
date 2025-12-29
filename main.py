@@ -720,8 +720,24 @@ class ZssmExplain(Star):
         m = re.match(r"^[\s/!！。\.、，\-]*zssm(?:\s+(.+))?$", t, re.I)
         if not m:
             return ""
-        content = m.group(1) or ""
-        return content.strip()
+        content = (m.group(1) or "").strip()
+
+        # AstrBot 的 message_outline/日志可能用 “[图片]” 等占位符表示非文本段；这里将其从 inline 内容里剔除，
+        # 避免把占位符当成用户真实输入（图片本身会从 message chain 单独提取）。
+        try:
+            content = re.sub(
+                r"[\[【](图片|image|img|视频|video|语音|record|文件|file)[\]】]",
+                " ",
+                content,
+                flags=re.I,
+            )
+        except Exception:
+            pass
+        try:
+            content = re.sub(r"\s{2,}", " ", content).strip()
+        except Exception:
+            content = content.strip()
+        return content
 
     def _get_inline_content(self, event: AstrMessageEvent) -> str:
         """从消息首个 Plain 文本或整体纯文本中提取 'zssm xxx' 的 xxx 内容。"""
@@ -813,7 +829,7 @@ class ZssmExplain(Star):
             if cand and cand not in seen:
                 seen.add(cand)
                 resolved.append(cand)
-        
+
         resolve_candidates: List[str] = []
         for img in images:
             if not isinstance(img, str) or not img:
@@ -1115,6 +1131,14 @@ class ZssmExplain(Star):
                 if inline_images_raw
                 else []
             )
+            if inline_images_raw and not inline_images:
+                # 部分平台会把图片段转成占位文本（如 "[图片]"），此时如果图片解析失败就不要继续调用 LLM。
+                placeholder = str(inline or "").strip().lower()
+                if placeholder in ("[图片]", "[image]", "[img]") or not placeholder:
+                    return self._ReplyPlan(
+                        message="未能获取到图片（未拿到可访问的链接/本地路径/base64）。请尝试重新发送图片，或查看日志 `zssm_explain: image resolve failed` / `zssm_explain: napcat resolve file/url failed` 获取详细信息。",
+                        cleanup_paths=cleanup_paths,
+                    )
             user_prompt = build_user_prompt(inline, inline_images)
             return self._LLMPlan(
                 user_prompt=user_prompt,
@@ -1227,7 +1251,7 @@ class ZssmExplain(Star):
         if not text and not images:
             if raw_images:
                 return self._ReplyPlan(
-                    message="未能获取到图片（未拿到可访问的链接/本地路径/base64），请尝试重新发送图片或查看日志中的 zssm_explain: image resolve failed 以排查平台/适配器是否能提供图片 URL（OneBot/Napcat 可检查 get_msg/get_image/get_file）。",
+                    message="未能获取到图片（未拿到可访问的链接/本地路径/base64），请尝试重新发送图片，或查看日志 `zssm_explain: image resolve failed` / `zssm_explain: napcat resolve file/url failed` 排查 OneBot/Napcat 是否能返回图片 URL（可检查 get_msg/get_image/get_file）。",
                     stop_event=True,
                     cleanup_paths=cleanup_paths,
                 )

@@ -184,6 +184,7 @@ async def napcat_resolve_file_url(
         try:
             base, ext = os.path.splitext(s)
             if ext and ext.lower() in (
+                # 视频
                 ".mp4",
                 ".mov",
                 ".m4v",
@@ -196,6 +197,14 @@ async def napcat_resolve_file_url(
                 ".mpeg",
                 ".mpg",
                 ".3gp",
+                # 图片（Napcat/OneBot 常见为 md5 + 扩展名，部分接口需要 md5 本体）
+                ".jpg",
+                ".jpeg",
+                ".png",
+                ".webp",
+                ".bmp",
+                ".tif",
+                ".tiff",
                 ".gif",
             ):
                 if base and base != s:
@@ -204,7 +213,7 @@ async def napcat_resolve_file_url(
             pass
         return None
 
-    # 一些 Napcat 场景下 file 值会携带扩展名（形如 hash.mp4），但接口实际需要 hash 本体。
+    # 一些 Napcat 场景下 file 值会携带扩展名（形如 md5.jpg / md5.mp4），但接口实际需要 md5 本体。
     candidates: List[str] = [file_id]
     stem = _stem_if_needed(file_id)
     if isinstance(stem, str) and stem and stem not in candidates:
@@ -238,7 +247,12 @@ async def napcat_resolve_file_url(
         params = item["params"]
         try:
             ret = await event.bot.api.call_action(action, **params)
-            data = ret.get("data") if isinstance(ret, dict) else None
+            data: Optional[Dict[str, Any]]
+            if isinstance(ret, dict):
+                d = ret.get("data")
+                data = d if isinstance(d, dict) else ret
+            else:
+                data = None
             url = data.get("url") if isinstance(data, dict) else None
             if isinstance(url, str) and url:
                 logger.info("zssm_explain: napcat %s ok, url=%s", action, url[:80])
@@ -303,9 +317,9 @@ async def napcat_resolve_file_url(
                 },
                 e,
             )
-            continue
-    logger.warning(
         "zssm_explain: napcat resolve video/file failed (file_id=%s)", str(file_id)[:64]
+    logger.warning(
+        "zssm_explain: napcat resolve file/url failed (file_id=%s)", str(file_id)[:64]
     )
     return None
 
