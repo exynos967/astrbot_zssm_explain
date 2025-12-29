@@ -23,6 +23,29 @@ import astrbot.api.message_components as Comp
 from .message_utils import ob_data
 
 
+def _safe_subprocess_run(cmd: List[str]) -> subprocess.CompletedProcess:
+    """安全执行子进程调用。
+    安全措施：
+    - 强制使用参数列表（非 shell 字符串），并显式设置 shell=False，避免 shell 注入
+    - 调用前验证 cmd 必须是非空字符串列表
+    - 丢弃 stdin，避免外部程序等待交互输入导致阻塞
+    - cmd 参数仅由本插件内部构造，不接受外部用户输入
+    """
+    if not isinstance(cmd, list) or not cmd:
+        raise ValueError("cmd must be a non-empty list")
+    if not all(isinstance(x, str) for x in cmd):
+        raise TypeError("cmd items must be str")
+    # Security: shell=False with validated list args; cmd is constructed internally, not from user input
+    return subprocess.run(  # nosec B603
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        stdin=subprocess.DEVNULL,
+        check=False,
+        shell=False,
+    )
+
+
 def extract_videos_from_chain(chain: List[object]) -> List[str]:
     """从消息链中递归提取视频相关 URL / 路径。"""
     videos: List[str] = []
@@ -164,6 +187,7 @@ async def napcat_resolve_file_url(
         try:
             base, ext = os.path.splitext(s)
             if ext and ext.lower() in (
+                # 视频
                 ".mp4",
                 ".mov",
                 ".m4v",
@@ -176,6 +200,14 @@ async def napcat_resolve_file_url(
                 ".mpeg",
                 ".mpg",
                 ".3gp",
+                # 图片（Napcat/OneBot 常见为 md5 + 扩展名，部分接口需要 md5 本体）
+                ".jpg",
+                ".jpeg",
+                ".png",
+                ".webp",
+                ".bmp",
+                ".tif",
+                ".tiff",
                 ".gif",
             ):
                 if base and base != s:
@@ -184,7 +216,7 @@ async def napcat_resolve_file_url(
             pass
         return None
 
-    # 一些 Napcat 场景下 file 值会携带扩展名（形如 hash.mp4），但接口实际需要 hash 本体。
+    # 一些 Napcat 场景下 file 值会携带扩展名（形如 md5.jpg / md5.mp4），但接口实际需要 md5 本体。
     candidates: List[str] = [file_id]
     stem = _stem_if_needed(file_id)
     if isinstance(stem, str) and stem and stem not in candidates:
@@ -218,7 +250,12 @@ async def napcat_resolve_file_url(
         params = item["params"]
         try:
             ret = await event.bot.api.call_action(action, **params)
-            data = ret.get("data") if isinstance(ret, dict) else None
+            data: Optional[Dict[str, Any]]
+            if isinstance(ret, dict):
+                d = ret.get("data")
+                data = d if isinstance(d, dict) else ret
+            else:
+                data = None
             url = data.get("url") if isinstance(data, dict) else None
             if isinstance(url, str) and url:
                 logger.info("zssm_explain: napcat %s ok, url=%s", action, url[:80])
@@ -283,9 +320,8 @@ async def napcat_resolve_file_url(
                 },
                 e,
             )
-            continue
     logger.warning(
-        "zssm_explain: napcat resolve video/file failed (file_id=%s)", str(file_id)[:64]
+        "zssm_explain: napcat resolve file/url failed (file_id=%s)", str(file_id)[:64]
     )
     return None
 
@@ -464,9 +500,7 @@ async def sample_frames_with_ffmpeg(
     loop = asyncio.get_running_loop()
 
     def _run():
-        return subprocess.run(
-            cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False
-        )
+        return _safe_subprocess_run(cmd)
 
     res = await loop.run_in_executor(None, _run)
     if res.returncode != 0:
@@ -533,10 +567,8 @@ async def sample_frames_equidistant(
                 out_path,
             ]
 
-            def _run_one():
-                return subprocess.run(
-                    cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False
-                )
+            def _run_one(cmd=cmd):
+                return _safe_subprocess_run(cmd)
 
             res = await loop.run_in_executor(None, _run_one)
             if res.returncode == 0 and os.path.exists(out_path):
@@ -579,9 +611,7 @@ async def extract_audio_wav(ffmpeg_path: str, video_path: str) -> Optional[str]:
     loop = asyncio.get_running_loop()
 
     def _run():
-        return subprocess.run(
-            cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False
-        )
+        return _safe_subprocess_run(cmd)
 
     res = await loop.run_in_executor(None, _run)
     if res.returncode != 0:
@@ -720,9 +750,7 @@ def probe_duration_sec(ffprobe_path: Optional[str], video_path: str) -> Optional
             "json",
             video_path,
         ]
-        res1 = subprocess.run(
-            cmd1, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False
-        )
+        res1 = _safe_subprocess_run(cmd1)
         if res1.returncode == 0:
             try:
                 data1 = json.loads(res1.stdout.decode("utf-8", errors="ignore") or "{}")
@@ -751,9 +779,7 @@ def probe_duration_sec(ffprobe_path: Optional[str], video_path: str) -> Optional
             "json",
             video_path,
         ]
-        res2 = subprocess.run(
-            cmd2, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False
-        )
+        res2 = _safe_subprocess_run(cmd2)
         if res2.returncode == 0:
             try:
                 data2 = json.loads(res2.stdout.decode("utf-8", errors="ignore") or "{}")
