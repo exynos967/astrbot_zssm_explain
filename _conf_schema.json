@@ -31,6 +31,12 @@
     "default": true,
     "hint": "关闭后仅响应 /zssm 指令，不再通过纯文本“zssm”自动触发"
   },
+  "enable_empty_zssm_prompt": {
+    "description": "空输入时是否提示",
+    "type": "bool",
+    "default": false,
+    "hint": "当用户仅发送 zssm / /zssm 且既未回复消息、也未附带文本/图片/链接时，是否回复提示语（例如“请输入要解释的内容”）。关闭则忽略不回复"
+  },
   "cf_screenshot_enable": {
     "description": "Cloudflare 截图降级",
     "type": "bool",

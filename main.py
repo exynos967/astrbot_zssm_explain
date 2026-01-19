@@ -69,6 +69,7 @@ URL_DETECT_ENABLE_KEY = "enable_url_detect"
 URL_FETCH_TIMEOUT_KEY = "url_timeout_sec"
 URL_MAX_CHARS_KEY = "url_max_chars"
 KEYWORD_ZSSM_ENABLE_KEY = "enable_keyword_zssm"
+EMPTY_ZSSM_PROMPT_ENABLE_KEY = "enable_empty_zssm_prompt"
 GROUP_LIST_MODE_KEY = "group_list_mode"
 GROUP_LIST_KEY = "group_list"
 VIDEO_PROVIDER_ID_KEY = "video_provider_id"
@@ -89,6 +90,7 @@ FORWARD_VIDEO_MAX_COUNT_KEY = "forward_video_max_count"
 DEFAULT_URL_DETECT_ENABLE = True
 DEFAULT_URL_FETCH_TIMEOUT = 20
 DEFAULT_URL_MAX_CHARS = 6000
+DEFAULT_EMPTY_ZSSM_PROMPT_ENABLE = False
 DEFAULT_VIDEO_FRAME_INTERVAL_SEC = 6
 DEFAULT_VIDEO_ASR_ENABLE = False
 DEFAULT_VIDEO_MAX_DURATION_SEC = 120
@@ -106,7 +108,7 @@ DEFAULT_FORWARD_VIDEO_MAX_COUNT = 2
 @register(
     "astrbot_zssm_explain",
     "薄暝",
-    'zssm，支持关键词"zssm"（忽略前缀）与"zssm + 内容"直接解释；引用消息（含@）正常处理；支持 QQ 合并转发；未回复仅发 zssm 时提示；默认提示词可在 main.py 顶部修改。',
+    'zssm，支持关键词"zssm"（忽略前缀）与"zssm + 内容"直接解释；引用消息（含@）正常处理；支持 QQ 合并转发；未回复仅发 zssm 时默认不回复（可配置提示）；默认提示词可在 main.py 顶部修改。',
     "v3.9.12",
     "https://github.com/xiaoxi68/astrbot_zssm_explain",
 )
@@ -1242,6 +1244,14 @@ class ZssmExplain(Star):
             if raw_images:
                 return self._ReplyPlan(
                     message="未能获取到图片（未拿到可访问的链接/本地路径/base64），请尝试重新发送图片，或查看日志 `zssm_explain: image resolve failed` / `zssm_explain: napcat resolve file/url failed` 排查 OneBot/Napcat 是否能返回图片 URL（可检查 get_msg/get_image/get_file）。",
+                    stop_event=True,
+                    cleanup_paths=cleanup_paths,
+                )
+            if self._get_conf_bool(
+                EMPTY_ZSSM_PROMPT_ENABLE_KEY, DEFAULT_EMPTY_ZSSM_PROMPT_ENABLE
+            ):
+                return self._ReplyPlan(
+                    message="请输入要解释的内容。",
                     stop_event=True,
                     cleanup_paths=cleanup_paths,
                 )
