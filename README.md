@@ -106,3 +106,4 @@
 
 - [Reina](https://github.com/Ri-Nai) 本插件参考了他的json消息处理代码并完善了json卡片消息的处理
 - [氕氙](https://github.com/piexian) 感谢稀有气体同学的PR
+- [プリン](https://github.com/zouyonghe) 感谢热心群u的PR
