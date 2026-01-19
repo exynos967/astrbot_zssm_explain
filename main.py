@@ -1065,7 +1065,7 @@ class ZssmExplain(Star):
         *,
         inline: str,
         enable_url: bool,
-    ) -> _ExplainPlan:
+    ) -> Optional[_ExplainPlan]:
         """将输入解析/拼装为一个可执行的解释计划（builder 阶段）。"""
         cleanup_paths: List[str] = []
 
@@ -1245,11 +1245,7 @@ class ZssmExplain(Star):
                     stop_event=True,
                     cleanup_paths=cleanup_paths,
                 )
-            return self._ReplyPlan(
-                message="请输入要解释的内容。",
-                stop_event=True,
-                cleanup_paths=cleanup_paths,
-            )
+            return None
 
         urls = extract_urls_from_text(text) if (enable_url and text) else []
         if urls and not from_forward:
@@ -1339,7 +1335,8 @@ class ZssmExplain(Star):
             return
 
         if isinstance(plan, self._ReplyPlan):
-            yield self._reply_text_result(event, plan.message)
+            if isinstance(plan.message, str) and plan.message.strip():
+                yield self._reply_text_result(event, plan.message)
             if plan.stop_event:
                 try:
                     event.stop_event()
@@ -1443,6 +1440,8 @@ class ZssmExplain(Star):
             plan = await self._build_explain_plan(
                 event, inline=inline, enable_url=enable_url
             )
+            if plan is None:
+                return
             try:
                 cleanup_paths = list(getattr(plan, "cleanup_paths", []) or [])
             except Exception:
