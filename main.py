@@ -168,7 +168,7 @@ class ZssmExplain(Star):
         t = text.strip()
         return bool(
             re.match(
-                r"^\s*/\s*(?:zssm|hyw|何意味)\s+[pP](?:\s|$)",
+                r"^\s*[/+＋]\s*(?:zssm|hyw|何意味)\s+[pP](?:\s|$)",
                 t,
                 re.I,
             )
@@ -799,7 +799,7 @@ class ZssmExplain(Star):
 
         # 1. 关键词自动触发逻辑判定
         # 检查是否有显式的指令前缀符号 (如 / ! . 等)
-        prefix_match = re.match(r"^\s*([/!！。\.、，\-]+)", t)
+        prefix_match = re.match(r"^\s*([/+＋!！。\.、，\-]+)", t)
         has_prefix = bool(prefix_match)
 
         if not kw_enabled:
@@ -811,7 +811,7 @@ class ZssmExplain(Star):
                 return False
 
         # 2. 正则匹配触发词
-        m = re.match(r"^[\s/!！。\.、，\-]*(zssm|hyw|何意味)(\s|$)", t, re.I)
+        m = re.match(r"^[\s/+＋!！。\.、，\-]*(zssm|hyw|何意味)(\s|$)", t, re.I)
         if not m:
             logger.debug(f"zssm_explain: no trigger match: {t}")
             return False
@@ -889,7 +889,9 @@ class ZssmExplain(Star):
         if not isinstance(text, str):
             return ""
         t = text.strip()
-        m = re.match(r"^[\s/!！。\.、，\-]*(?:zssm|hyw|何意味)(?:\s+(.+))?$", t, re.I)
+        m = re.match(
+            r"^[\s/+＋!！。\.、，\-]*(?:zssm|hyw|何意味)(?:\s+(.+))?$", t, re.I
+        )
         if not m:
             return ""
         content = (m.group(1) or "").strip()
@@ -1746,7 +1748,7 @@ class ZssmExplain(Star):
             at_me = False
         if isinstance(head, str) and head.strip():
             hs = head.strip()
-            if re.match(r"^\s*/\s*(zssm|hyw|何意味)(\s|$)", hs, re.I):
+            if re.match(r"^\s*[/+＋]\s*(zssm|hyw|何意味)(\s|$)", hs, re.I):
                 return
             if at_me and re.match(r"^(zssm|hyw|何意味)(\s|$)", hs, re.I):
                 return
@@ -1761,7 +1763,7 @@ class ZssmExplain(Star):
             text = getattr(event, "message_str", "") or ""
         if isinstance(text, str) and text.strip():
             t = text.strip()
-            if re.match(r"^\s*/\s*(zssm|hyw|何意味)(\s|$)", t, re.I):
+            if re.match(r"^\s*[/+＋]\s*(zssm|hyw|何意味)(\s|$)", t, re.I):
                 return
             if at_me and re.match(r"^(zssm|hyw|何意味)(\s|$)", t, re.I):
                 return
