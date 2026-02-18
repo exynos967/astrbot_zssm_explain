@@ -147,6 +147,104 @@ class ZssmExplain(Star):
         except Exception:
             return event.plain_result(str(text) if text is not None else "")
 
+    @staticmethod
+    def _strip_private_flag_from_inline(inline: str) -> str:
+        """将 inline 中前导的 `p` 私聊标记剥离。"""
+        if not isinstance(inline, str):
+            return ""
+        t = inline.strip()
+        if not t:
+            return ""
+        m = re.match(r"^[pP](?:\s+(.+))?$", t)
+        if not m:
+            return t
+        return (m.group(1) or "").strip()
+
+    @staticmethod
+    def _is_private_command_text(text: str) -> bool:
+        """判断是否为显式 /zssm p（含别名）。"""
+        if not isinstance(text, str):
+            return False
+        t = text.strip()
+        return bool(
+            re.match(
+                r"^\s*/\s*(?:zssm|hyw|何意味)\s+[pP](?:\s|$)",
+                t,
+                re.I,
+            )
+        )
+
+    @staticmethod
+    def _get_sender_id_for_private(event: AstrMessageEvent) -> Optional[str]:
+        """尽力提取发送者 ID。"""
+        try:
+            sid = event.get_sender_id()
+            if sid is not None and str(sid).strip():
+                return str(sid).strip()
+        except Exception:
+            pass
+        try:
+            sender = getattr(getattr(event, "message_obj", None), "sender", None)
+            uid = getattr(sender, "user_id", None) if sender is not None else None
+            if uid is not None and str(uid).strip():
+                return str(uid).strip()
+        except Exception:
+            pass
+        try:
+            raw = getattr(getattr(event, "message_obj", None), "raw_message", None)
+            if isinstance(raw, dict):
+                uid = raw.get("user_id")
+                if uid is not None and str(uid).strip():
+                    return str(uid).strip()
+        except Exception:
+            pass
+        return None
+
+    async def _send_private_text(self, event: AstrMessageEvent, text: str) -> bool:
+        """尝试给触发者发送私聊文本。"""
+        uid = self._get_sender_id_for_private(event)
+        if not uid:
+            return False
+        client = getattr(event, "bot", None)
+        if client is None:
+            return False
+        message = str(text) if text is not None else ""
+        # 常见 OneBot 客户端方法
+        for method_name in ("send_private_msg", "send_private_message"):
+            try:
+                fn = getattr(client, method_name, None)
+                if not callable(fn):
+                    continue
+                try:
+                    user_id: Union[int, str] = int(uid) if uid.isdigit() else uid
+                except Exception:
+                    user_id = uid
+                await fn(user_id=user_id, message=message)
+                return True
+            except Exception as e:
+                logger.warning(
+                    "zssm_explain: private send failed via %s: %s", method_name, e
+                )
+                continue
+        return False
+
+    async def _emit_text_result(
+        self,
+        event: AstrMessageEvent,
+        text: str,
+        *,
+        private_mode: bool = False,
+    ):
+        """根据模式输出结果：群内回复或私聊发送。"""
+        if not private_mode:
+            return self._reply_text_result(event, text)
+        ok = await self._send_private_text(event, text)
+        if ok:
+            return None
+        return self._reply_text_result(
+            event, "私聊发送错误，可能是当前平台或适配器不支持"
+        )
+
     # ===== 群聊权限控制 =====
     def _get_conf_str(self, key: str, default: str) -> str:
         try:
@@ -337,21 +435,33 @@ class ZssmExplain(Star):
         except Exception:
             return None
 
-    async def _explain_video(self, event: AstrMessageEvent, video_src: str):
+    async def _explain_video(
+        self,
+        event: AstrMessageEvent,
+        video_src: str,
+        *,
+        private_mode: bool = False,
+    ):
         # 配置检查：未配置 video_provider_id 时视为未启用视频解释
         cfg_video_provider = self._get_config_provider(VIDEO_PROVIDER_ID_KEY)
         if cfg_video_provider is None:
-            yield self._reply_text_result(
+            msg = await self._emit_text_result(
                 event,
                 "视频解释未配置可用的模型提供商，请在插件配置中选择 video_provider_id 后再试。",
+                private_mode=private_mode,
             )
+            if msg is not None:
+                yield msg
             return
         ffmpeg_path = self._resolve_ffmpeg()
         if not ffmpeg_path:
-            yield self._reply_text_result(
+            msg = await self._emit_text_result(
                 event,
                 "未检测到 ffmpeg，请安装系统 ffmpeg 或 Python 包 imageio-ffmpeg，并在插件配置中设置 ffmpeg_path。",
+                private_mode=private_mode,
             )
+            if msg is not None:
+                yield msg
             return
         logger.info(
             "zssm_explain: video start src=%s ffmpeg=%s",
@@ -376,10 +486,13 @@ class ZssmExplain(Star):
                 local_path = bili_local
             else:
                 # B 站链接解析失败时直接给出友好提示，避免误将网页当作视频文件处理
-                yield self._reply_text_result(
+                msg = await self._emit_text_result(
                     event,
                     "暂时无法解析该 B 站视频链接，请确认视频为公开可访问状态，或改为发送视频文件/截图后再试。",
+                    private_mode=private_mode,
                 )
+                if msg is not None:
+                    yield msg
                 return
 
         # 若尚未得到本地路径，再按通用逻辑处理 Napcat/file_id 与普通 http 链接/本地路径
@@ -399,27 +512,38 @@ class ZssmExplain(Star):
             if isinstance(src, str) and is_http_url(src):
                 local_path = await download_video_to_temp(src, max_mb)
                 if not local_path:
-                    yield self._reply_text_result(
-                        event, f"视频下载失败或超过大小限制（>{max_mb}MB）。"
+                    msg = await self._emit_text_result(
+                        event,
+                        f"视频下载失败或超过大小限制（>{max_mb}MB）。",
+                        private_mode=private_mode,
                     )
+                    if msg is not None:
+                        yield msg
                     return
             else:
                 # 假定为本地路径
                 if not (
                     isinstance(src, str) and os.path.isabs(src) and os.path.exists(src)
                 ):
-                    yield self._reply_text_result(
-                        event, "无法读取该视频源，请确认路径或链接有效。"
+                    msg = await self._emit_text_result(
+                        event,
+                        "无法读取该视频源，请确认路径或链接有效。",
+                        private_mode=private_mode,
                     )
+                    if msg is not None:
+                        yield msg
                     return
                 # 大小检查
                 try:
                     sz = os.path.getsize(src)
                     if sz > max_mb * 1024 * 1024:
-                        yield self._reply_text_result(
+                        msg = await self._emit_text_result(
                             event,
                             f"视频大小超过限制（>{max_mb}MB），请压缩或截取片段后重试。",
+                            private_mode=private_mode,
                         )
+                        if msg is not None:
+                            yield msg
                         return
                 except Exception:
                     pass
@@ -436,9 +560,13 @@ class ZssmExplain(Star):
             max_sec,
         )
         if isinstance(dur, (int, float)) and dur > max_sec:
-            yield self._reply_text_result(
-                event, f"视频时长超过限制（>{max_sec}s），请截取片段后重试。"
+            msg = await self._emit_text_result(
+                event,
+                f"视频时长超过限制（>{max_sec}s），请截取片段后重试。",
+                private_mode=private_mode,
             )
+            if msg is not None:
+                yield msg
             return
 
         # 抽帧
@@ -484,14 +612,22 @@ class ZssmExplain(Star):
                     ffmpeg_path, local_path, interval, n_frames
                 )
         except Exception as e:
-            yield self._reply_text_result(event, f"抽帧失败：{e}")
+            msg = await self._emit_text_result(
+                event, f"抽帧失败：{e}", private_mode=private_mode
+            )
+            if msg is not None:
+                yield msg
             return
         logger.info("zssm_explain: sampled %d frames", len(frames))
         image_urls = self._llm.filter_supported_images(frames)
         if not image_urls:
-            yield self._reply_text_result(
-                event, "未能生成可用关键帧，请检查 ffmpeg 或更换视频后重试。"
+            msg = await self._emit_text_result(
+                event,
+                "未能生成可用关键帧，请检查 ffmpeg 或更换视频后重试。",
+                private_mode=private_mode,
             )
+            if msg is not None:
+                yield msg
             return
 
         # 可选 ASR：由 video_asr_enable + asr_provider_id 控制
@@ -540,9 +676,13 @@ class ZssmExplain(Star):
             logger.error(f"zssm_explain: get provider failed: {e}")
             provider = None
         if not provider:
-            yield self._reply_text_result(
-                event, "未检测到可用的大语言模型提供商，请先在 AstrBot 配置中启用。"
+            msg = await self._emit_text_result(
+                event,
+                "未检测到可用的大语言模型提供商，请先在 AstrBot 配置中启用。",
+                private_mode=private_mode,
             )
+            if msg is not None:
+                yield msg
             return
         system_prompt = await self._build_system_prompt(event)
         meta = {
@@ -627,7 +767,11 @@ class ZssmExplain(Star):
             except Exception:
                 elapsed = None
             reply_text = self._format_explain_output(reply_text, elapsed_sec=elapsed)
-            yield self._reply_text_result(event, reply_text)
+            msg = await self._emit_text_result(
+                event, reply_text, private_mode=private_mode
+            )
+            if msg is not None:
+                yield msg
             try:
                 event.stop_event()
             except Exception:
@@ -1373,16 +1517,28 @@ class ZssmExplain(Star):
             user_prompt=user_prompt, images=images, cleanup_paths=cleanup_paths
         )
 
-    async def _execute_explain_plan(self, event: AstrMessageEvent, plan: _ExplainPlan):
+    async def _execute_explain_plan(
+        self,
+        event: AstrMessageEvent,
+        plan: _ExplainPlan,
+        *,
+        private_mode: bool = False,
+    ):
         """执行解释计划（executor 阶段）。"""
         if isinstance(plan, self._VideoPlan):
-            async for r in self._explain_video(event, plan.video_src):
+            async for r in self._explain_video(
+                event, plan.video_src, private_mode=private_mode
+            ):
                 yield r
             return
 
         if isinstance(plan, self._ReplyPlan):
             if isinstance(plan.message, str) and plan.message.strip():
-                yield self._reply_text_result(event, plan.message)
+                msg = await self._emit_text_result(
+                    event, plan.message, private_mode=private_mode
+                )
+                if msg is not None:
+                    yield msg
             if plan.stop_event:
                 try:
                     event.stop_event()
@@ -1400,9 +1556,13 @@ class ZssmExplain(Star):
             provider = None
 
         if not provider:
-            yield self._reply_text_result(
-                event, "未检测到可用的大语言模型提供商，请先在 AstrBot 配置中启用。"
+            msg = await self._emit_text_result(
+                event,
+                "未检测到可用的大语言模型提供商，请先在 AstrBot 配置中启用。",
+                private_mode=private_mode,
             )
+            if msg is not None:
+                yield msg
             return
 
         system_prompt = await self._build_system_prompt(event)
@@ -1442,24 +1602,36 @@ class ZssmExplain(Star):
             except Exception:
                 elapsed = None
             reply_text = self._format_explain_output(reply_text, elapsed_sec=elapsed)
-            yield self._reply_text_result(event, reply_text)
+            msg = await self._emit_text_result(
+                event, reply_text, private_mode=private_mode
+            )
+            if msg is not None:
+                yield msg
             try:
                 event.stop_event()
             except Exception:
                 pass
         except asyncio.TimeoutError:
-            yield self._reply_text_result(
-                event, "解释超时，请稍后重试或换一个模型提供商。"
+            msg = await self._emit_text_result(
+                event,
+                "解释超时，请稍后重试或换一个模型提供商。",
+                private_mode=private_mode,
             )
+            if msg is not None:
+                yield msg
             try:
                 event.stop_event()
             except Exception:
                 pass
         except Exception as e:
             logger.error(f"zssm_explain: LLM 调用失败: {e}")
-            yield self._reply_text_result(
-                event, "解释失败：LLM 或图片转述模型调用异常，请稍后再试或联系管理员。"
+            msg = await self._emit_text_result(
+                event,
+                "解释失败：LLM 或图片转述模型调用异常，请稍后再试或联系管理员。",
+                private_mode=private_mode,
             )
+            if msg is not None:
+                yield msg
             try:
                 event.stop_event()
             except Exception:
@@ -1491,7 +1663,11 @@ class ZssmExplain(Star):
                 )
                 return
 
+            private_mode = self._is_private_command_text(check_text)
+
             inline = self._get_inline_content(event)
+            if private_mode:
+                inline = self._strip_private_flag_from_inline(inline)
             enable_url = self._get_conf_bool(
                 URL_DETECT_ENABLE_KEY, DEFAULT_URL_DETECT_ENABLE
             )
@@ -1506,13 +1682,19 @@ class ZssmExplain(Star):
             except Exception:
                 cleanup_paths = []
 
-            async for r in self._execute_explain_plan(event, plan):
+            async for r in self._execute_explain_plan(
+                event, plan, private_mode=private_mode
+            ):
                 yield r
         except Exception as e:
             logger.error("zssm_explain: handler crashed: %s", e)
-            yield self._reply_text_result(
-                event, "解释失败：插件内部异常，请稍后再试或联系管理员。"
+            msg = await self._emit_text_result(
+                event,
+                "解释失败：插件内部异常，请稍后再试或联系管理员。",
+                private_mode=False,
             )
+            if msg is not None:
+                yield msg
             try:
                 event.stop_event()
             except Exception:
