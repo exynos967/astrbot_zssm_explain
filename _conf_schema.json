@@ -150,5 +150,49 @@
     "type": "string",
     "_special": "select_provider_stt",
     "hint": "留空则使用当前会话 STT 提供商"
+  },
+  "video_direct_mode": {
+    "description": "视频直接输入模式",
+    "type": "string",
+    "options": ["off", "base64", "dashscope"],
+    "default": "off",
+    "hint": "off: 禁用直传，始终抽帧；base64: Base64编码(≤10MB，适用于第三方中转)；dashscope: 百炼模式(≤100MB本地路径，>100MB自动上传OSS)"
+  },
+  "video_direct_fps": {
+    "description": "视频直传抽帧频率",
+    "type": "int",
+    "default": 2,
+    "hint": "范围 1-30，传递给 API 的 fps 参数（仅 dashscope 模式生效）"
+  },
+  "video_direct_target_size_mb": {
+    "description": "视频压缩目标大小（MB）",
+    "type": "int",
+    "default": -1,
+    "hint": "-1: 按模式自动(base64→10MB, dashscope→100MB)；0: 不压缩；正整数: 手动指定目标大小"
+  },
+  "video_direct_timeout_sec": {
+    "description": "视频直传超时时间（秒）",
+    "type": "int",
+    "default": 300,
+    "hint": "范围 60-600，适用于大文件上传场景"
+  },
+  "bilibili_cookie": {
+    "description": "B站 Cookie（用于绕过 API 风控）",
+    "type": "object",
+    "hint": "选填。部分 B 站内容（图文动态等）需要登录态，请在浏览器登录 B 站后按 F12，在 Application > Cookies 中找到对应值填入",
+    "items": {
+      "SESSDATA": {
+        "description": "SESSDATA",
+        "type": "string",
+        "default": "",
+        "hint": "登录凭证，必填项"
+      },
+      "bili_jct": {
+        "description": "bili_jct",
+        "type": "string",
+        "default": "",
+        "hint": "CSRF Token，部分接口需要"
+      }
+    }
   }
 }
