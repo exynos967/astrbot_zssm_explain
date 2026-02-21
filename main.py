@@ -1701,6 +1701,7 @@ class ZssmExplain(Star):
                     max_mb=max_mb,
                     max_sec=max_sec,
                     timeout_sec=timeout_sec,
+                    video_meta=video_meta,
                 )
                 if f_frames:
                     images.extend(f_frames)

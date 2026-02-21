@@ -112,9 +112,8 @@ def get_bilibili_url_type(url: Optional[str]) -> Optional[str]:
     - "live": 直播
     - "read": 专栏
     - "opus": 图文动态
-    - "favlist": 收藏夹
     - "short": 短链（需展开后再判断）
-    - None: 非 B 站链接
+    - None: 非 B 站链接或暂不支持的类型（如收藏夹）
     """
     if not is_bilibili_url(url):
         return None
@@ -129,8 +128,9 @@ def get_bilibili_url_type(url: Optional[str]) -> Optional[str]:
         return "read"
     if _BILI_OPUS_RE.search(s):
         return "opus"
+    # 收藏夹暂不支持，返回 None 让调用方走截图降级
     if _BILI_FAVLIST_RE.search(s):
-        return "favlist"
+        return None
     if _BILI_BV_RE.search(s) or _BILI_AV_RE.search(s):
         return "video"
     # bilibilix.com 视频直链
@@ -455,10 +455,12 @@ async def download_bilibili_video_to_temp(
 # ---------------------------------------------------------------------------
 
 
-async def resolve_bilibili_dynamic(
-    url: str, cookie: Optional[str] = None
+def _parse_dynamic_detail_response(
+    data: Optional[Dict[str, Any]],
 ) -> Optional[Dict[str, Any]]:
-    """解析 B 站动态，返回结构化信息。
+    """解析动态详情 API 响应，提取结构化信息。
+
+    用于 dynamic 和 opus 类型，它们共用同一个 API。
 
     返回字典包含：
     - title: 标题（可能为空）
@@ -467,24 +469,7 @@ async def resolve_bilibili_dynamic(
     - author: 作者名
     - avatar: 作者头像
     - timestamp: 发布时间戳
-
-    Args:
-        url: B 站动态链接
-        cookie: 可选的 Cookie 字符串，格式如 "SESSDATA=xxx; bili_jct=xxx"
     """
-    m = _BILI_DYNAMIC_RE.search(url or "")
-    if not m:
-        # 可能是短链，先展开
-        if _BILI_B23_RE.search(url or ""):
-            real = await _bili_resolve_b23(url)
-            if real:
-                m = _BILI_DYNAMIC_RE.search(real)
-        if not m:
-            return None
-
-    dynamic_id = m.group(1)
-    api = f"https://api.bilibili.com/x/polymer/web-dynamic/v1/detail?id={dynamic_id}"
-    data = await _bili_request_json(api, cookie=cookie)
     if not (isinstance(data, dict) and data.get("code") == 0):
         return None
 
@@ -532,6 +517,39 @@ async def resolve_bilibili_dynamic(
         "avatar": author_mod.get("face", ""),
         "timestamp": author_mod.get("pub_ts", 0),
     }
+
+
+async def resolve_bilibili_dynamic(
+    url: str, cookie: Optional[str] = None
+) -> Optional[Dict[str, Any]]:
+    """解析 B 站动态，返回结构化信息。
+
+    返回字典包含：
+    - title: 标题（可能为空）
+    - text: 文本内容
+    - images: 图片 URL 列表
+    - author: 作者名
+    - avatar: 作者头像
+    - timestamp: 发布时间戳
+
+    Args:
+        url: B 站动态链接
+        cookie: 可选的 Cookie 字符串，格式如 "SESSDATA=xxx; bili_jct=xxx"
+    """
+    m = _BILI_DYNAMIC_RE.search(url or "")
+    if not m:
+        # 可能是短链，先展开
+        if _BILI_B23_RE.search(url or ""):
+            real = await _bili_resolve_b23(url)
+            if real:
+                m = _BILI_DYNAMIC_RE.search(real)
+        if not m:
+            return None
+
+    dynamic_id = m.group(1)
+    api = f"https://api.bilibili.com/x/polymer/web-dynamic/v1/detail?id={dynamic_id}"
+    data = await _bili_request_json(api, cookie=cookie)
+    return _parse_dynamic_detail_response(data)
 
 
 # ---------------------------------------------------------------------------
@@ -680,51 +698,12 @@ async def resolve_bilibili_opus(
     # opus 使用动态 API，直接用 opus_id 作为 dynamic_id 查询
     api = f"https://api.bilibili.com/x/polymer/web-dynamic/v1/detail?id={opus_id}"
     data = await _bili_request_json(api, cookie=cookie)
-    if not (isinstance(data, dict) and data.get("code") == 0):
+    result = _parse_dynamic_detail_response(data)
+    if not result:
         logger.debug(
             "zssm_explain: opus API failed, code=%s", data.get("code") if data else None
         )
-        return None
-
-    item = (data.get("data") or {}).get("item")
-    if not isinstance(item, dict):
-        return None
-
-    modules = item.get("modules") or {}
-    author_mod = modules.get("module_author") or {}
-    dynamic_mod = modules.get("module_dynamic") or {}
-
-    # 提取图片
-    images: list[str] = []
-    major = dynamic_mod.get("major") or {}
-    major_type = major.get("type", "")
-
-    if major_type == "MAJOR_TYPE_OPUS":
-        opus = major.get("opus") or {}
-        pics = opus.get("pics") or []
-        images = [p.get("url") for p in pics if isinstance(p, dict) and p.get("url")]
-    elif major_type == "MAJOR_TYPE_DRAW":
-        draw = major.get("draw") or {}
-        items = draw.get("items") or []
-        images = [p.get("src") for p in items if isinstance(p, dict) and p.get("src")]
-
-    # 提取文本
-    text = ""
-    desc = dynamic_mod.get("desc") or {}
-    text = desc.get("text", "")
-    if not text and major_type == "MAJOR_TYPE_OPUS":
-        opus = major.get("opus") or {}
-        summary = opus.get("summary") or {}
-        text = summary.get("text", "")
-
-    return {
-        "title": None,
-        "text": text,
-        "images": images,
-        "author": author_mod.get("name", ""),
-        "avatar": author_mod.get("face", ""),
-        "timestamp": author_mod.get("pub_ts", 0),
-    }
+    return result
 
 
 # ---------------------------------------------------------------------------

@@ -1086,8 +1086,12 @@ async def extract_forward_video_keyframes(
     max_mb: int,
     max_sec: int,
     timeout_sec: int,
+    video_meta: Optional[dict] = None,
 ) -> Tuple[List[str], List[str]]:
-    """将合并转发中的视频源转换为少量关键帧图片（默认每个视频 1 张），用于“聊天记录解释”场景。
+    """将合并转发中的视频源转换为少量关键帧图片（默认每个视频 1 张），用于"聊天记录解释"场景。
+
+    Args:
+        video_meta: 视频元数据字典，key 为视频索引，value 为 {fileUuid, ...}
 
     返回:
     - frames: 本地关键帧图片路径列表（均位于临时目录）
@@ -1116,11 +1120,42 @@ async def extract_forward_video_keyframes(
     frames: List[str] = []
     cleanup: List[str] = []
 
-    for src in uniq_sources[:max_count]:
+    for idx, src in enumerate(uniq_sources[:max_count]):
         local_path = None
         downloaded_tmp = False
         try:
             resolved_src = src
+            # 优先通过 fileUuid 获取公网直链（避免 get_file 调用大文件崩溃）
+            meta = (video_meta or {}).get(idx, {}) if video_meta else {}
+            file_uuid = meta.get("fileUuid")
+            if file_uuid and not is_http_url(src) and not is_abs_file(src):
+                try:
+                    gid = event.get_group_id()
+                    if gid:
+                        gid_param = (
+                            int(gid) if isinstance(gid, str) and gid.isdigit() else gid
+                        )
+                        ret = await event.bot.api.call_action(
+                            "get_group_file_url",
+                            group_id=gid_param,
+                            file_id=file_uuid,
+                        )
+                        d = ret.get("data") if isinstance(ret, dict) else None
+                        if not isinstance(d, dict):
+                            d = ret if isinstance(ret, dict) else {}
+                        url = d.get("url")
+                        if isinstance(url, str) and url.strip():
+                            logger.info(
+                                "zssm_explain: forward video get_group_file_url ok => %s",
+                                url[:80],
+                            )
+                            resolved_src = url.strip()
+                except Exception as e:
+                    logger.debug(
+                        "zssm_explain: forward video get_group_file_url failed: %s", e
+                    )
+
+            # 回退到 napcat 解析（可能触发 get_file）
             if (
                 isinstance(resolved_src, str)
                 and (not is_http_url(resolved_src))
