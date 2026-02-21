@@ -10,7 +10,7 @@ import math
 import time
 
 from astrbot.api.event import filter, AstrMessageEvent
-from astrbot.api.star import Context, Star, register
+from astrbot.api.star import Context, Star
 from astrbot.api import logger
 import astrbot.api.message_components as Comp
 from astrbot.core.star.star_handler import EventType
@@ -43,8 +43,17 @@ from .video_utils import (
     sample_frames_equidistant,
     sample_frames_with_ffmpeg,
     extract_audio_wav,
+    get_video_size_mb,
+    is_safe_video_path,
+    compress_video_to_target,
 )
-from .bilibili_utils import is_bilibili_url, download_bilibili_video_to_temp
+from .bilibili_utils import (
+    is_bilibili_url,
+    download_bilibili_video_to_temp,
+    get_bilibili_url_type,
+    resolve_bilibili_content,
+    resolve_bilibili_short_url,
+)
 from .prompt_utils import (
     DEFAULT_URL_USER_PROMPT,
     DEFAULT_VIDEO_USER_PROMPT,
@@ -87,6 +96,12 @@ FILE_PREVIEW_EXTS_KEY = "file_preview_exts"
 FILE_PREVIEW_MAX_SIZE_KB_KEY = "file_preview_max_size_kb"
 FORWARD_VIDEO_KEYFRAME_ENABLE_KEY = "forward_video_keyframe_enable"
 FORWARD_VIDEO_MAX_COUNT_KEY = "forward_video_max_count"
+
+VIDEO_DIRECT_MODE_KEY = "video_direct_mode"
+VIDEO_DIRECT_FPS_KEY = "video_direct_fps"
+VIDEO_DIRECT_TARGET_SIZE_MB_KEY = "video_direct_target_size_mb"
+VIDEO_DIRECT_TIMEOUT_SEC_KEY = "video_direct_timeout_sec"
+BILIBILI_COOKIE_KEY = "bilibili_cookie"
 
 DEFAULT_URL_DETECT_ENABLE = True
 DEFAULT_URL_FETCH_TIMEOUT = 20
@@ -147,6 +162,26 @@ class ZssmExplain(Star):
         except Exception:
             return event.plain_result(str(text) if text is not None else "")
 
+    def _format_llm_error(self, e: Exception, context: str = "") -> str:
+        """将 LLM 调用异常转换为用户友好的错误提示。"""
+        err_str = str(e)
+        prefix = f"{context}失败：" if context else "LLM 调用失败："
+        if "Connection error" in err_str or "ConnectionError" in err_str:
+            return f"{prefix}LLM 服务连接失败，请检查网络或代理设置。"
+        if "timeout" in err_str.lower() or "Timeout" in err_str:
+            return f"{prefix}LLM 服务响应超时，请稍后重试。"
+        if (
+            "401" in err_str
+            or "Unauthorized" in err_str
+            or "invalid_api_key" in err_str
+        ):
+            return f"{prefix}LLM API Key 无效或已过期。"
+        if "429" in err_str or "rate_limit" in err_str.lower():
+            return f"{prefix}LLM 请求频率超限，请稍后重试。"
+        if "all providers failed" in err_str:
+            return f"{prefix}所有 LLM 服务均不可用，请检查配置。"
+        return f"{prefix}LLM 调用出错，请查看日志。"
+
     # ===== 群聊权限控制 =====
     def _get_conf_str(self, key: str, default: str) -> str:
         try:
@@ -156,6 +191,27 @@ class ZssmExplain(Star):
         except Exception:
             pass
         return default
+
+    def _get_bilibili_cookie(self) -> Optional[str]:
+        """从配置中获取 B 站 Cookie 字符串。
+
+        配置格式为 object: {"SESSDATA": "xxx", "bili_jct": "xxx"}
+        返回格式为 "SESSDATA=xxx; bili_jct=xxx"，若未配置则返回 None。
+        """
+        try:
+            cookie_cfg = self.config.get(BILIBILI_COOKIE_KEY)
+            if not isinstance(cookie_cfg, dict):
+                return None
+            sessdata = cookie_cfg.get("SESSDATA", "").strip()
+            bili_jct = cookie_cfg.get("bili_jct", "").strip()
+            if not sessdata:
+                return None
+            parts = [f"SESSDATA={sessdata}"]
+            if bili_jct:
+                parts.append(f"bili_jct={bili_jct}")
+            return "; ".join(parts)
+        except Exception:
+            return None
 
     def _get_conf_list_str(self, key: str) -> List[str]:
         try:
@@ -337,7 +393,195 @@ class ZssmExplain(Star):
         except Exception:
             return None
 
-    async def _explain_video(self, event: AstrMessageEvent, video_src: str):
+    # -------------------------------------------------------------------------
+    # B站图文/动态/直播解释（非视频内容）
+    # -------------------------------------------------------------------------
+
+    async def _explain_bilibili(
+        self,
+        event: AstrMessageEvent,
+        bili_url: str,
+        bili_type: str,
+    ):
+        """解释 B 站非视频内容（动态/直播/专栏/图文），将图片发给模型。"""
+        logger.info(
+            "zssm_explain: bilibili content type=%s url=%s",
+            bili_type,
+            bili_url[:100] if bili_url else "",
+        )
+
+        type_name_map = {
+            "dynamic": "动态",
+            "live": "直播",
+            "read": "专栏",
+            "opus": "图文",
+        }
+        type_name = type_name_map.get(bili_type, "内容")
+
+        # 获取 B 站 Cookie
+        bili_cookie = self._get_bilibili_cookie()
+
+        # 解析 B 站内容
+        try:
+            content = await resolve_bilibili_content(bili_url, cookie=bili_cookie)
+        except Exception as e:
+            logger.warning("zssm_explain: bilibili resolve failed: %s", e)
+            content = None
+
+        # API 解析失败时，回退到网页截图方式
+        if not content:
+            # 根据是否配置了 Cookie 给出不同提示
+            if not bili_cookie:
+                logger.info(
+                    "zssm_explain: bilibili API failed (no cookie), fallback to screenshot"
+                )
+            else:
+                logger.info(
+                    "zssm_explain: bilibili API failed (with cookie), fallback to screenshot"
+                )
+            timeout_sec = self._get_conf_int(
+                URL_FETCH_TIMEOUT_KEY, DEFAULT_URL_FETCH_TIMEOUT, 2, 60
+            )
+            max_chars = self._get_conf_int(
+                URL_MAX_CHARS_KEY, DEFAULT_URL_MAX_CHARS, min_v=1000, max_v=50000
+            )
+            cf_enable = self._get_conf_bool(
+                CF_SCREENSHOT_ENABLE_KEY, DEFAULT_CF_SCREENSHOT_ENABLE
+            )
+            width, height = self._get_cf_screenshot_size()
+            url_ctx = await prepare_url_prompt(
+                bili_url,
+                timeout_sec,
+                self._last_fetch_info,
+                max_chars=max_chars,
+                cf_screenshot_enable=cf_enable,
+                cf_screenshot_width=width,
+                cf_screenshot_height=height,
+                file_preview_max_bytes=self._get_file_preview_max_bytes(),
+                user_prompt_template=f"请解释以下 B 站{type_name}的内容：\n{{text}}",
+            )
+            if url_ctx:
+                user_prompt, _text, images = url_ctx
+                # 获取 provider
+                try:
+                    provider = self.context.get_using_provider(
+                        umo=event.unified_msg_origin
+                    )
+                except Exception as e:
+                    logger.error(f"zssm_explain: get provider failed: {e}")
+                    provider = None
+
+                if not provider:
+                    yield self._reply_text_result(
+                        event,
+                        "未检测到可用的大语言模型提供商，请先在 AstrBot 配置中启用。",
+                    )
+                    return
+
+                image_urls = self._llm.filter_supported_images(images)
+                system_prompt = await self._build_system_prompt(event)
+
+                try:
+                    start_ts = time.perf_counter()
+                    call_provider = self._llm.select_primary_provider(
+                        session_provider=provider, image_urls=image_urls
+                    )
+                    llm_resp = await self._llm.call_with_fallback(
+                        primary=call_provider,
+                        session_provider=provider,
+                        user_prompt=user_prompt,
+                        system_prompt=system_prompt,
+                        image_urls=image_urls,
+                    )
+                    reply_text = self._llm.pick_llm_text(llm_resp)
+                    elapsed = time.perf_counter() - start_ts
+                    reply_text = self._format_explain_output(
+                        reply_text, elapsed_sec=elapsed
+                    )
+                    yield self._reply_text_result(event, reply_text)
+                    return
+                except Exception as e:
+                    logger.error("zssm_explain: bilibili screenshot LLM failed: %s", e)
+
+            # 根据是否配置了 Cookie 给出不同的错误提示
+            if not bili_cookie:
+                yield self._reply_text_result(
+                    event,
+                    f"无法解析该 B 站{type_name}链接（API 风控需要 Cookie，请在插件配置中填写 B站 Cookie）。",
+                )
+            else:
+                yield self._reply_text_result(
+                    event,
+                    f"无法解析该 B 站{type_name}链接（API 解析失败，截图也失败了）。",
+                )
+            return
+
+        # 构建提示词
+        title = content.get("title") or ""
+        text = content.get("text") or ""
+        author = content.get("author") or ""
+        images = content.get("images") or []
+
+        prompt_parts = [f"请解释以下 B 站{type_name}的内容："]
+        if title:
+            prompt_parts.append(f"标题：{title}")
+        if author:
+            prompt_parts.append(f"作者：{author}")
+        if text:
+            prompt_parts.append(f"正文：\n{text[:2000]}")
+        if images:
+            prompt_parts.append(f"（附带 {len(images)} 张图片）")
+
+        user_prompt = "\n".join(prompt_parts)
+
+        # 获取 provider
+        try:
+            provider = self.context.get_using_provider(umo=event.unified_msg_origin)
+        except Exception as e:
+            logger.error(f"zssm_explain: get provider failed: {e}")
+            provider = None
+
+        if not provider:
+            yield self._reply_text_result(
+                event, "未检测到可用的大语言模型提供商，请先在 AstrBot 配置中启用。"
+            )
+            return
+
+        # 过滤支持的图片
+        image_urls = self._llm.filter_supported_images(images)
+        system_prompt = await self._build_system_prompt(event)
+
+        try:
+            start_ts = time.perf_counter()
+            call_provider = self._llm.select_primary_provider(
+                session_provider=provider, image_urls=image_urls
+            )
+            llm_resp = await self._llm.call_with_fallback(
+                primary=call_provider,
+                session_provider=provider,
+                user_prompt=user_prompt,
+                system_prompt=system_prompt,
+                image_urls=image_urls,
+            )
+
+            reply_text = self._llm.pick_llm_text(llm_resp)
+            elapsed = time.perf_counter() - start_ts
+            reply_text = self._format_explain_output(reply_text, elapsed_sec=elapsed)
+            yield self._reply_text_result(event, reply_text)
+
+        except Exception as e:
+            logger.error("zssm_explain: bilibili LLM call failed: %s", e)
+            yield self._reply_text_result(
+                event, self._format_llm_error(e, f"解释 B 站{type_name}")
+            )
+
+    async def _explain_video(
+        self,
+        event: AstrMessageEvent,
+        video_src: str,
+        *,
+        video_meta: Optional[dict] = None,
+    ):
         # 配置检查：未配置 video_provider_id 时视为未启用视频解释
         cfg_video_provider = self._get_config_provider(VIDEO_PROVIDER_ID_KEY)
         if cfg_video_provider is None:
@@ -346,17 +590,25 @@ class ZssmExplain(Star):
                 "视频解释未配置可用的模型提供商，请在插件配置中选择 video_provider_id 后再试。",
             )
             return
+
+        direct_mode = self._get_conf_str(VIDEO_DIRECT_MODE_KEY, "off").lower()
+        if direct_mode not in ("off", "base64", "dashscope"):
+            direct_mode = "off"
+
+        # 非直传模式下，ffmpeg 是必须的；直传模式下 ffmpeg 仅用于回退
         ffmpeg_path = self._resolve_ffmpeg()
-        if not ffmpeg_path:
+        if direct_mode == "off" and not ffmpeg_path:
             yield self._reply_text_result(
                 event,
                 "未检测到 ffmpeg，请安装系统 ffmpeg 或 Python 包 imageio-ffmpeg，并在插件配置中设置 ffmpeg_path。",
             )
             return
+
         logger.info(
-            "zssm_explain: video start src=%s ffmpeg=%s",
+            "zssm_explain: video start src=%s ffmpeg=%s direct_mode=%s",
             (str(video_src)[:128] if video_src else ""),
             ffmpeg_path,
+            direct_mode,
         )
 
         # 统一获取本地文件路径（支持 http/https 下载，Napcat 直链解析）
@@ -369,6 +621,10 @@ class ZssmExplain(Star):
         if isinstance(src, str) and is_http_url(src) and is_bilibili_url(src):
             try:
                 bili_local = await download_bilibili_video_to_temp(src, max_mb)
+            except ValueError as ve:
+                # 大小超限，给出明确提示
+                yield self._reply_text_result(event, str(ve))
+                return
             except Exception as e:
                 logger.warning("zssm_explain: bilibili download failed: %s", e)
                 bili_local = None
@@ -384,6 +640,59 @@ class ZssmExplain(Star):
 
         # 若尚未得到本地路径，再按通用逻辑处理 Napcat/file_id 与普通 http 链接/本地路径
         if local_path is None:
+            # 若有 fileUuid，优先尝试 get_group_file_url 拿公网直链
+            file_uuid = (video_meta or {}).get("fileUuid")
+            if file_uuid and not is_http_url(src) and not is_abs_file(src):
+                try:
+                    gid = event.get_group_id()
+                    if gid:
+                        gid_param = (
+                            int(gid) if isinstance(gid, str) and gid.isdigit() else gid
+                        )
+                        ret = await event.bot.api.call_action(
+                            "get_group_file_url",
+                            group_id=gid_param,
+                            file_id=file_uuid,
+                        )
+                        d = ret.get("data") if isinstance(ret, dict) else None
+                        if not isinstance(d, dict):
+                            d = ret if isinstance(ret, dict) else {}
+                        url = d.get("url")
+                        if isinstance(url, str) and url.strip():
+                            logger.info(
+                                "zssm_explain: get_group_file_url ok => %s",
+                                url[:80],
+                            )
+                            src = url.strip()
+                except Exception as e:
+                    logger.debug("zssm_explain: get_group_file_url failed: %s", e)
+            # 若 src 已经是绝对路径且存在（从 records filePath 拿到的），也优先尝试
+            # get_group_file_url 拿公网直链（dashscope 可直接用 http URL）
+            elif file_uuid and is_abs_file(src) and direct_mode == "dashscope":
+                try:
+                    gid = event.get_group_id()
+                    if gid:
+                        gid_param = (
+                            int(gid) if isinstance(gid, str) and gid.isdigit() else gid
+                        )
+                        ret = await event.bot.api.call_action(
+                            "get_group_file_url",
+                            group_id=gid_param,
+                            file_id=file_uuid,
+                        )
+                        d = ret.get("data") if isinstance(ret, dict) else None
+                        if not isinstance(d, dict):
+                            d = ret if isinstance(ret, dict) else {}
+                        url = d.get("url")
+                        if isinstance(url, str) and url.strip():
+                            logger.info(
+                                "zssm_explain: get_group_file_url ok (override local) => %s",
+                                url[:80],
+                            )
+                            src = url.strip()
+                except Exception as e:
+                    logger.debug("zssm_explain: get_group_file_url failed: %s", e)
+
             # 若不是 URL/绝对路径，尝试通过 Napcat file_id 获取直链
             if (
                 isinstance(src, str)
@@ -412,10 +721,10 @@ class ZssmExplain(Star):
                         event, "无法读取该视频源，请确认路径或链接有效。"
                     )
                     return
-                # 大小检查
+                # 大小检查（直传模式跳过，百炼支持大文件）
                 try:
                     sz = os.path.getsize(src)
-                    if sz > max_mb * 1024 * 1024:
+                    if sz > max_mb * 1024 * 1024 and direct_mode == "off":
                         yield self._reply_text_result(
                             event,
                             f"视频大小超过限制（>{max_mb}MB），请压缩或截取片段后重试。",
@@ -435,9 +744,141 @@ class ZssmExplain(Star):
             dur if dur is not None else "unknown",
             max_sec,
         )
-        if isinstance(dur, (int, float)) and dur > max_sec:
+        if isinstance(dur, (int, float)) and dur > max_sec and direct_mode == "off":
             yield self._reply_text_result(
                 event, f"视频时长超过限制（>{max_sec}s），请截取片段后重试。"
+            )
+            return
+
+        # ===== 视频直传分支 =====
+        direct_cleanup: List[str] = []
+        if direct_mode != "off" and is_safe_video_path(local_path):
+            try:
+                direct_path = local_path
+                size_mb = get_video_size_mb(direct_path)
+                target_cfg = self._get_conf_int(
+                    VIDEO_DIRECT_TARGET_SIZE_MB_KEY, -1, -1, 500
+                )
+
+                if direct_mode == "base64":
+                    # base64 模式：限制 10MB
+                    limit_mb = 10.0
+                    if target_cfg == -1:
+                        target_mb = limit_mb
+                    elif target_cfg == 0:
+                        target_mb = 0.0
+                    else:
+                        target_mb = min(float(target_cfg), limit_mb)
+
+                    if size_mb > limit_mb and target_mb > 0 and ffmpeg_path:
+                        compressed = await compress_video_to_target(
+                            ffmpeg_path, direct_path, target_mb
+                        )
+                        if compressed and compressed != direct_path:
+                            direct_cleanup.append(compressed)
+                            direct_path = compressed
+                            size_mb = get_video_size_mb(direct_path)
+
+                    if size_mb <= limit_mb:
+                        logger.info("zssm_explain: video direct base64 %.1fMB", size_mb)
+                        system_prompt = await self._build_system_prompt(event)
+                        start_ts = time.perf_counter()
+                        result = await self._llm.call_video_direct(
+                            video_path=direct_path,
+                            mode="base64",
+                            provider=cfg_video_provider,
+                            prompt=self._build_video_user_prompt(
+                                {"name": os.path.basename(local_path), "duration": dur},
+                                None,
+                            ),
+                            timeout=self._get_conf_int(
+                                VIDEO_DIRECT_TIMEOUT_SEC_KEY, 300, 60, 600
+                            ),
+                        )
+                        elapsed = time.perf_counter() - start_ts
+                        result = self._format_explain_output(
+                            result, elapsed_sec=elapsed
+                        )
+                        yield self._reply_text_result(event, result)
+                        try:
+                            event.stop_event()
+                        except Exception:
+                            pass
+                    else:
+                        raise ValueError(
+                            f"视频 {size_mb:.1f}MB 超过 base64 限制 {limit_mb:.0f}MB"
+                        )
+
+                elif direct_mode == "dashscope":
+                    # dashscope 模式：≤100MB 用 file://，>100MB 上传 OSS
+                    limit_mb = 100.0
+                    if target_cfg == -1:
+                        target_mb = limit_mb
+                    elif target_cfg == 0:
+                        target_mb = 0.0
+                    else:
+                        target_mb = min(float(target_cfg), limit_mb)
+
+                    if size_mb > limit_mb and target_mb > 0 and ffmpeg_path:
+                        compressed = await compress_video_to_target(
+                            ffmpeg_path, direct_path, target_mb
+                        )
+                        if compressed and compressed != direct_path:
+                            direct_cleanup.append(compressed)
+                            direct_path = compressed
+                            size_mb = get_video_size_mb(direct_path)
+
+                    fps = self._get_conf_int(VIDEO_DIRECT_FPS_KEY, 2, 1, 30)
+                    logger.info(
+                        "zssm_explain: video direct dashscope %.1fMB fps=%d",
+                        size_mb,
+                        fps,
+                    )
+                    system_prompt = await self._build_system_prompt(event)
+                    start_ts = time.perf_counter()
+                    result = await self._llm.call_video_direct(
+                        video_path=direct_path,
+                        mode="dashscope",
+                        provider=cfg_video_provider,
+                        prompt=self._build_video_user_prompt(
+                            {"name": os.path.basename(local_path), "duration": dur},
+                            None,
+                        ),
+                        fps=fps,
+                        timeout=self._get_conf_int(
+                            VIDEO_DIRECT_TIMEOUT_SEC_KEY, 300, 60, 600
+                        ),
+                    )
+                    elapsed = time.perf_counter() - start_ts
+                    result = self._format_explain_output(result, elapsed_sec=elapsed)
+                    yield self._reply_text_result(event, result)
+                    try:
+                        event.stop_event()
+                    except Exception:
+                        pass
+
+            except Exception as e:
+                logger.warning("zssm_explain: 视频直传失败: %s", e)
+                # 使用统一的错误美化，避免泄露内部信息
+                yield self._reply_text_result(
+                    event, self._format_llm_error(e, "视频直传")
+                )
+            finally:
+                for p in direct_cleanup:
+                    try:
+                        if isinstance(p, str) and p and os.path.isfile(p):
+                            os.remove(p)
+                    except Exception:
+                        pass
+
+            # 直传模式下不回退抽帧，直接返回
+            return
+
+        # 回退抽帧需要 ffmpeg
+        if not ffmpeg_path:
+            yield self._reply_text_result(
+                event,
+                "未检测到 ffmpeg，视频直传也未成功，请安装 ffmpeg 或检查直传配置。",
             )
             return
 
@@ -484,7 +925,10 @@ class ZssmExplain(Star):
                     ffmpeg_path, local_path, interval, n_frames
                 )
         except Exception as e:
-            yield self._reply_text_result(event, f"抽帧失败：{e}")
+            logger.error("zssm_explain: frame sampling failed: %s", e)
+            yield self._reply_text_result(
+                event, "视频抽帧失败，请检查 ffmpeg 配置或更换视频后重试。"
+            )
             return
         logger.info("zssm_explain: sampled %d frames", len(frames))
         image_urls = self._llm.filter_supported_images(frames)
@@ -611,7 +1055,10 @@ class ZssmExplain(Star):
                 )
             except Exception as e:
                 logger.error("zssm_explain: final summary call failed: %s", e)
-                raise
+                yield self._reply_text_result(
+                    event, self._format_llm_error(e, "视频解释")
+                )
+                return
 
             # 只对最终结果触发 OnLLMResponseEvent（避免中间过程外泄）
             try:
@@ -902,8 +1349,8 @@ class ZssmExplain(Star):
                 try:
                     ret = await call_get_msg(event, mid)
                     data = ob_data(ret or {})
-                    _t, imgs2, _v = extract_from_onebot_message_payload_with_videos(
-                        data
+                    _t, imgs2, _v, _vm = (
+                        extract_from_onebot_message_payload_with_videos(data)
                     )
                     for x in imgs2:
                         nx = _norm(x)
@@ -1088,6 +1535,15 @@ class ZssmExplain(Star):
     class _VideoPlan:
         video_src: str
         cleanup_paths: List[str] = field(default_factory=list)
+        video_meta: dict = field(default_factory=dict)
+
+    @dataclass
+    class _BilibiliPlan:
+        """B站图文/动态/直播等非视频内容的解释计划。"""
+
+        bili_url: str
+        bili_type: str  # dynamic/live/read/opus
+        cleanup_paths: List[str] = field(default_factory=list)
 
     @dataclass
     class _ReplyPlan:
@@ -1095,7 +1551,7 @@ class ZssmExplain(Star):
         stop_event: bool = True
         cleanup_paths: List[str] = field(default_factory=list)
 
-    _ExplainPlan = Union[_LLMPlan, _VideoPlan, _ReplyPlan]
+    _ExplainPlan = Union[_LLMPlan, _VideoPlan, _BilibiliPlan, _ReplyPlan]
 
     async def _build_explain_plan(
         self,
@@ -1112,8 +1568,21 @@ class ZssmExplain(Star):
             if urls:
                 target_url = urls[0]
                 if is_bilibili_url(target_url):
-                    return self._VideoPlan(
-                        video_src=target_url, cleanup_paths=cleanup_paths
+                    # 短链先展开，再判断真实类型
+                    bili_type = get_bilibili_url_type(target_url)
+                    if bili_type == "short":
+                        target_url = await resolve_bilibili_short_url(target_url)
+                        bili_type = get_bilibili_url_type(target_url)
+                    # 视频类型走 VideoPlan
+                    if bili_type == "video" or bili_type is None:
+                        return self._VideoPlan(
+                            video_src=target_url, cleanup_paths=cleanup_paths
+                        )
+                    # 动态/直播/专栏/图文走 BilibiliPlan（图文发给模型）
+                    return self._BilibiliPlan(
+                        bili_url=target_url,
+                        bili_type=bili_type,
+                        cleanup_paths=cleanup_paths,
                     )
 
                 timeout_sec = self._get_conf_int(
@@ -1174,9 +1643,13 @@ class ZssmExplain(Star):
                 cleanup_paths=cleanup_paths,
             )
 
-        text, images, vids, from_forward = await extract_quoted_payload_with_videos(
-            event
-        )
+        (
+            text,
+            images,
+            vids,
+            from_forward,
+            video_meta,
+        ) = await extract_quoted_payload_with_videos(event)
         # 同时支持“zssm + 图片”（图片在当前消息里，而非被回复消息中）
         try:
             images.extend(self._extract_images_from_event(event))
@@ -1187,7 +1660,10 @@ class ZssmExplain(Star):
             images = list(dict.fromkeys(images))
 
         if vids and not from_forward:
-            return self._VideoPlan(video_src=vids[0], cleanup_paths=cleanup_paths)
+            vm = video_meta.get(0, {}) if video_meta else {}
+            return self._VideoPlan(
+                video_src=vids[0], cleanup_paths=cleanup_paths, video_meta=vm
+            )
 
         if from_forward and vids:
             try:
@@ -1297,8 +1773,20 @@ class ZssmExplain(Star):
         if urls and not from_forward:
             target_url = urls[0]
             if is_bilibili_url(target_url):
-                return self._VideoPlan(
-                    video_src=target_url, cleanup_paths=cleanup_paths
+                # 短链先展开，再判断真实类型
+                bili_type = get_bilibili_url_type(target_url)
+                if bili_type == "short":
+                    target_url = await resolve_bilibili_short_url(target_url)
+                    bili_type = get_bilibili_url_type(target_url)
+                # 视频类型走 VideoPlan
+                if bili_type == "video" or bili_type is None:
+                    return self._VideoPlan(
+                        video_src=target_url, cleanup_paths=cleanup_paths
+                    )
+                return self._BilibiliPlan(
+                    bili_url=target_url,
+                    bili_type=bili_type,
+                    cleanup_paths=cleanup_paths,
                 )
 
             timeout_sec = self._get_conf_int(
@@ -1376,7 +1864,14 @@ class ZssmExplain(Star):
     async def _execute_explain_plan(self, event: AstrMessageEvent, plan: _ExplainPlan):
         """执行解释计划（executor 阶段）。"""
         if isinstance(plan, self._VideoPlan):
-            async for r in self._explain_video(event, plan.video_src):
+            async for r in self._explain_video(
+                event, plan.video_src, video_meta=plan.video_meta
+            ):
+                yield r
+            return
+
+        if isinstance(plan, self._BilibiliPlan):
+            async for r in self._explain_bilibili(event, plan.bili_url, plan.bili_type):
                 yield r
             return
 
@@ -1456,10 +1951,8 @@ class ZssmExplain(Star):
             except Exception:
                 pass
         except Exception as e:
-            logger.error(f"zssm_explain: LLM 调用失败: {e}")
-            yield self._reply_text_result(
-                event, "解释失败：LLM 或图片转述模型调用异常，请稍后再试或联系管理员。"
-            )
+            logger.error(f"zssm_explain: LLM call failed: {e}")
+            yield self._reply_text_result(event, self._format_llm_error(e, "解释"))
             try:
                 event.stop_event()
             except Exception:

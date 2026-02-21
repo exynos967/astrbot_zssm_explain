@@ -46,6 +46,122 @@ def _safe_subprocess_run(cmd: List[str]) -> subprocess.CompletedProcess:
     )
 
 
+def get_video_size_mb(path: str) -> float:
+    """获取视频文件大小（MB）。"""
+    try:
+        return os.path.getsize(path) / (1024 * 1024)
+    except Exception:
+        return 0.0
+
+
+def is_safe_video_path(path: str) -> bool:
+    """验证路径安全性：必须是绝对路径、存在的常规文件、非符号链接。"""
+    if not isinstance(path, str) or not path:
+        return False
+    try:
+        real = os.path.realpath(path)
+        if not os.path.isabs(real):
+            return False
+        if os.path.islink(path):
+            return False
+        if not os.path.isfile(real):
+            return False
+        return True
+    except OSError:
+        return False
+
+
+async def compress_video_to_target(
+    ffmpeg_path: str, video_path: str, target_mb: float
+) -> Optional[str]:
+    """使用 ffmpeg 两遍编码压缩视频到目标大小，返回临时文件路径（调用方负责清理）。
+
+    压缩失败返回 None。
+    """
+    if target_mb <= 0:
+        return None
+    src_mb = get_video_size_mb(video_path)
+    if src_mb <= 0:
+        return None
+    if src_mb <= target_mb:
+        return video_path
+
+    # 探测时长
+    dur = None
+    try:
+        ffprobe_path = resolve_ffprobe(ffmpeg_path)
+        if ffprobe_path:
+            dur = probe_duration_sec(ffprobe_path, video_path)
+    except Exception:
+        pass
+    if not dur or dur <= 0:
+        # 无法获取时长，无法计算目标码率
+        return None
+
+    target_bits = target_mb * 8 * 1024 * 1024
+    # 预留 10% 给音频
+    video_bitrate = int(target_bits * 0.9 / dur)
+    audio_bitrate = max(32000, int(target_bits * 0.1 / dur))
+    if video_bitrate < 50000:
+        return None
+
+    out_fd, out_path = tempfile.mkstemp(prefix="zssm_compressed_", suffix=".mp4")
+    os.close(out_fd)
+
+    cmd = [
+        ffmpeg_path,
+        "-y",
+        "-i",
+        video_path,
+        "-c:v",
+        "libx264",
+        "-b:v",
+        str(video_bitrate),
+        "-c:a",
+        "aac",
+        "-b:a",
+        str(audio_bitrate),
+        "-movflags",
+        "+faststart",
+        out_path,
+    ]
+    loop = asyncio.get_running_loop()
+
+    def _run():
+        return _safe_subprocess_run(cmd)
+
+    try:
+        res = await loop.run_in_executor(None, _run)
+        if res.returncode != 0:
+            logger.warning(
+                "zssm_explain: video compress failed (code=%s)",
+                res.returncode,
+            )
+            try:
+                os.remove(out_path)
+            except Exception:
+                pass
+            return None
+        result_mb = get_video_size_mb(out_path)
+        if result_mb > target_mb * 1.1:
+            logger.warning(
+                "zssm_explain: compressed %.1fMB > target %.1fMB", result_mb, target_mb
+            )
+            try:
+                os.remove(out_path)
+            except Exception:
+                pass
+            return None
+        return out_path
+    except Exception as e:
+        logger.warning("zssm_explain: video compress error: %s", e)
+        try:
+            os.remove(out_path)
+        except Exception:
+            pass
+        return None
+
+
 def extract_videos_from_chain(chain: List[object]) -> List[str]:
     """从消息链中递归提取视频相关 URL / 路径。"""
     videos: List[str] = []
@@ -153,6 +269,48 @@ def is_napcat(event: AstrMessageEvent) -> bool:
         return False
 
 
+def _parse_file_result(f: str) -> Optional[str]:
+    """将 napcat 返回的 file 字段解析为可用路径/URL。"""
+    if not isinstance(f, str) or not f:
+        return None
+    lf = f.lower()
+    if lf.startswith("base64://") or lf.startswith("data:image/"):
+        return f
+    if lf.startswith("file://"):
+        try:
+            fp = f[7:]
+            if fp.startswith("/") and len(fp) > 3 and fp[2] == ":":
+                fp = fp[1:]
+            if fp and os.path.exists(fp):
+                return os.path.abspath(fp)
+        except Exception:
+            pass
+        return None
+    try:
+        if os.path.isabs(f) and os.path.exists(f):
+            return os.path.abspath(f)
+        if os.path.exists(f):
+            return os.path.abspath(f)
+    except Exception:
+        pass
+    return None
+
+
+def _parse_get_file_data(data: Optional[dict]) -> Optional[str]:
+    """从 get_file / get_image 等返回的 data 中提取可用 url 或本地路径。"""
+    if not isinstance(data, dict):
+        return None
+    url = data.get("url")
+    if isinstance(url, str) and url.strip():
+        return url.strip()
+    f = data.get("file")
+    if isinstance(f, str) and f.strip():
+        result = _parse_file_result(f.strip())
+        if result:
+            return result
+    return None
+
+
 async def napcat_resolve_file_url(
     event: AstrMessageEvent, file_id: str
 ) -> Optional[str]:
@@ -216,24 +374,133 @@ async def napcat_resolve_file_url(
             pass
         return None
 
+    # 安全检查：如果 file_id 看起来是纯文件名（含视频扩展名但不像 UUID/hash），
+    # 则跳过 get_file 调用，因为 napcat 会尝试下载该文件名，大文件会导致超时崩溃。
+    def _looks_like_plain_filename(s: str) -> bool:
+        """判断是否为纯文件名（非 UUID/hash 格式）。"""
+        if not s:
+            return False
+        base, ext = os.path.splitext(s)
+        if not ext:
+            return False
+        # UUID 格式（32 hex 或带连字符）或纯 hash（32+ hex）不算纯文件名
+        if re.match(r"^[0-9a-fA-F]{32,}$", base):
+            return False
+        if re.match(
+            r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$",
+            base,
+        ):
+            return False
+        return True
+
+    is_plain_filename = _looks_like_plain_filename(file_id)
+
     # 一些 Napcat 场景下 file 值会携带扩展名（形如 md5.jpg / md5.mp4），但接口实际需要 md5 本体。
     candidates: List[str] = [file_id]
     stem = _stem_if_needed(file_id)
     if isinstance(stem, str) and stem and stem not in candidates:
         candidates.append(stem)
 
+    # ---- 大文件保护：先用 get_file 探测 file_size，>10MB 走 download_file 缓存 ----
+    # 对纯文件名（如 NCED.mkv）直接跳过 get_file（会导致 napcat 崩溃），
+    # 对 UUID/hash 格式的 file_id 则安全调用 get_file 探测。
+    _LARGE_FILE_THRESHOLD = 10 * 1024 * 1024  # 10MB
+
+    if not is_plain_filename:
+        for fid in candidates:
+            for param_key in ("file_id", "file"):
+                try:
+                    ret = await event.bot.api.call_action(
+                        "get_file", **{param_key: fid}
+                    )
+                    info = ret.get("data") if isinstance(ret, dict) else None
+                    if not isinstance(info, dict):
+                        info = ret if isinstance(ret, dict) else {}
+                    # 解析 file_size
+                    raw_size = info.get("file_size")
+                    file_size = 0
+                    if isinstance(raw_size, (int, float)):
+                        file_size = int(raw_size)
+                    elif isinstance(raw_size, str) and raw_size.strip().isdigit():
+                        file_size = int(raw_size.strip())
+
+                    if file_size > _LARGE_FILE_THRESHOLD:
+                        # 大文件：用 download_file 让 napcat 缓存到本地
+                        src_url = info.get("url") or info.get("file") or ""
+                        file_name = info.get("file_name") or os.path.basename(file_id)
+                        size_mb = file_size / (1024 * 1024)
+                        if isinstance(src_url, str) and src_url.strip():
+                            logger.info(
+                                "zssm_explain: [download] start %.1fMB '%s'",
+                                size_mb,
+                                file_name,
+                            )
+                            t0 = __import__("time").monotonic()
+                            try:
+                                dl_ret = await event.bot.api.call_action(
+                                    "download_file",
+                                    url=src_url.strip(),
+                                    name=file_name,
+                                )
+                                elapsed = __import__("time").monotonic() - t0
+                                dl_data = (
+                                    dl_ret.get("data")
+                                    if isinstance(dl_ret, dict)
+                                    else None
+                                )
+                                if not isinstance(dl_data, dict):
+                                    dl_data = dl_ret if isinstance(dl_ret, dict) else {}
+                                cached = dl_data.get("file")
+                                if isinstance(cached, str) and cached.strip():
+                                    speed = size_mb / elapsed if elapsed > 0 else 0
+                                    logger.info(
+                                        "zssm_explain: [download] done %.1fMB in %.1fs (%.1fMB/s) => %s",
+                                        size_mb,
+                                        elapsed,
+                                        speed,
+                                        cached[:80],
+                                    )
+                                    return _parse_file_result(cached)
+                                logger.warning(
+                                    "zssm_explain: [download] finished in %.1fs but no file path returned",
+                                    elapsed,
+                                )
+                            except Exception as dl_e:
+                                elapsed = __import__("time").monotonic() - t0
+                                logger.warning(
+                                    "zssm_explain: [download] failed after %.1fs: %s",
+                                    elapsed,
+                                    dl_e,
+                                )
+                        # download_file 失败，仍尝试返回 get_file 的结果
+                        result = _parse_get_file_data(info)
+                        if result:
+                            return result
+                    else:
+                        # 小文件或未知大小：直接用 get_file 返回的 url/file
+                        result = _parse_get_file_data(info)
+                        if result:
+                            return result
+                except Exception as e:
+                    logger.debug(
+                        "zssm_explain: get_file(%s=%s) failed: %s",
+                        param_key,
+                        fid[:64],
+                        e,
+                    )
+    else:
+        logger.info(
+            "zssm_explain: skip get_file for plain filename '%s' to avoid napcat crash",
+            file_id[:64],
+        )
+
+    # ---- 其他接口兜底 ----
     actions: List[Dict[str, Any]] = []
-    # 兜底：Napcat 通用文件解析接口（可用于 message 视频/图片等的 file_id/fileUUID）
     for fid in candidates:
-        actions.append({"action": "get_file", "params": {"file_id": fid}})
-        actions.append({"action": "get_file", "params": {"file": fid}})
-        # 图片在部分实现中需要 get_image 才能拿到本地路径或可下载 URL（优先尝试，失败则忽略）
         actions.append({"action": "get_image", "params": {"file": fid}})
         actions.append({"action": "get_image", "params": {"file_id": fid}})
         actions.append({"action": "get_image", "params": {"id": fid}})
         actions.append({"action": "get_image", "params": {"image": fid}})
-
-    # 群文件接口：仅在能拿到群号时尝试
     if group_id_param:
         for fid in candidates:
             actions.append(
@@ -250,74 +517,26 @@ async def napcat_resolve_file_url(
         params = item["params"]
         try:
             ret = await event.bot.api.call_action(action, **params)
-            data: Optional[Dict[str, Any]]
+            info: Optional[Dict[str, Any]]
             if isinstance(ret, dict):
                 d = ret.get("data")
-                data = d if isinstance(d, dict) else ret
+                info = d if isinstance(d, dict) else ret
             else:
-                data = None
-            url = data.get("url") if isinstance(data, dict) else None
-            if isinstance(url, str) and url:
-                logger.info("zssm_explain: napcat %s ok, url=%s", action, url[:80])
-                return url
-            # get_file/get_image/get_record 等可能返回本地路径 file
-            f = data.get("file") if isinstance(data, dict) else None
-            if isinstance(f, str) and f:
-                lf = f.lower()
-                # OneBot 常见：base64://... 或 data:image/...;base64,...
-                if lf.startswith("base64://") or lf.startswith("data:image/"):
-                    logger.info(
-                        "zssm_explain: napcat %s ok, base64(%d)", action, len(f)
-                    )
-                    return f
-                # OneBot 常见：file://...
-                if lf.startswith("file://"):
-                    try:
-                        fp = f[7:]
-                        # Windows: file:///C:/xxx
-                        if fp.startswith("/") and len(fp) > 3 and fp[2] == ":":
-                            fp = fp[1:]
-                        if fp and os.path.exists(fp):
-                            fp = os.path.abspath(fp)
-                            logger.info(
-                                "zssm_explain: napcat %s ok, file=%s", action, fp[:80]
-                            )
-                            return fp
-                    except Exception:
-                        pass
-                # 绝对路径或相对路径（存在则提升为绝对路径）
-                try:
-                    if os.path.isabs(f) and os.path.exists(f):
-                        logger.info(
-                            "zssm_explain: napcat %s ok, file=%s", action, f[:80]
-                        )
-                        return f
-                    if os.path.exists(f):
-                        fp = os.path.abspath(f)
-                        logger.info(
-                            "zssm_explain: napcat %s ok, file=%s", action, fp[:80]
-                        )
-                        return fp
-                except Exception:
-                    pass
+                info = None
+            result = _parse_get_file_data(info)
+            if result:
+                logger.info("zssm_explain: napcat %s ok => %s", action, result[:80])
+                return result
             logger.debug(
-                "zssm_explain: napcat %s returned no url/file (file_id=%s params=%s)",
+                "zssm_explain: napcat %s returned no url/file (file_id=%s)",
                 action,
                 str(file_id)[:64],
-                {
-                    k: str(v)[:64]
-                    for k, v in (params.items() if isinstance(params, dict) else [])
-                },
             )
         except Exception as e:
             logger.debug(
-                "zssm_explain: napcat %s failed (file_id=%s params=%s): %s",
+                "zssm_explain: napcat %s failed (file_id=%s): %s",
                 action,
                 str(file_id)[:64],
-                {
-                    k: str(v)[:64]
-                    for k, v in (params.items() if isinstance(params, dict) else [])
-                },
                 e,
             )
     logger.warning(
@@ -624,11 +843,15 @@ async def extract_audio_wav(ffmpeg_path: str, video_path: str) -> Optional[str]:
 
 
 async def download_video_to_temp(
-    url: str, size_mb_limit: int, headers: Optional[Dict[str, str]] = None
+    url: str,
+    size_mb_limit: int,
+    headers: Optional[Dict[str, str]] = None,
+    timeout_sec: int = 120,
 ) -> Optional[str]:
     """下载视频到临时文件，做大小限制校验。
 
     headers 可选，用于为特定站点（如 B 站）附加 UA/Referer 等。
+    timeout_sec 下载超时时间，默认 120 秒。
     """
 
     def _safe_ext_from_url(u: str) -> str:
@@ -662,11 +885,18 @@ async def download_video_to_temp(
     tmp_path = tmp.name
     tmp.close()
     max_bytes = size_mb_limit * 1024 * 1024
+    dl_timeout = max(30, min(600, timeout_sec))
     if aiohttp is not None:
         try:
-            async with aiohttp.ClientSession() as sess:
-                async with sess.get(url, timeout=20, headers=headers or {}) as resp:
+            timeout_obj = aiohttp.ClientTimeout(total=dl_timeout)
+            async with aiohttp.ClientSession(timeout=timeout_obj) as sess:
+                async with sess.get(url, headers=headers or {}) as resp:
                     if resp.status != 200:
+                        logger.warning(
+                            "zssm_explain: download_video_to_temp status=%s url=%s",
+                            resp.status,
+                            url[:80],
+                        )
                         try:
                             os.remove(tmp_path)
                         except Exception:
@@ -674,6 +904,11 @@ async def download_video_to_temp(
                         return None
                     cl = resp.headers.get("Content-Length")
                     if cl and cl.isdigit() and int(cl) > max_bytes:
+                        logger.warning(
+                            "zssm_explain: download_video_to_temp size %s > limit %s",
+                            cl,
+                            max_bytes,
+                        )
                         try:
                             os.remove(tmp_path)
                         except Exception:
@@ -697,7 +932,8 @@ async def download_video_to_temp(
                                 return None
                             f.write(chunk)
             return tmp_path if os.path.exists(tmp_path) else None
-        except Exception:
+        except Exception as e:
+            logger.warning("zssm_explain: download_video_to_temp failed: %s", e)
             try:
                 os.remove(tmp_path)
             except Exception:
@@ -707,7 +943,11 @@ async def download_video_to_temp(
         import urllib.request
 
         req = urllib.request.Request(url, headers=headers or {})
-        with urllib.request.urlopen(req, timeout=20) as r, open(tmp_path, "wb") as f:
+        # 使用配置的超时时间
+        with (
+            urllib.request.urlopen(req, timeout=dl_timeout) as r,
+            open(tmp_path, "wb") as f,
+        ):
             total = 0
             while True:
                 chunk = r.read(8192)

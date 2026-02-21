@@ -374,17 +374,61 @@ async def call_get_forward_msg(
 
 def extract_from_onebot_message_payload(payload: Any) -> Tuple[str, List[str]]:
     """从 OneBot/Napcat get_msg 返回的 payload 中提取文本与图片；识别 forward/nodes 由上层处理。"""
-    text, images, _videos = extract_from_onebot_message_payload_with_videos(payload)
+    text, images, _videos, _meta = extract_from_onebot_message_payload_with_videos(
+        payload
+    )
     return (text, images)
+
+
+def _find_file_path_in_records(data: dict, file_name: str) -> Optional[dict]:
+    """从 Napcat get_msg 返回的 records 中查找文件/视频元素信息。
+
+    同时检查 fileElement 和 videoElement，返回 dict: {"filePath": ..., "fileUuid": ...} 或 None。
+    """
+    records = data.get("records")
+    if not isinstance(records, list):
+        return None
+    for rec in records:
+        if not isinstance(rec, dict):
+            continue
+        elements = rec.get("elements")
+        if not isinstance(elements, list):
+            continue
+        for elem in elements:
+            if not isinstance(elem, dict):
+                continue
+            # 检查 fileElement 和 videoElement
+            for elem_key in ("videoElement", "fileElement"):
+                fe = elem.get(elem_key)
+                if not isinstance(fe, dict):
+                    continue
+                fn = fe.get("fileName") or fe.get("file_name")
+                if not (isinstance(fn, str) and fn == file_name):
+                    continue
+                result: dict = {}
+                fp = fe.get("filePath") or fe.get("file_path")
+                if isinstance(fp, str) and fp.strip():
+                    result["filePath"] = fp.strip()
+                fu = fe.get("fileUuid") or fe.get("file_uuid")
+                if isinstance(fu, str) and fu.strip():
+                    result["fileUuid"] = fu.strip()
+                if result:
+                    return result
+    return None
 
 
 def extract_from_onebot_message_payload_with_videos(
     payload: Any,
-) -> Tuple[str, List[str], List[str]]:
-    """从 OneBot/Napcat get_msg 返回的 payload 中提取文本、图片与视频；识别 forward/nodes 由上层处理。"""
+) -> Tuple[str, List[str], List[str], dict]:
+    """从 OneBot/Napcat get_msg 返回的 payload 中提取文本、图片与视频；识别 forward/nodes 由上层处理。
+
+    返回 (text, images, videos, video_meta)。
+    video_meta: {video_index: {"fileUuid": ...}} 供后续 get_group_file_url 使用。
+    """
     texts: List[str] = []
     images: List[str] = []
     videos: List[str] = []
+    video_meta: dict = {}
     data = ob_data(payload) if isinstance(payload, dict) else {}
     if isinstance(data, dict):
         msg = data.get("message") or data.get("messages")
@@ -404,9 +448,28 @@ def extract_from_onebot_message_payload_with_videos(
                         if isinstance(url, str) and url:
                             images.append(url)
                     elif t == "video":
-                        file_id = d.get("url") or d.get("file")
-                        if isinstance(file_id, str) and file_id:
-                            videos.append(file_id)
+                        url = d.get("url")
+                        file_id = d.get("file")
+                        if (
+                            isinstance(url, str)
+                            and url
+                            and (url.lower().startswith("http") or os.path.isabs(url))
+                        ):
+                            videos.append(url)
+                        elif isinstance(file_id, str) and file_id:
+                            # 优先从 records 中提取 filePath / fileUuid，
+                            # 避免用文件名调 get_file 导致 napcat 崩溃
+                            name_hint = d.get("name") or d.get("file_name") or file_id
+                            rec_info = _find_file_path_in_records(data, str(name_hint))
+                            if rec_info:
+                                # filePath 可直接用；fileUuid 附加到 video_meta 供后续 get_group_file_url
+                                fp = rec_info.get("filePath")
+                                fu = rec_info.get("fileUuid")
+                                videos.append(fp if fp else (fu or file_id))
+                                if fu:
+                                    video_meta[len(videos) - 1] = {"fileUuid": fu}
+                            else:
+                                videos.append(file_id)
                     elif t == "json":
                         # Napcat JSON 消息：核心数据在 data.data 中，需要再次解析
                         raw = d.get("data")
@@ -438,22 +501,36 @@ def extract_from_onebot_message_payload_with_videos(
                                 or _looks_like_video(str(file_id))
                                 or _looks_like_video(str(d.get("url") or ""))
                             ):
-                                videos.append(file_id)
+                                # 优先从 records 中提取完整本地路径，避免调 get_file
+                                rec_info = _find_file_path_in_records(data, str(name))
+                                if rec_info:
+                                    fp = rec_info.get("filePath")
+                                    fu = rec_info.get("fileUuid")
+                                    videos.append(fp if fp else (fu or file_id))
+                                    if fu:
+                                        video_meta[len(videos) - 1] = {"fileUuid": fu}
+                                else:
+                                    videos.append(file_id)
                     # 对于 forward/nodes，不在此层解析，由上层触发 get_forward_msg 获取节点
                 except Exception as e:
                     logger.warning(f"zssm_explain: parse onebot segment failed: {e}")
-            return ("\n".join([t for t in texts if t]).strip(), images, videos)
+            return (
+                "\n".join([t for t in texts if t]).strip(),
+                images,
+                videos,
+                video_meta,
+            )
         elif isinstance(msg, str) and msg:
             texts.append(msg)
-            return ("\n".join(texts).strip(), images, videos)
+            return ("\n".join(texts).strip(), images, videos, video_meta)
         raw = data.get("raw_message")
         if isinstance(raw, str) and raw:
             texts.append(raw)
-            return ("\n".join(texts).strip(), images, videos)
+            return ("\n".join(texts).strip(), images, videos, video_meta)
     logger.warning(
         "zssm_explain: failed to extract text from OneBot payload; fallback to empty text"
     )
-    return ("", images, videos)
+    return ("", images, videos, video_meta)
 
 
 def _extract_forward_nodes_recursively(
@@ -621,10 +698,10 @@ async def extract_quoted_payload(
 
 async def extract_quoted_payload_with_videos(
     event: AstrMessageEvent,
-) -> Tuple[Optional[str], List[str], List[str], bool]:
+) -> Tuple[Optional[str], List[str], List[str], bool, dict]:
     """从当前事件中获取被回复消息的文本、图片与视频。
 
-    优先：Reply 携带嵌入消息；回退：OneBot get_msg/get_forward_msg；失败：(None, [], [], False)。
+    优先：Reply 携带嵌入消息；回退：OneBot get_msg/get_forward_msg；失败：(None, [], [], False, {})。
 
     返回:
     - text: 提取到的文本（可为空字符串）
@@ -647,20 +724,22 @@ async def extract_quoted_payload_with_videos(
             pass
 
     if not reply_comp:
-        return (None, [], [], False)
+        return (None, [], [], False, {})
 
     text, images, videos, from_forward = try_extract_from_reply_component_with_videos(
         reply_comp
     )
     if text or images or videos:
-        return (text, images, videos, from_forward)
+        return (text, images, videos, from_forward, {})
 
     reply_id = get_reply_message_id(reply_comp)
     if reply_id:
         try:
             ret = await call_get_msg(event, reply_id)
             data = ob_data(ret or {})
-            t2, imgs2, vids2 = extract_from_onebot_message_payload_with_videos(data)
+            t2, imgs2, vids2, vids2_meta = (
+                extract_from_onebot_message_payload_with_videos(data)
+            )
             agg_texts: List[str] = [t2] if t2 else []
             agg_imgs: List[str] = list(imgs2)
             agg_vids: List[str] = list(vids2)
@@ -762,6 +841,7 @@ async def extract_quoted_payload_with_videos(
                     _uniq(agg_imgs),
                     _uniq(agg_vids),
                     from_forward_ob,
+                    vids2_meta,
                 )
         except Exception as e:
             logger.warning(f"zssm_explain: get_msg failed: {e}")
@@ -769,4 +849,4 @@ async def extract_quoted_payload_with_videos(
     logger.info(
         "zssm_explain: reply component found but no embedded origin; consider platform API to fetch by id"
     )
-    return (None, [], [], False)
+    return (None, [], [], False, {})
