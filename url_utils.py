@@ -15,6 +15,7 @@ except Exception:  # pragma: no cover
 from astrbot.api import logger
 
 from .file_preview_utils import pdf_bytes_to_markdown
+from .wechat_utils import is_wechat_article_url, fetch_wechat_article_markdown
 
 
 def extract_urls_from_text(text: Optional[str]) -> List[str]:
@@ -363,7 +364,19 @@ async def prepare_url_prompt(
     - text: 当前实现不返回正文（保持与旧逻辑一致，返回 None）
     - images: 可选的本地截图路径（Cloudflare 降级）
     """
-    # 1) 特判 PDF 链接：直接按 PDF 处理并生成 Markdown 片段
+    # 1) 特判微信公众号文章：仅抓取当前文章并转 Markdown（不抓账号/专栏列表）
+    if is_wechat_article_url(url):
+        wx_ctx = await fetch_wechat_article_markdown(
+            url,
+            timeout_sec,
+            last_fetch_info,
+            max_chars=max_chars,
+            user_prompt_template=user_prompt_template,
+        )
+        if wx_ctx:
+            return wx_ctx
+
+    # 2) 特判 PDF 链接：直接按 PDF 处理并生成 Markdown 片段
     try:
         path = urlparse(url).path
         _, ext = os.path.splitext(str(path).lower())
@@ -389,7 +402,7 @@ async def prepare_url_prompt(
                 )
                 return (user_prompt, None, [])
 
-    # 2) 常规 HTML 场景
+    # 3) 常规 HTML 场景
     html = await fetch_html(url, timeout_sec, last_fetch_info)
     if html:
         user_prompt, _title = build_url_user_prompt(
@@ -397,7 +410,7 @@ async def prepare_url_prompt(
         )
         return (user_prompt, None, [])
 
-    # 3) Cloudflare 截图降级
+    # 4) Cloudflare 截图降级
     info = last_fetch_info or {}
     is_cf = bool(info.get("cloudflare"))
     if is_cf and cf_screenshot_enable:
@@ -454,6 +467,10 @@ def build_url_failure_message(
     last_fetch_info: Dict[str, Any], cf_screenshot_enable: bool
 ) -> str:
     info = last_fetch_info or {}
+    if info.get("wechat"):
+        if info.get("wechat_captcha"):
+            return "微信公众号页面触发验证码，当前无法自动抓取，请稍后重试或更换网络后再试。"
+        return "微信公众号文章抓取失败，请确认链接可访问并稍后重试。"
     if info.get("cloudflare"):
         if cf_screenshot_enable:
             return "目标站点启用 Cloudflare 防护，截图降级失败，请稍后重试或改为发送手动截图/摘录内容。"
