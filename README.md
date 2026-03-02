@@ -1,3 +1,7 @@
+<div align="center">
+
+![:name](https://count.getloli.com/@:astrbot_zssm_explain?name=%3Aastrbot_zssm_explain&theme=miku&padding=7&offset=0&align=top&scale=1&pixelated=1&darkmode=auto)
+
 ## zssm_explain 插件说明
 
 一个为 AstrBot 提供「知识说明 / 消息解释」能力的插件。支持文本、图片、网页、视频以及 QQ 群文件（含 PDF，支持转 Markdown），可智能理解被回复的消息或内容链接，并输出结构化的中文解释。
