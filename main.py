@@ -246,8 +246,10 @@ class ZssmExplain(Star):
         return str(keyword).strip().lower()
 
     def _get_configured_trigger_keywords(self) -> List[str]:
-        raw_keywords = self._get_conf_list_str(TRIGGER_KEYWORDS_KEY)
-        if not raw_keywords:
+        # 仅当配置项缺失时回退默认；显式配置空列表表示禁用额外关键词。
+        if isinstance(self.config, dict) and TRIGGER_KEYWORDS_KEY in self.config:
+            raw_keywords = self._get_conf_list_str(TRIGGER_KEYWORDS_KEY)
+        else:
             raw_keywords = list(DEFAULT_EXTRA_TRIGGER_KEYWORDS)
 
         keywords: List[str] = []
@@ -1193,7 +1195,8 @@ class ZssmExplain(Star):
         logger.debug(
             f"zssm_explain: trigger found: {keyword} (prefix={has_prefix}, is_command={is_command})"
         )
-        if (has_prefix or is_command) and keyword != COMMAND_TRIGGER_KEYWORD:
+        # 仅允许 zssm 作为带前缀的命令触发；@Bot + 额外关键词仍按关键词触发处理。
+        if has_prefix and keyword != COMMAND_TRIGGER_KEYWORD:
             return False
 
         return True
@@ -2120,7 +2123,27 @@ class ZssmExplain(Star):
             # 如果首个文本没搜到，回退到整体字符串
             check_text = head_text or (getattr(event, "message_str", "") or "")
             trigger_keyword = self._match_trigger_keyword(check_text)
-            if not self._is_zssm_trigger(check_text, is_command=True):
+            actual_command_like = False
+            try:
+                text_for_check = check_text.strip()
+                has_prefix = bool(
+                    re.match(r"^\s*([/!！。\.、，\-]+)", text_for_check)
+                )
+                at_me = False
+                try:
+                    self_id = event.get_self_id()
+                    at_me = self._chain_has_at_me(chain, self_id)
+                except Exception:
+                    at_me = False
+                actual_command_like = has_prefix or (
+                    at_me and trigger_keyword == COMMAND_TRIGGER_KEYWORD
+                )
+            except Exception:
+                actual_command_like = False
+
+            if not self._is_zssm_trigger(
+                check_text, is_command=actual_command_like
+            ):
                 logger.debug(
                     f"zssm_explain: zssm command filter blocked execution. check_text: {check_text}"
                 )
