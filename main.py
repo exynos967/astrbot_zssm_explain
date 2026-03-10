@@ -119,8 +119,12 @@ DEFAULT_FILE_PREVIEW_EXTS = "txt,md,log,json,csv,ini,cfg,yml,yaml,py"
 DEFAULT_FILE_PREVIEW_MAX_SIZE_KB = 100
 DEFAULT_FORWARD_VIDEO_KEYFRAME_ENABLE = True
 DEFAULT_FORWARD_VIDEO_MAX_COUNT = 2
-TRIGGER_KEYWORD_PATTERN = r"zssm|hyw|何意味"
-HE_YI_WEI_TRIGGER_KEYWORDS = frozenset({"hyw", "何意味"})
+TRIGGER_KEYWORDS_KEY = "trigger_keywords"
+COMMAND_TRIGGER_KEYWORD = "zssm"
+DEFAULT_EXTRA_TRIGGER_KEYWORDS = ("hyw", "何意味")
+HE_YI_WEI_TRIGGER_KEYWORDS = frozenset(
+    kw.lower() for kw in DEFAULT_EXTRA_TRIGGER_KEYWORDS
+)
 
 
 class ZssmExplain(Star):
@@ -137,6 +141,7 @@ class ZssmExplain(Star):
 
     async def initialize(self):
         """可选：插件初始化。"""
+        self._migrate_legacy_trigger_keywords_config()
 
     def _reply_text_result(self, event: AstrMessageEvent, text: str):
         """构造一个显式“回复调用者”的文本消息结果。
@@ -233,6 +238,71 @@ class ZssmExplain(Star):
         except Exception:
             pass
         return []
+
+    @staticmethod
+    def _normalize_trigger_keyword(keyword: object) -> str:
+        if not isinstance(keyword, (str, int)):
+            return ""
+        return str(keyword).strip().lower()
+
+    def _get_configured_trigger_keywords(self) -> List[str]:
+        raw_keywords = self._get_conf_list_str(TRIGGER_KEYWORDS_KEY)
+        if not raw_keywords:
+            raw_keywords = list(DEFAULT_EXTRA_TRIGGER_KEYWORDS)
+
+        keywords: List[str] = []
+        seen: Set[str] = set()
+        for raw_keyword in raw_keywords:
+            keyword = self._normalize_trigger_keyword(raw_keyword)
+            if (
+                not keyword
+                or keyword == COMMAND_TRIGGER_KEYWORD
+                or keyword in seen
+            ):
+                continue
+            keywords.append(keyword)
+            seen.add(keyword)
+        return keywords
+
+    def _get_effective_trigger_keywords(self) -> List[str]:
+        return [COMMAND_TRIGGER_KEYWORD, *self._get_configured_trigger_keywords()]
+
+    @staticmethod
+    def _build_trigger_keyword_pattern(keywords: List[str]) -> str:
+        escaped = sorted((re.escape(keyword) for keyword in keywords), key=len, reverse=True)
+        return "|".join(escaped)
+
+    def _get_trigger_keyword_pattern(self) -> str:
+        return self._build_trigger_keyword_pattern(self._get_effective_trigger_keywords())
+
+    def _migrate_legacy_trigger_keywords_config(self) -> None:
+        if not isinstance(self.config, dict):
+            return
+        if self._get_conf_bool(HE_YI_WEI_ENABLE_KEY, True):
+            return
+
+        configured_keywords = self._get_configured_trigger_keywords()
+        default_keywords = [
+            self._normalize_trigger_keyword(keyword)
+            for keyword in DEFAULT_EXTRA_TRIGGER_KEYWORDS
+        ]
+        if configured_keywords != default_keywords:
+            return
+
+        self.config[TRIGGER_KEYWORDS_KEY] = []
+        self.config[HE_YI_WEI_ENABLE_KEY] = True
+        save_config = getattr(self.config, "save_config", None)
+        if callable(save_config):
+            try:
+                save_config()
+            except Exception as exc:
+                logger.warning(
+                    "zssm_explain: failed to persist legacy trigger keyword migration: %s",
+                    exc,
+                )
+        logger.info(
+            "zssm_explain: migrated legacy enable_heyiwei=false to trigger_keywords=[]"
+        )
 
     def _is_group_allowed(self, event: AstrMessageEvent) -> bool:
         """根据配置的白/黑名单判断是否允许在该群聊中使用插件。
@@ -1099,7 +1169,6 @@ class ZssmExplain(Star):
         if not isinstance(text, str):
             return False
         t = text.strip()
-        hyw_enabled = self._get_conf_bool(HE_YI_WEI_ENABLE_KEY, True)
         kw_enabled = self._get_conf_bool(KEYWORD_ZSSM_ENABLE_KEY, True)
 
         # 1. 关键词自动触发逻辑判定
@@ -1124,25 +1193,26 @@ class ZssmExplain(Star):
         logger.debug(
             f"zssm_explain: trigger found: {keyword} (prefix={has_prefix}, is_command={is_command})"
         )
-        # 3. 如果是何意味别名，但关闭了何意味开关，拦截
-        if keyword in HE_YI_WEI_TRIGGER_KEYWORDS and not hyw_enabled:
+        if (has_prefix or is_command) and keyword != COMMAND_TRIGGER_KEYWORD:
             return False
 
         return True
 
-    @staticmethod
-    def _match_trigger_keyword(text: str) -> Optional[str]:
+    def _match_trigger_keyword(self, text: str) -> Optional[str]:
         """从文本中提取命中的触发词，未命中则返回 None。"""
         if not isinstance(text, str):
             return None
+        pattern = self._get_trigger_keyword_pattern()
+        if not pattern:
+            return None
         matched = re.match(
-            rf"^[\s/!！。\.、，\-]*({TRIGGER_KEYWORD_PATTERN})(\s|$)",
+            rf"^[\s/!！。\.、，\-]*({pattern})(\s|$)",
             text.strip(),
             re.I,
         )
         if not matched:
             return None
-        return matched.group(1).lower()
+        return self._normalize_trigger_keyword(matched.group(1))
 
     @staticmethod
     def _first_plain_head_text(chain: list[object]) -> str:
@@ -1201,14 +1271,16 @@ class ZssmExplain(Star):
             pass
         return False
 
-    @staticmethod
-    def _strip_trigger_and_get_content(text: str) -> str:
+    def _strip_trigger_and_get_content(self, text: str) -> str:
         """剥离前缀与 zssm 触发词，返回其后的内容；无内容则返回空串。"""
         if not isinstance(text, str):
             return ""
         t = text.strip()
+        pattern = self._get_trigger_keyword_pattern()
+        if not pattern:
+            return ""
         m = re.match(
-            rf"^[\s/!！。\.、，\-]*(?:{TRIGGER_KEYWORD_PATTERN})(?:\s+(.+))?$",
+            rf"^[\s/!！。\.、，\-]*(?:{pattern})(?:\s+(.+))?$",
             t,
             re.I,
         )
@@ -2031,7 +2103,7 @@ class ZssmExplain(Star):
             except Exception:
                 pass
 
-    @filter.command("zssm", alias={"知识说明", "解释", "hyw", "何意味"})
+    @filter.command("zssm")
     async def zssm(self, event: AstrMessageEvent):
         """解释被回复消息：/zssm 或关键词触发；若携带内容则直接解释该内容，否则按回复消息逻辑。"""
         cleanup_paths: List[str] = []
@@ -2122,7 +2194,7 @@ class ZssmExplain(Star):
 
     @filter.event_message_type(filter.EventMessageType.ALL)
     async def keyword_zssm(self, event: AstrMessageEvent):
-        """关键词触发：忽略常见前缀/Reply/At 等，检测首个 Plain 段的 zssm。
+        """关键词触发：忽略常见前缀/Reply/At 等，检测首个 Plain 段的配置关键词。
         避免与 /zssm 指令重复：若以 /zssm 开头则交由指令处理。
         """
         # 群聊权限控制：不满足条件则直接忽略
@@ -2151,12 +2223,14 @@ class ZssmExplain(Star):
         if isinstance(head, str) and head.strip():
             hs = head.strip()
             if re.match(
-                rf"^\s*/\s*({TRIGGER_KEYWORD_PATTERN})(\s|$)",
+                rf"^\s*/\s*({re.escape(COMMAND_TRIGGER_KEYWORD)})(\s|$)",
                 hs,
                 re.I,
             ):
                 return
-            if at_me and re.match(rf"^({TRIGGER_KEYWORD_PATTERN})(\s|$)", hs, re.I):
+            if at_me and re.match(
+                rf"^({re.escape(COMMAND_TRIGGER_KEYWORD)})(\s|$)", hs, re.I
+            ):
                 return
             if self._is_zssm_trigger(hs, is_command=at_me):
                 async for r in self.zssm(event):
@@ -2170,12 +2244,14 @@ class ZssmExplain(Star):
         if isinstance(text, str) and text.strip():
             t = text.strip()
             if re.match(
-                rf"^\s*/\s*({TRIGGER_KEYWORD_PATTERN})(\s|$)",
+                rf"^\s*/\s*({re.escape(COMMAND_TRIGGER_KEYWORD)})(\s|$)",
                 t,
                 re.I,
             ):
                 return
-            if at_me and re.match(rf"^({TRIGGER_KEYWORD_PATTERN})(\s|$)", t, re.I):
+            if at_me and re.match(
+                rf"^({re.escape(COMMAND_TRIGGER_KEYWORD)})(\s|$)", t, re.I
+            ):
                 return
             if self._is_zssm_trigger(t, is_command=at_me):
                 async for r in self.zssm(event):

@@ -13,6 +13,13 @@
     "default": [],
     "hint": "仅在 whitelist/blacklist 下生效；留空等效于无限制"
   },
+  "trigger_keywords": {
+    "description": "额外关键词触发词列表",
+    "type": "list",
+    "items": { "type": "string" },
+    "default": ["hyw", "何意味"],
+    "hint": "仅参与关键词监听，不会注册为命令"
+  },
   "video_asr_enable": {
     "description": "是否启用音频转写",
     "type": "bool",
@@ -26,22 +33,23 @@
     "hint": "关闭后仅按文本/图片解释"
   },
   "enable_keyword_zssm": {
-    "description": "是否启用“zssm”关键词自动触发",
+    "description": "是否启用 zssm 和额外关键词自动触发",
     "type": "bool",
     "default": true,
-    "hint": "关闭后仅响应 /zssm 指令，不再通过纯文本“zssm”自动触发"
+    "hint": "关闭后仅响应 /zssm 指令；不再通过 zssm 关键词或额外关键词触发"
   },
   "enable_heyiwei": {
-    "description": "是否开启“何意味”",
+    "description": "兼容旧版：是否启用 hyw / 何意味 关键词",
     "type": "bool",
     "default": true,
-    "hint": "开启后将响应“hyw”、“何意味”及其命令形式。若关闭，则仅响应“zssm”"
+    "invisible": true,
+    "hint": "旧配置迁移兼容字段，新版本请改用 trigger_keywords"
   },
   "enable_empty_zssm_prompt": {
     "description": "空输入时是否提示",
     "type": "bool",
     "default": false,
-    "hint": "当用户仅发送 zssm / /zssm / hyw / /hyw / 何意味 / /何意味，且既未回复消息、也未附带文本/图片/链接时，是否回复提示语（例如“请输入要解释的内容”）。关闭则忽略不回复；其中空的 hyw/何意味 默认不会占用普通聊天触发。"
+    "hint": "当用户仅发送 zssm 或额外关键词，且未回复任何有关内容，是否回复提示语。"
   },
   "cf_screenshot_enable": {
     "description": "Cloudflare 截图降级",
