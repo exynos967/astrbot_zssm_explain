@@ -119,6 +119,8 @@ DEFAULT_FILE_PREVIEW_EXTS = "txt,md,log,json,csv,ini,cfg,yml,yaml,py"
 DEFAULT_FILE_PREVIEW_MAX_SIZE_KB = 100
 DEFAULT_FORWARD_VIDEO_KEYFRAME_ENABLE = True
 DEFAULT_FORWARD_VIDEO_MAX_COUNT = 2
+TRIGGER_KEYWORD_PATTERN = r"zssm|hyw|何意味"
+HE_YI_WEI_TRIGGER_KEYWORDS = frozenset({"hyw", "何意味"})
 
 
 class ZssmExplain(Star):
@@ -1114,20 +1116,33 @@ class ZssmExplain(Star):
                 return False
 
         # 2. 正则匹配触发词
-        m = re.match(r"^[\s/!！。\.、，\-]*(zssm|hyw|何意味)(\s|$)", t, re.I)
-        if not m:
+        keyword = self._match_trigger_keyword(t)
+        if not keyword:
             logger.debug(f"zssm_explain: no trigger match: {t}")
             return False
 
-        keyword = m.group(1).lower()
         logger.debug(
             f"zssm_explain: trigger found: {keyword} (prefix={has_prefix}, is_command={is_command})"
         )
         # 3. 如果是何意味别名，但关闭了何意味开关，拦截
-        if keyword in ("hyw", "何意味") and not hyw_enabled:
+        if keyword in HE_YI_WEI_TRIGGER_KEYWORDS and not hyw_enabled:
             return False
 
         return True
+
+    @staticmethod
+    def _match_trigger_keyword(text: str) -> Optional[str]:
+        """从文本中提取命中的触发词，未命中则返回 None。"""
+        if not isinstance(text, str):
+            return None
+        matched = re.match(
+            rf"^[\s/!！。\.、，\-]*({TRIGGER_KEYWORD_PATTERN})(\s|$)",
+            text.strip(),
+            re.I,
+        )
+        if not matched:
+            return None
+        return matched.group(1).lower()
 
     @staticmethod
     def _first_plain_head_text(chain: list[object]) -> str:
@@ -1192,7 +1207,11 @@ class ZssmExplain(Star):
         if not isinstance(text, str):
             return ""
         t = text.strip()
-        m = re.match(r"^[\s/!！。\.、，\-]*(?:zssm|hyw|何意味)(?:\s+(.+))?$", t, re.I)
+        m = re.match(
+            rf"^[\s/!！。\.、，\-]*(?:{TRIGGER_KEYWORD_PATTERN})(?:\s+(.+))?$",
+            t,
+            re.I,
+        )
         if not m:
             return ""
         content = (m.group(1) or "").strip()
@@ -1254,6 +1273,54 @@ class ZssmExplain(Star):
         except Exception:
             images = []
         return [x for x in images if isinstance(x, str) and x]
+
+    @staticmethod
+    def _chain_has_reply(chain: List[object]) -> bool:
+        """检测当前消息链是否显式引用了其他消息。"""
+        if not isinstance(chain, list):
+            return False
+        for seg in chain:
+            try:
+                if isinstance(seg, Comp.Reply):
+                    return True
+                if isinstance(seg, dict) and seg.get("type") in ("reply", "quote"):
+                    return True
+            except (AttributeError, TypeError):
+                continue
+        return False
+
+    def _has_direct_explainable_payload(
+        self, event: AstrMessageEvent, chain: Optional[List[object]] = None
+    ) -> bool:
+        """判断当前消息是否直接携带了可解释的媒体内容。"""
+        chain = chain if isinstance(chain, list) else self._safe_get_chain(event)
+        try:
+            if self._extract_images_from_event(event):
+                return True
+        except Exception:
+            pass
+        try:
+            return bool(extract_videos_from_chain(chain))
+        except Exception:
+            return False
+
+    def _should_defer_empty_heyiwei_trigger(
+        self,
+        event: AstrMessageEvent,
+        *,
+        trigger_keyword: Optional[str],
+        inline: str,
+        chain: Optional[List[object]] = None,
+    ) -> bool:
+        """空的 `hyw/何意味` 触发词不默认占用消息，让普通聊天继续处理。"""
+        if trigger_keyword not in HE_YI_WEI_TRIGGER_KEYWORDS:
+            return False
+        if inline:
+            return False
+        chain = chain if isinstance(chain, list) else self._safe_get_chain(event)
+        if self._chain_has_reply(chain):
+            return False
+        return not self._has_direct_explainable_payload(event, chain)
 
     async def _resolve_images_for_llm(
         self, event: AstrMessageEvent, images: List[str]
@@ -1553,6 +1620,19 @@ class ZssmExplain(Star):
 
     _ExplainPlan = Union[_LLMPlan, _VideoPlan, _BilibiliPlan, _ReplyPlan]
 
+    def _build_empty_input_reply_plan(
+        self, cleanup_paths: Optional[List[str]] = None
+    ) -> Optional[_ReplyPlan]:
+        if not self._get_conf_bool(
+            EMPTY_ZSSM_PROMPT_ENABLE_KEY, DEFAULT_EMPTY_ZSSM_PROMPT_ENABLE
+        ):
+            return None
+        return self._ReplyPlan(
+            message="请输入要解释的内容。",
+            stop_event=True,
+            cleanup_paths=list(cleanup_paths or []),
+        )
+
     async def _build_explain_plan(
         self,
         event: AstrMessageEvent,
@@ -1760,15 +1840,7 @@ class ZssmExplain(Star):
                     stop_event=True,
                     cleanup_paths=cleanup_paths,
                 )
-            if self._get_conf_bool(
-                EMPTY_ZSSM_PROMPT_ENABLE_KEY, DEFAULT_EMPTY_ZSSM_PROMPT_ENABLE
-            ):
-                return self._ReplyPlan(
-                    message="请输入要解释的内容。",
-                    stop_event=True,
-                    cleanup_paths=cleanup_paths,
-                )
-            return None
+            return self._build_empty_input_reply_plan(cleanup_paths)
 
         urls = extract_urls_from_text(text) if (enable_url and text) else []
         if urls and not from_forward:
@@ -1962,8 +2034,6 @@ class ZssmExplain(Star):
     @filter.command("zssm", alias={"知识说明", "解释", "hyw", "何意味"})
     async def zssm(self, event: AstrMessageEvent):
         """解释被回复消息：/zssm 或关键词触发；若携带内容则直接解释该内容，否则按回复消息逻辑。"""
-        # 在入口处调用 event.should_call_llm(True)，阻止默认 LLM 接管
-        event.should_call_llm(True)
         cleanup_paths: List[str] = []
         try:
             try:
@@ -1971,14 +2041,13 @@ class ZssmExplain(Star):
                     return
             except Exception:
                 pass
-            if self._already_handled(event):
-                return
 
             # 触发校验：确保开启了对应开关，且在关闭关键词触发时必须带有指令前缀
             chain = self._safe_get_chain(event)
             head_text = self._first_plain_head_text(chain)
             # 如果首个文本没搜到，回退到整体字符串
             check_text = head_text or (getattr(event, "message_str", "") or "")
+            trigger_keyword = self._match_trigger_keyword(check_text)
             if not self._is_zssm_trigger(check_text, is_command=True):
                 logger.debug(
                     f"zssm_explain: zssm command filter blocked execution. check_text: {check_text}"
@@ -1986,6 +2055,29 @@ class ZssmExplain(Star):
                 return
 
             inline = self._get_inline_content(event)
+            if self._should_defer_empty_heyiwei_trigger(
+                event,
+                trigger_keyword=trigger_keyword,
+                inline=inline,
+                chain=chain,
+            ):
+                reply_plan = self._build_empty_input_reply_plan()
+                if reply_plan is None:
+                    logger.debug(
+                        "zssm_explain: ignore empty heyiwei trigger without reply/payload"
+                    )
+                    return
+                event.should_call_llm(True)
+                if self._already_handled(event):
+                    return
+                async for r in self._execute_explain_plan(event, reply_plan):
+                    yield r
+                return
+
+            # 真正进入解释流程前再阻止默认 LLM 接管，避免空的 hyw/何意味 误拦截普通聊天
+            event.should_call_llm(True)
+            if self._already_handled(event):
+                return
             enable_url = self._get_conf_bool(
                 URL_DETECT_ENABLE_KEY, DEFAULT_URL_DETECT_ENABLE
             )
@@ -2058,9 +2150,13 @@ class ZssmExplain(Star):
             at_me = False
         if isinstance(head, str) and head.strip():
             hs = head.strip()
-            if re.match(r"^\s*/\s*(zssm|hyw|何意味)(\s|$)", hs, re.I):
+            if re.match(
+                rf"^\s*/\s*({TRIGGER_KEYWORD_PATTERN})(\s|$)",
+                hs,
+                re.I,
+            ):
                 return
-            if at_me and re.match(r"^(zssm|hyw|何意味)(\s|$)", hs, re.I):
+            if at_me and re.match(rf"^({TRIGGER_KEYWORD_PATTERN})(\s|$)", hs, re.I):
                 return
             if self._is_zssm_trigger(hs, is_command=at_me):
                 async for r in self.zssm(event):
@@ -2073,9 +2169,13 @@ class ZssmExplain(Star):
             text = getattr(event, "message_str", "") or ""
         if isinstance(text, str) and text.strip():
             t = text.strip()
-            if re.match(r"^\s*/\s*(zssm|hyw|何意味)(\s|$)", t, re.I):
+            if re.match(
+                rf"^\s*/\s*({TRIGGER_KEYWORD_PATTERN})(\s|$)",
+                t,
+                re.I,
+            ):
                 return
-            if at_me and re.match(r"^(zssm|hyw|何意味)(\s|$)", t, re.I):
+            if at_me and re.match(rf"^({TRIGGER_KEYWORD_PATTERN})(\s|$)", t, re.I):
                 return
             if self._is_zssm_trigger(t, is_command=at_me):
                 async for r in self.zssm(event):
