@@ -1,71 +1,72 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from typing import List, Tuple, Optional, Any, Dict, Set, Union
-import os
 import asyncio
+import math
+import os
 import re
 import shutil
-import math
 import time
+from dataclasses import dataclass, field
+from typing import Any, Dict, List, Optional, Set, Tuple, Union
 
-from astrbot.api.event import filter, AstrMessageEvent
-from astrbot.api.star import Context, Star
-from astrbot.api import logger
 import astrbot.api.message_components as Comp
-from astrbot.core.star.star_handler import EventType
+from astrbot.api import logger
+from astrbot.api.event import AstrMessageEvent, filter
+from astrbot.api.star import Context, Star
 from astrbot.core.pipeline.context_utils import call_event_hook
+from astrbot.core.star.star_handler import EventType
 
-from .url_utils import (
-    fetch_html,
-    extract_urls_from_text,
-    prepare_url_prompt,
-    build_url_failure_message,
-    build_url_brief_for_forward,
-)
-from .message_utils import (
-    extract_quoted_payload_with_videos,
-    extract_text_images_videos_from_chain,
-    call_get_msg,
-    ob_data,
-    extract_from_onebot_message_payload_with_videos,
-)
-from .video_utils import (
-    extract_videos_from_chain,
-    is_http_url,
-    is_abs_file,
-    napcat_resolve_file_url,
-    extract_forward_video_keyframes,
-    probe_duration_sec,
-    resolve_ffmpeg,
-    resolve_ffprobe,
-    download_video_to_temp,
-    sample_frames_equidistant,
-    sample_frames_with_ffmpeg,
-    extract_audio_wav,
-    get_video_size_mb,
-    is_safe_video_path,
-    compress_video_to_target,
-)
 from .bilibili_utils import (
-    is_bilibili_url,
     download_bilibili_video_to_temp,
     get_bilibili_url_type,
+    is_bilibili_url,
     resolve_bilibili_content,
     resolve_bilibili_short_url,
 )
-from .prompt_utils import (
-    DEFAULT_URL_USER_PROMPT,
-    DEFAULT_VIDEO_USER_PROMPT,
-    DEFAULT_FRAME_CAPTION_PROMPT,
-    build_user_prompt,
-    build_system_prompt_for_event,
-)
-from .llm_client import LLMClient
 from .file_preview_utils import (
     build_text_exts_from_config,
     extract_file_preview_from_reply,
 )
+from .llm_client import LLMClient
+from .message_utils import (
+    call_get_msg,
+    extract_from_onebot_message_payload_with_videos,
+    extract_quoted_payload_with_videos,
+    extract_text_images_videos_from_chain,
+    ob_data,
+)
+from .prompt_utils import (
+    DEFAULT_FRAME_CAPTION_PROMPT,
+    DEFAULT_URL_USER_PROMPT,
+    DEFAULT_VIDEO_USER_PROMPT,
+    build_system_prompt_for_event,
+    build_user_prompt,
+)
+from .url_utils import (
+    build_url_brief_for_forward,
+    build_url_failure_message,
+    extract_urls_from_text,
+    fetch_html,
+    prepare_url_prompt,
+)
+from .video_utils import (
+    compress_video_to_target,
+    download_video_to_temp,
+    extract_audio_wav,
+    extract_forward_video_keyframes,
+    extract_videos_from_chain,
+    get_video_size_mb,
+    is_abs_file,
+    is_http_url,
+    is_safe_video_path,
+    napcat_resolve_file_url,
+    probe_duration_sec,
+    resolve_ffmpeg,
+    resolve_ffprobe,
+    sample_frames_equidistant,
+    sample_frames_with_ffmpeg,
+)
+from .zhihu_utils import ZhihuParseError, match_zhihu_url, prepare_zhihu_prompt
 
 """
 默认提示词已集中放在 prompt_utils.py 中：
@@ -102,6 +103,7 @@ VIDEO_DIRECT_FPS_KEY = "video_direct_fps"
 VIDEO_DIRECT_TARGET_SIZE_MB_KEY = "video_direct_target_size_mb"
 VIDEO_DIRECT_TIMEOUT_SEC_KEY = "video_direct_timeout_sec"
 BILIBILI_COOKIE_KEY = "bilibili_cookie"
+ZHIHU_COOKIE_KEY = "zhihu_cookie"
 
 DEFAULT_URL_DETECT_ENABLE = True
 DEFAULT_URL_FETCH_TIMEOUT = 20
@@ -256,11 +258,7 @@ class ZssmExplain(Star):
         seen: Set[str] = set()
         for raw_keyword in raw_keywords:
             keyword = self._normalize_trigger_keyword(raw_keyword)
-            if (
-                not keyword
-                or keyword == COMMAND_TRIGGER_KEYWORD
-                or keyword in seen
-            ):
+            if not keyword or keyword == COMMAND_TRIGGER_KEYWORD or keyword in seen:
                 continue
             keywords.append(keyword)
             seen.add(keyword)
@@ -271,11 +269,15 @@ class ZssmExplain(Star):
 
     @staticmethod
     def _build_trigger_keyword_pattern(keywords: List[str]) -> str:
-        escaped = sorted((re.escape(keyword) for keyword in keywords), key=len, reverse=True)
+        escaped = sorted(
+            (re.escape(keyword) for keyword in keywords), key=len, reverse=True
+        )
         return "|".join(escaped)
 
     def _get_trigger_keyword_pattern(self) -> str:
-        return self._build_trigger_keyword_pattern(self._get_effective_trigger_keywords())
+        return self._build_trigger_keyword_pattern(
+            self._get_effective_trigger_keywords()
+        )
 
     def _migrate_legacy_trigger_keywords_config(self) -> None:
         if not isinstance(self.config, dict):
@@ -1743,6 +1745,24 @@ class ZssmExplain(Star):
                 timeout_sec = self._get_conf_int(
                     URL_FETCH_TIMEOUT_KEY, DEFAULT_URL_FETCH_TIMEOUT, 2, 60
                 )
+                if match_zhihu_url(target_url):
+                    try:
+                        zhihu_ctx = await prepare_zhihu_prompt(
+                            target_url,
+                            cookie=self._get_conf_str(ZHIHU_COOKIE_KEY, ""),
+                            timeout_sec=timeout_sec,
+                        )
+                    except ZhihuParseError as exc:
+                        return self._ReplyPlan(
+                            message=str(exc),
+                            stop_event=True,
+                            cleanup_paths=cleanup_paths,
+                        )
+                    return self._LLMPlan(
+                        user_prompt=zhihu_ctx.prompt,
+                        images=zhihu_ctx.images,
+                        cleanup_paths=cleanup_paths,
+                    )
                 max_chars = self._get_conf_int(
                     URL_MAX_CHARS_KEY,
                     DEFAULT_URL_MAX_CHARS,
@@ -1940,6 +1960,24 @@ class ZssmExplain(Star):
             timeout_sec = self._get_conf_int(
                 URL_FETCH_TIMEOUT_KEY, DEFAULT_URL_FETCH_TIMEOUT, 2, 60
             )
+            if match_zhihu_url(target_url):
+                try:
+                    zhihu_ctx = await prepare_zhihu_prompt(
+                        target_url,
+                        cookie=self._get_conf_str(ZHIHU_COOKIE_KEY, ""),
+                        timeout_sec=timeout_sec,
+                    )
+                except ZhihuParseError as exc:
+                    return self._ReplyPlan(
+                        message=str(exc),
+                        stop_event=True,
+                        cleanup_paths=cleanup_paths,
+                    )
+                return self._LLMPlan(
+                    user_prompt=zhihu_ctx.prompt,
+                    images=zhihu_ctx.images,
+                    cleanup_paths=cleanup_paths,
+                )
             max_chars = self._get_conf_int(
                 URL_MAX_CHARS_KEY,
                 DEFAULT_URL_MAX_CHARS,
@@ -2126,9 +2164,7 @@ class ZssmExplain(Star):
             actual_command_like = False
             try:
                 text_for_check = check_text.strip()
-                has_prefix = bool(
-                    re.match(r"^\s*([/!！。\.、，\-]+)", text_for_check)
-                )
+                has_prefix = bool(re.match(r"^\s*([/!！。\.、，\-]+)", text_for_check))
                 at_me = False
                 try:
                     self_id = event.get_self_id()
@@ -2141,9 +2177,7 @@ class ZssmExplain(Star):
             except Exception:
                 actual_command_like = False
 
-            if not self._is_zssm_trigger(
-                check_text, is_command=actual_command_like
-            ):
+            if not self._is_zssm_trigger(check_text, is_command=actual_command_like):
                 logger.debug(
                     f"zssm_explain: zssm command filter blocked execution. check_text: {check_text}"
                 )

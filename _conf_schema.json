@@ -202,5 +202,11 @@
         "hint": "CSRF Token，部分接口需要"
       }
     }
+  },
+  "zhihu_cookie": {
+    "description": "知乎 Cookie",
+    "type": "string",
+    "default": "",
+    "hint": "用于知乎文章 / 回答 / 问题 / 想法的专用解析。请在浏览器登录知乎后复制 Cookie 字符串填入，否则知乎链接会提示无法解析。"
   }
 }
