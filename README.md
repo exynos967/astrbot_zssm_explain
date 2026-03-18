@@ -8,6 +8,8 @@
 
 ---
 
+</div>
+
 ## 功能概览
 
 - 文本解释  
@@ -119,3 +121,4 @@
 - [プリン](https://github.com/zouyonghe) 感谢热心群u的PR
 - [回归天空](https://github.com/SXP-Simon) 感谢回归天空同学的PR
 - [xunxiing](https://github.com/xunxiing) 感谢到此为止吧同学的PR
+- [晴空](https://github.com/XXXxx7258) 感谢晴空的PR
