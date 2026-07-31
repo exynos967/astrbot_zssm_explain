@@ -2610,6 +2610,8 @@ class ZssmExplain(Star):
             text = getattr(event, "message_str", "") or ""
         if isinstance(text, str) and text.strip():
             t = text.strip()
+            if isinstance(head, str) and head.strip() == t:
+                return
             if re.match(
                 rf"^\s*/\s*({re.escape(COMMAND_TRIGGER_KEYWORD)})(\s|$)",
                 t,
