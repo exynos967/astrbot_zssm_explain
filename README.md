@@ -119,11 +119,11 @@
 
 ## 提示词与输出格式
 
-- 系统提示词与用户提示词模板集中在 `prompt_utils.py`：  
-  - `DEFAULT_SYSTEM_PROMPT`：约束 LLM 输出结构，如「关键词行 + 总结 + **详细阐述**」。  
+- `prompt_utils.py` 中保留了默认提示词与用户提示词模板：  
+  - `DEFAULT_SYSTEM_PROMPT`：作为 `system_prompt` 的内置默认值，约束 LLM 输出结构，如「关键词行 + 总结 + **详细阐述**」。  
   - `DEFAULT_TEXT_USER_PROMPT` / `DEFAULT_IMAGE_USER_PROMPT`：分别用于纯文本、图文场景。  
   - `DEFAULT_URL_USER_PROMPT` / `DEFAULT_VIDEO_USER_PROMPT`：用于网页摘要与视频解释。
-- 如需自定义输出格式（例如改为项目管理风格、问答风格），建议修改 `prompt_utils.py` 中的常量。
+- 如需自定义输出格式（例如改为项目管理风格、问答风格），优先通过配置项 `system_prompt` 调整。
 
 ---
 

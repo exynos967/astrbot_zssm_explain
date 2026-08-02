@@ -3,7 +3,7 @@ from __future__ import annotations
 from typing import Any, List, Optional
 
 
-# === 默认提示词常量（集中管理，可供用户修改） ===
+# === 默认提示词常量（集中管理，作为配置默认值来源） ===
 
 DEFAULT_SYSTEM_PROMPT = (
     "你是一个中文助理，擅长从被引用的消息中提炼含义、意图和注意事项。"
@@ -53,8 +53,12 @@ def build_user_prompt(text: Optional[str], images: List[str]) -> str:
     return tmpl.format(text=text or "", text_block=text_block)
 
 
-def build_system_prompt() -> str:
-    """返回系统提示词（供 LLM 调用使用）。"""
+def build_system_prompt(system_prompt_override: Optional[str] = None) -> str:
+    """返回系统提示词（优先使用配置覆盖值）。"""
+    if isinstance(system_prompt_override, str):
+        override = system_prompt_override.strip()
+        if override:
+            return override
     return DEFAULT_SYSTEM_PROMPT
 
 
@@ -63,14 +67,15 @@ async def build_system_prompt_for_event(
     umo: Any,
     *,
     keep_original_persona: bool,
+    system_prompt_override: Optional[str] = None,
 ) -> str:
-    """根据会话人格（可选）构造系统提示词。
+    """根据配置与会话人格（可选）构造系统提示词。
 
-    - keep_original_persona=False：直接返回默认系统提示词；
+    - keep_original_persona=False：直接返回配置后的系统提示词；
     - keep_original_persona=True：若 context.persona_manager 存在，则尝试读取当前会话人格 prompt，
-      并替换默认系统提示词的首行（保留其余结构化输出约束）。
+      并替换系统提示词的首行（保留其余结构化输出约束）。
     """
-    sp = build_system_prompt()
+    sp = build_system_prompt(system_prompt_override)
     if not keep_original_persona:
         return sp
 

@@ -39,6 +39,7 @@ from .message_utils import (
 )
 from .proxy_utils import normalize_proxy_url
 from .prompt_utils import (
+    DEFAULT_SYSTEM_PROMPT,
     DEFAULT_FRAME_CAPTION_PROMPT,
     DEFAULT_URL_USER_PROMPT,
     DEFAULT_VIDEO_USER_PROMPT,
@@ -74,7 +75,7 @@ from .zhihu_utils import ZhihuParseError, match_zhihu_url, prepare_zhihu_prompt
 
 """
 默认提示词已集中放在 prompt_utils.py 中：
-- DEFAULT_* 常量用于不同流程的默认文案
+- DEFAULT_* 常量用于不同流程的默认文案与配置默认值
 - build_* 函数用于构造系统/用户提示词
 """
 
@@ -98,6 +99,7 @@ ASR_PROVIDER_ID_KEY = "asr_provider_id"
 CF_SCREENSHOT_ENABLE_KEY = "cf_screenshot_enable"
 CF_SCREENSHOT_SIZE_KEY = "cf_screenshot_size"
 KEEP_ORIGINAL_PERSONA_KEY = "keep_original_persona"
+SYSTEM_PROMPT_KEY = "system_prompt"
 FILE_PREVIEW_EXTS_KEY = "file_preview_exts"
 FILE_PREVIEW_MAX_SIZE_KB_KEY = "file_preview_max_size_kb"
 FORWARD_VIDEO_KEYFRAME_ENABLE_KEY = "forward_video_keyframe_enable"
@@ -1911,10 +1913,14 @@ class ZssmExplain(Star):
         keep = self._get_conf_bool(
             KEEP_ORIGINAL_PERSONA_KEY, DEFAULT_KEEP_ORIGINAL_PERSONA
         )
+        system_prompt = self._get_conf_str(
+            SYSTEM_PROMPT_KEY, DEFAULT_SYSTEM_PROMPT
+        )
         return await build_system_prompt_for_event(
             self.context,
             event.unified_msg_origin,
             keep_original_persona=keep,
+            system_prompt_override=system_prompt,
         )
 
     # 解释输出格式化仍保留在 main.py（与事件/输出策略紧耦合）
