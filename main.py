@@ -2501,6 +2501,7 @@ class ZssmExplain(Star):
             )
             return
 
+        start_ts = time.perf_counter()
         exa_context = await self._search_exa_context(plan.exa_query)
         if exa_context:
             user_prompt = user_prompt + exa_context
@@ -2515,7 +2516,6 @@ class ZssmExplain(Star):
             if gif_notes:
                 user_prompt = user_prompt + "\n" + "\n".join(gif_notes)
             image_urls = self._llm.filter_supported_images(images)
-            start_ts = time.perf_counter()
             call_provider = self._llm.select_primary_provider(
                 session_provider=provider, image_urls=image_urls
             )
