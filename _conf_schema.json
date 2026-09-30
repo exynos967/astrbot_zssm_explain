@@ -32,6 +32,24 @@
     "default": true,
     "hint": "关闭后仅按文本/图片解释"
   },
+  "exa_search_enable": {
+    "description": "是否使用 Exa 联网搜索补充解释上下文",
+    "type": "bool",
+    "default": true,
+    "hint": "需同时安装并配置 astrbot_plugin_exa_web_search；不可用时自动回退本地解释"
+  },
+  "exa_search_max_results": {
+    "description": "Exa 联网搜索最多返回结果数",
+    "type": "int",
+    "default": 5,
+    "hint": "范围 1-10；结果越多会占用更多模型上下文"
+  },
+  "exa_search_timeout_sec": {
+    "description": "Exa 联网搜索超时时间（秒）",
+    "type": "int",
+    "default": 10,
+    "hint": "范围 2-30；超时或 Exa 不可用时继续使用原有解释流程"
+  },
   "enable_keyword_zssm": {
     "description": "是否启用 zssm 和额外关键词自动触发",
     "type": "bool",

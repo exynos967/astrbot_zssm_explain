@@ -57,6 +57,11 @@
   - ASR（音频转写）可指定 STT Provider；  
   - 所有调用在失败时均带有回退逻辑（例如回退到当前会话 Provider，或仅做文本解释）。
 
+- Exa 联网知识补充
+  - 安装并配置 `astrbot_plugin_exa_web_search` 后，zssm 会在调用 LLM 前按待解释文本进行 Exa 搜索，并把标题、来源和摘要作为参考资料交给模型。
+  - 通过 `exa_search_enable` 可关闭该功能；`exa_search_max_results` 和 `exa_search_timeout_sec` 可限制结果数量与等待时间。
+  - Exa 插件未安装、未配置、未就绪或请求失败时，会自动回退到原有的本地解释/网页抓取流程，不影响 zssm 使用。
+
 ---
 
 ## 触发方式
